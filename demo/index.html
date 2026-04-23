@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>lll-web-agent Demo</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+.header { background: #1a1a2e; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .tag { background: #16213e; padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #a0a0c0; }
+.header .strategy-switch { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.header .strategy-switch select { padding: 4px 8px; border-radius: 4px; border: 1px solid #444; background: #16213e; color: #e0e0e0; font-size: 12px; cursor: pointer; }
+.header .strategy-label { color: #a0a0c0; font-size: 12px; }
+.chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+.msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-size: 14px; }
+.msg.user { align-self: flex-end; background: #1a1a2e; color: #fff; border-bottom-right-radius: 4px; }
+.msg.assistant { align-self: flex-start; background: #fff; color: #333; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.msg.tool { align-self: flex-start; background: #e8f5e9; color: #2e7d32; font-size: 12px; font-family: monospace; border-radius: 8px; }
+.msg.error { align-self: center; background: #ffebee; color: #c62828; font-size: 13px; }
+.msg.plan { align-self: flex-start; background: #e3f2fd; color: #1565c0; font-size: 13px; border-radius: 8px; border-left: 3px solid #1565c0; }
+.msg.phase { align-self: center; background: #f3e5f5; color: #7b1fa2; font-size: 12px; border-radius: 16px; padding: 6px 16px; }
+.msg.step { align-self: flex-start; background: #fff8e1; color: #f57f17; font-size: 12px; font-family: monospace; border-radius: 8px; border-left: 3px solid #f57f17; }
+.typing { display: inline-block; }
+.typing::after { content: '▊'; animation: blink 0.7s infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.input-area { background: #fff; border-top: 1px solid #e0e0e0; padding: 16px 24px; display: flex; gap: 12px; }
+.input-area input { flex: 1; padding: 10px 16px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; outline: none; }
+.input-area input:focus { border-color: #1a1a2e; }
+.input-area button { padding: 10px 24px; background: #1a1a2e; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }
+.input-area button:hover { background: #16213e; }
+.input-area button:disabled { background: #999; cursor: not-allowed; }
+.actions { display: flex; gap: 8px; }
+.actions button.secondary { background: transparent; color: #666; border: 1px solid #ddd; }
+.actions button.secondary:hover { background: #f5f5f5; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>lll-web-agent</h1>
+  <span class="tag">Demo</span>
+  <div class="strategy-switch">
+    <span class="strategy-label">执行策略:</span>
+    <select id="strategy" onchange="switchStrategy(this.value)">
+      <option value="react">ReAct（默认）</option>
+      <option value="plan_and_execute">Plan & Execute</option>
+    </select>
+  </div>
+</div>
+<div class="chat" id="chat"></div>
+<div class="input-area">
+  <input id="input" placeholder="输入消息..." autocomplete="off" />
+  <div class="actions">
+    <button id="send" onclick="send()">发送</button>
+    <button class="secondary" onclick="resetChat()">新会话</button>
+  </div>
+</div>
+<script>
+const chat = document.getElementById('chat')
+const input = document.getElementById('input')
+const sendBtn = document.getElementById('send')
+let sending = false
+
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } })
+
+async function send() {
+  const msg = input.value.trim()
+  if (!msg || sending) return
+  input.value = ''
+  sending = true
+  sendBtn.disabled = true
+
+  addMsg('user', msg)
+  let assistantEl = null
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg }),
+    })
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop()
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6)
+        if (data === '[DONE]') continue
+        try {
+          const event = JSON.parse(data)
+          switch (event.type) {
+            case 'delta':
+              if (!assistantEl) { assistantEl = addMsg('assistant', ''); assistantEl.classList.add('typing') }
+              assistantEl.textContent += event.content
+              break
+            case 'tool_start':
+              addMsg('tool', `🔧 调用工具: ${event.name}`)
+              break
+            case 'tool_end':
+              addMsg('tool', `✅ ${event.name} → ${event.result}`)
+              break
+            case 'phase':
+              addMsg('phase', `📋 ${event.message}`)
+              break
+            case 'plan_generated':
+              addMsg('plan', '📝 执行计划:\n' + event.plan.map(s => `  ${s.index + 1}. ${s.description}`).join('\n'))
+              break
+            case 'step_start':
+              addMsg('step', `▶ Step ${event.index + 1}: ${event.description}`)
+              break
+            case 'step_complete':
+              addMsg('step', `${event.success ? '✅' : '❌'} Step ${event.index + 1} (${event.duration}ms)`)
+              break
+            case 'plan_revised':
+              addMsg('plan', '🔄 计划已修订:\n' + event.plan.map(s => `  ${s.index + 1}. ${s.description} [${s.status}]`).join('\n'))
+              break
+            case 'done':
+              if (event.content && !assistantEl) {
+                assistantEl = addMsg('assistant', event.content)
+              }
+              break
+            case 'error':
+              addMsg('error', `❌ ${event.message}`)
+              break
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    addMsg('error', `请求失败: ${err.message}`)
+  }
+
+  if (assistantEl) assistantEl.classList.remove('typing')
+  if (assistantEl && !assistantEl.textContent) assistantEl.remove()
+  sending = false
+  sendBtn.disabled = false
+  input.focus()
+}
+
+function addMsg(role, text) {
+  const el = document.createElement('div')
+  el.className = `msg ${role}`
+  el.textContent = text
+  chat.appendChild(el)
+  chat.scrollTop = chat.scrollHeight
+  return el
+}
+
+async function resetChat() {
+  try {
+    await fetch('/reset', { method: 'POST' })
+  } catch {}
+  chat.innerHTML = ''
+  addMsg('assistant', '会话已重置，请开始新的对话。')
+}
+
+async function switchStrategy(strategy) {
+  try {
+    const res = await fetch('/strategy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy }),
+    })
+    if (!res.ok) throw new Error('Server returned ' + res.status)
+    chat.innerHTML = ''
+    const label = strategy === 'plan_and_execute' ? 'Plan & Execute' : 'ReAct'
+    addMsg('assistant', `已切换到 ${label} 策略。${strategy === 'plan_and_execute' ? '\n\nPlan & Execute 模式会先制定执行计划，再逐步执行。适合复杂多步骤任务。' : '\n\nReAct 模式边思考边行动，适合简单直接的任务。'}`)
+  } catch (err) {
+    addMsg('error', `切换策略失败: ${err.message}\n请确认已启动 Demo 服务器: OPENAI_API_KEY=sk-xxx node demo/server.js`)
+  }
+}
+
+addMsg('assistant', '你好！我是 lll-web-agent 的 Demo。我可以查询时间和做数学计算。\n\n💡 右上角可以切换执行策略：\n  • ReAct — 边思考边行动（默认）\n  • Plan & Execute — 先规划再执行（适合复杂任务）')
+input.focus()
+
+// 页面加载时同步服务端当前策略
+fetch('/strategy').then(r => r.json()).then(({ strategy }) => {
+  document.getElementById('strategy').value = strategy
+}).catch(() => {})
+</script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+{
+  "name": "lll-web-agent",
+  "version": "0.5.1",
+  "description": "开箱即用的 LLM Agent SDK — 配个 API Key 就能跑",
+  "type": "module",
+  "main": "src/index.js",
+  "browser": "dist/lll-web-agent.min.js",
+  "unpkg": "dist/lll-web-agent.min.js",
+  "jsdelivr": "dist/lll-web-agent.min.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --outfile=dist/lll-web-agent.js",
+    "build:min": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --minify --outfile=dist/lll-web-agent.min.js",
+    "prepublishOnly": "npm run build && npm run build:min",
+    "test": "node --test src/**/*.test.js",
+    "example": "node examples/basic.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "agent",
+    "llm",
+    "openai",
+    "deepseek",
+    "anthropic",
+    "qwen",
+    "function-calling",
+    "react-loop",
+    "tool-use"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.4",
+    "fast-check": "^4.7.0"
+  }
+}
