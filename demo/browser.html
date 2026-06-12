@@ -7,10 +7,13 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;height:100vh;display:flex;flex-direction:column}
-.setup{background:#fff;padding:20px 24px;border-bottom:1px solid #e0e0e0;display:flex;gap:12px;align-items:end;flex-wrap:wrap}
+.setup{background:#fff;padding:16px 24px;border-bottom:1px solid #e0e0e0;display:flex;gap:12px;align-items:end;flex-wrap:wrap}
 .setup label{font-size:13px;color:#666;display:flex;flex-direction:column;gap:4px}
+.setup label.check{flex-direction:row;align-items:center;gap:6px;padding-bottom:8px}
 .setup select,.setup input{padding:8px 12px;border:1px solid #ddd;border-radius:6px;font-size:13px}
-.setup input[type=text]{width:280px}
+.setup input[type=text]{width:240px}
+.setup .fieldset-title{flex-basis:100%;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;padding-top:8px;border-top:1px dashed #eee}
+.setup .fieldset-title:first-of-type{border-top:none;margin-top:0;padding-top:0}
 .setup button{padding:8px 20px;background:#1a1a2e;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;height:36px}
 .setup button:hover{background:#16213e}
 .setup .status{font-size:12px;color:#999;align-self:center}
@@ -27,10 +30,71 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .msg.plan{align-self:flex-start;background:#e3f2fd;color:#1565c0;font-size:13px;border-radius:8px;border-left:3px solid #1565c0}
 .msg.phase{align-self:center;background:#f3e5f5;color:#7b1fa2;font-size:12px;border-radius:16px;padding:6px 16px}
 .msg.step{align-self:flex-start;background:#fff8e1;color:#f57f17;font-size:12px;font-family:monospace;border-radius:8px;border-left:3px solid #f57f17}
+.msg.intent{align-self:flex-start;background:#ede7f6;color:#4527a0;font-size:13px;border-radius:8px;border-left:3px solid #7e57c2;max-width:90%}
+.msg.intent .intent-head{font-weight:600;margin-bottom:4px;display:flex;gap:6px;flex-wrap:wrap}
+.msg.intent .tag{display:inline-block;background:#d1c4e9;color:#311b92;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:500}
+.msg.intent .tag.complex{background:#ffccbc;color:#bf360c}
+.msg.intent .tag.ambiguous{background:#ffe082;color:#e65100}
+.msg.intent .reasoning{color:#5e35b1;font-style:italic;margin-top:4px;font-size:12px}
+.msg.intent .tools-list{margin-top:4px;font-family:monospace;font-size:11px;color:#4527a0}
+.msg.reasoning{align-self:flex-start;background:#fafafa;color:#666;font-size:12px;font-style:italic;border-radius:8px;border-left:3px solid #bdbdbd;max-width:85%}
+.msg.reasoning::before{content:'🤔 思考中 ';color:#9e9e9e;font-weight:600;font-style:normal}
 .typing::after{content:'▊';animation:blink .7s infinite}
 @keyframes blink{50%{opacity:0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes popIn{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
+
+/* ==== Telemetry panel ==== */
+.main{flex:1;display:flex;overflow:hidden}
+.chat{flex:1;min-width:0}
+.telemetry{width:360px;border-left:1px solid #e0e0e0;background:#fafbfc;display:flex;flex-direction:column;font-size:12px}
+.telemetry.collapsed{display:none}
+.telemetry .panel-title{padding:10px 14px;background:#1a1a2e;color:#fff;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
+.telemetry .panel-title .badge{background:#16213e;padding:2px 8px;border-radius:10px;font-size:10px;color:#a0a0c0;font-weight:normal;font-family:'SF Mono',Menlo,monospace}
+.telemetry .metrics{padding:10px 14px;border-bottom:1px solid #e0e0e0;background:#fff}
+.telemetry .metrics-section{margin-bottom:8px}
+.telemetry .metrics-section:last-child{margin-bottom:0}
+.telemetry .metrics-section .head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;margin-bottom:5px}
+.telemetry .metrics-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px}
+.telemetry .metric{display:flex;flex-direction:column}
+.telemetry .metric .label{color:#999;font-size:10px}
+.telemetry .metric .value{color:#1a1a2e;font-size:13px;font-weight:600;font-family:'SF Mono',Menlo,monospace}
+.telemetry .events-head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;padding:6px 10px;border-bottom:1px solid #e0e0e0;display:flex;align-items:center;justify-content:space-between}
+.telemetry .events-head button{background:transparent;border:1px solid #ddd;color:#666;padding:1px 8px;border-radius:4px;cursor:pointer;font-size:10px}
+.telemetry .events{flex:1;overflow-y:auto;padding:6px 10px;display:flex;flex-direction:column;gap:3px}
+.telemetry .event{padding:5px 7px;border-radius:5px;background:#fff;border:1px solid #e8e8e8;font-family:'SF Mono',Menlo,monospace;font-size:11px;line-height:1.3;display:flex;flex-direction:column;gap:2px}
+.telemetry .event .evt-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.telemetry .event .evt-name{font-weight:600;padding:1px 5px;border-radius:3px;font-size:10px}
+.telemetry .event .evt-name.session-start,.telemetry .event .evt-name.session-end{background:#ede7f6;color:#4527a0}
+.telemetry .event .evt-name.round-start,.telemetry .event .evt-name.round-end{background:#fff3e0;color:#e65100}
+.telemetry .event .evt-name.llm-call{background:#e1f5fe;color:#0277bd}
+.telemetry .event .evt-name.tool-call{background:#e8f5e9;color:#2e7d32}
+.telemetry .event .evt-name.tool-call.failed,.telemetry .event .evt-name.llm-call.failed{background:#ffebee;color:#c62828}
+.telemetry .event .evt-detail{color:#555;font-size:11px}
+.telemetry .event .evt-meta{color:#999;font-size:10px}
+.telemetry .empty{color:#bbb;text-align:center;padding:16px 8px;font-style:italic;font-size:11px}
+.telemetry-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:#a0a0c0;cursor:pointer;user-select:none;margin-left:auto}
+.telemetry-toggle input{cursor:pointer}
+.mcp-badge{background:#2a2a3e;color:#666;padding:2px 10px;border-radius:10px;font-size:11px;display:flex;align-items:center;gap:4px;font-family:'SF Mono',Menlo,monospace;cursor:help}
+.mcp-badge.on{background:#1e4620;color:#a5d6a7}
+.mcp-badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block}
+
+/* MCP 配置面板 */
+.mcp-panel{background:#fff;border-bottom:1px solid #e0e0e0;padding:12px 24px;display:flex;flex-direction:column;gap:8px}
+.mcp-panel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.mcp-panel-head .title{font-size:13px;font-weight:600;color:#333}
+.mcp-panel-head .hint{font-size:11px;color:#999}
+.mcp-panel-head select{padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:12px;background:#fff;min-width:280px}
+.mcp-panel-head button{padding:6px 14px;background:#1a1a2e;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px}
+.mcp-panel-head button:hover{background:#16213e}
+.mcp-panel-head button.secondary{background:transparent;color:#666;border:1px solid #ddd}
+.mcp-panel-head button.secondary:hover{background:#f5f5f5}
+.mcp-panel-head button:disabled{background:#ccc;cursor:wait}
+.mcp-panel-status{font-size:11px;color:#666;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.mcp-panel-status.ok{color:#2e7d32}
+.mcp-panel-status.err{color:#c62828}
+.mcp-panel-status .tool-chip{display:inline-block;background:#e8f5e9;color:#2e7d32;padding:1px 8px;border-radius:10px;font-family:'SF Mono',Menlo,monospace;font-size:10px}
+
 .input-area{background:#fff;border-top:1px solid #e0e0e0;padding:12px 24px;display:flex;gap:12px}
 .input-area input{flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none}
 .input-area input:focus{border-color:#1a1a2e}
@@ -44,9 +108,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="header">
   <h1>lll-web-agent</h1>
   <span class="tag">浏览器端 Demo</span>
+  <span id="mcpBadge" class="mcp-badge off" title="MCP 状态">
+    <span class="dot"></span>
+    <span id="mcpBadgeText">MCP 未连接</span>
+  </span>
+  <label class="telemetry-toggle">
+    <input type="checkbox" id="showTelemetry" checked onchange="toggleTelemetry(this.checked)">
+    📡 遥测面板
+  </label>
 </div>
 
 <div class="setup" id="setup">
+  <div class="fieldset-title">主任务模型（思考模型）</div>
   <label>供应商
     <select id="provider">
       <option value="qwen">通义千问 (qwen)</option>
@@ -57,7 +130,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     </select>
   </label>
   <label>模型
-    <input type="text" id="model" value="qwen-turbo" placeholder="模型名称">
+    <input type="text" id="model" value="qwen3.5-plus" placeholder="模型名称">
   </label>
   <label>API Key
     <input type="text" id="apikey" placeholder="sk-xxx" autocomplete="off">
@@ -68,13 +141,90 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <option value="plan_and_execute">Plan & Execute</option>
     </select>
   </label>
+
+  <div class="fieldset-title">简单任务模型（可选，用于意图识别/工具筛选/记忆摘要，留空则复用主模型）</div>
+  <label>供应商
+    <select id="simpleProvider">
+      <option value="">（同主模型）</option>
+      <option value="qwen">通义千问 (qwen)</option>
+      <option value="deepseek">DeepSeek</option>
+      <option value="openai">OpenAI</option>
+      <option value="moonshot">Moonshot</option>
+      <option value="zhipu">智谱 AI</option>
+    </select>
+  </label>
+  <label>简单模型
+    <input type="text" id="simpleModel" placeholder="留空则同主模型" autocomplete="off">
+  </label>
+  <label>简单 API Key
+    <input type="text" id="simpleApiKey" placeholder="留空则同主 Key" autocomplete="off">
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableIntent" checked> 启用意图识别（sidecar 调用走简单模型）
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableAskUser" checked> 注入 ask_user 工具（允许 LLM 向你发问）
+  </label>
+
   <button onclick="initAgent()">连接</button>
   <span class="status" id="status">未连接</span>
 </div>
 
+<div class="mcp-panel">
+  <div class="mcp-panel-head">
+    <span class="title">🔌 MCP Server</span>
+    <select id="mcpPreset">
+      <option value="">— 选一个预设挂载 —</option>
+    </select>
+    <button id="mcpConnectBtn" onclick="mcpConnect()">挂载</button>
+    <button class="secondary" onclick="mcpDisconnect()">卸载</button>
+    <span class="hint">挂载后,Agent.tools 会追加该 server 的工具(命名空间前缀 mcp__&lt;name&gt;__)</span>
+  </div>
+  <div class="mcp-panel-status" id="mcpPanelStatus">未连接</div>
+</div>
+
 <div class="warn">注意：浏览器端直连 LLM API，API Key 暴露在前端。仅用于开发测试，生产环境请使用服务端代理。</div>
 
-<div class="chat" id="chat"></div>
+<div class="main" style="flex:1;display:flex;overflow:hidden">
+  <div class="chat" id="chat"></div>
+  <aside class="telemetry" id="telemetryPanel">
+    <div class="panel-title">
+      📡 Telemetry
+      <span class="badge" id="traceBadge">—</span>
+    </div>
+    <div class="metrics">
+      <div class="metrics-section">
+        <div class="head">当前 Run</div>
+        <div class="metrics-grid">
+          <div class="metric"><span class="label">rounds</span><span class="value" id="mRounds">—</span></div>
+          <div class="metric"><span class="label">wall-clock</span><span class="value" id="mWall">—</span></div>
+          <div class="metric"><span class="label">llm calls</span><span class="value" id="mLlm">—</span></div>
+          <div class="metric"><span class="label">tool calls</span><span class="value" id="mTool">—</span></div>
+          <div class="metric"><span class="label">input tokens</span><span class="value" id="mIn">—</span></div>
+          <div class="metric"><span class="label">output tokens</span><span class="value" id="mOut">—</span></div>
+        </div>
+      </div>
+      <div class="metrics-section">
+        <div class="head">Session 累计</div>
+        <div class="metrics-grid">
+          <div class="metric"><span class="label">total runs</span><span class="value" id="sRuns">0</span></div>
+          <div class="metric"><span class="label">total rounds</span><span class="value" id="sRounds">0</span></div>
+          <div class="metric"><span class="label">total llm</span><span class="value" id="sLlm">0</span></div>
+          <div class="metric"><span class="label">total tools</span><span class="value" id="sTool">0</span></div>
+          <div class="metric"><span class="label">total input</span><span class="value" id="sIn">0</span></div>
+          <div class="metric"><span class="label">total output</span><span class="value" id="sOut">0</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="events-head">
+      <span>事件流</span>
+      <button onclick="clearEvents()">清空</button>
+    </div>
+    <div class="events" id="events">
+      <div class="empty">连接 Agent 并发送一条消息后，llm.call / tool.call / round.* / session.* 会实时展示在这里</div>
+    </div>
+  </aside>
+</div>
 
 <div class="input-area">
   <input id="input" placeholder="输入消息..." autocomplete="off" disabled>
@@ -92,80 +242,483 @@ var input = document.getElementById('input')
 var sendBtn = document.getElementById('send')
 
 // 浏览器端可用的工具
+
+// 1. 时间日期类
 var getCurrentTime = defineTool({
   name: 'get_current_time',
-  description: '获取当前时间',
+  description: '获取当前日期和时间',
   parameters: { type: 'object', properties: {} },
-  execute: async function() { return new Date().toLocaleString('zh-CN') }
+  execute: async function() { return new Date().toLocaleString('zh-CN', { dateStyle: 'full', timeStyle: 'medium' }) }
 })
 
+// 2. 数学计算类
 var calculate = defineTool({
   name: 'calculate',
-  description: '计算数学表达式',
-  parameters: { type: 'object', properties: { expression: { type: 'string', description: '数学表达式' } }, required: ['expression'] },
-  execute: async function(p) { return String(Function('"use strict"; return (' + p.expression + ')')()) }
+  description: '计算数学表达式，支持加减乘除、幂运算、三角函数等',
+  parameters: { type: 'object', properties: { expression: { type: 'string', description: '数学表达式，如 2+3*4、Math.sqrt(144)、Math.PI*2' } }, required: ['expression'] },
+  execute: async function(p) {
+    try { return String(Function('"use strict"; return (' + p.expression + ')')()) }
+    catch(e) { return 'Error: ' + e.message }
+  }
 })
 
+// 3. UI 交互类
 var showPopup = defineTool({
   name: 'show_popup',
   description: '在页面上弹出一个弹窗，向用户展示重要信息。当需要醒目地提示用户某些内容时使用此工具。',
   parameters: { type: 'object', properties: { content: { type: 'string', description: '弹窗中展示的文字内容' } }, required: ['content'] },
   execute: async function(p) {
     return new Promise(function(resolve) {
-      // 遮罩
       var overlay = document.createElement('div')
       overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s'
-      // 弹窗
       var box = document.createElement('div')
       box.style.cssText = 'background:#fff;border-radius:12px;padding:28px 32px 20px;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.2);animation:popIn .25s'
-      // 图标
       var icon = document.createElement('div')
       icon.style.cssText = 'font-size:32px;text-align:center;margin-bottom:12px'
-      icon.textContent = '💡'
-      // 内容
+      icon.textContent = '\uD83D\uDCA1'
       var text = document.createElement('div')
       text.style.cssText = 'font-size:15px;line-height:1.7;color:#333;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto'
       text.textContent = p.content
-      // 按钮
       var btn = document.createElement('button')
       btn.style.cssText = 'display:block;margin:20px auto 0;padding:8px 32px;background:#1a1a2e;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer'
       btn.textContent = '知道了'
       btn.onclick = function() { document.body.removeChild(overlay); resolve('用户已查看弹窗内容') }
-      box.appendChild(icon)
-      box.appendChild(text)
-      box.appendChild(btn)
-      overlay.appendChild(box)
-      document.body.appendChild(overlay)
+      box.appendChild(icon); box.appendChild(text); box.appendChild(btn)
+      overlay.appendChild(box); document.body.appendChild(overlay)
     })
   }
 })
 
+// 4. 天气查询类（模拟）
+var getWeather = defineTool({
+  name: 'get_weather',
+  description: '查询指定城市的当前天气信息',
+  parameters: { type: 'object', properties: { city: { type: 'string', description: '城市名称，如 北京、上海、深圳' } }, required: ['city'] },
+  execute: async function(p) {
+    var weathers = ['晴', '多云', '阴', '小雨', '大风']
+    var w = weathers[Math.floor(Math.random() * weathers.length)]
+    var temp = Math.floor(Math.random() * 25) + 5
+    var humidity = Math.floor(Math.random() * 60) + 30
+    return p.city + '：' + w + '，气温 ' + temp + '°C，湿度 ' + humidity + '%'
+  }
+})
+
+// 5. 单位换算类
+var convertUnit = defineTool({
+  name: 'convert_unit',
+  description: '单位换算工具，支持长度（km/mi/m/ft）、重量（kg/lb）、温度（C/F）之间的转换',
+  parameters: { type: 'object', properties: {
+    value: { type: 'number', description: '要转换的数值' },
+    from: { type: 'string', description: '原始单位，如 km、mi、kg、lb、C、F' },
+    to: { type: 'string', description: '目标单位' }
+  }, required: ['value', 'from', 'to'] },
+  execute: async function(p) {
+    var conversions = {
+      'km_mi': 0.621371, 'mi_km': 1.60934,
+      'm_ft': 3.28084, 'ft_m': 0.3048,
+      'kg_lb': 2.20462, 'lb_kg': 0.453592,
+      'C_F': function(v) { return v * 9/5 + 32 },
+      'F_C': function(v) { return (v - 32) * 5/9 }
+    }
+    var key = p.from + '_' + p.to
+    var conv = conversions[key]
+    if (!conv) return 'Error: 不支持 ' + p.from + ' 到 ' + p.to + ' 的转换'
+    var result = typeof conv === 'function' ? conv(p.value) : p.value * conv
+    return p.value + ' ' + p.from + ' = ' + result.toFixed(2) + ' ' + p.to
+  }
+})
+
+// 6. 随机生成类
+var generateRandom = defineTool({
+  name: 'generate_random',
+  description: '生成随机内容：密码、UUID、随机数、随机颜色等',
+  parameters: { type: 'object', properties: {
+    type: { type: 'string', description: '生成类型：password（密码）、uuid、number（随机数）、color（随机颜色）' },
+    length: { type: 'number', description: '长度（仅密码有效，默认16）' }
+  }, required: ['type'] },
+  execute: async function(p) {
+    switch (p.type) {
+      case 'password':
+        var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*'
+        var len = p.length || 16
+        var pw = ''; for (var i = 0; i < len; i++) pw += chars[Math.floor(Math.random() * chars.length)]
+        return '生成的密码：' + pw
+      case 'uuid':
+        return 'UUID: ' + crypto.randomUUID()
+      case 'number':
+        return '随机数: ' + Math.floor(Math.random() * 1000000)
+      case 'color':
+        var hex = '#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0')
+        return '随机颜色: ' + hex
+      default:
+        return 'Error: 未知类型 ' + p.type + '，支持 password/uuid/number/color'
+    }
+  }
+})
+
+// 7. 文本处理类
+var processText = defineTool({
+  name: 'process_text',
+  description: '文本处理工具：统计字数、转大小写、反转文本、提取数字等',
+  parameters: { type: 'object', properties: {
+    text: { type: 'string', description: '要处理的文本' },
+    action: { type: 'string', description: '操作：count（统计字数）、upper（转大写）、lower（转小写）、reverse（反转）、extract_numbers（提取数字）' }
+  }, required: ['text', 'action'] },
+  execute: async function(p) {
+    switch (p.action) {
+      case 'count': return '字符数: ' + p.text.length + '，单词数: ' + p.text.trim().split(/\s+/).length
+      case 'upper': return p.text.toUpperCase()
+      case 'lower': return p.text.toLowerCase()
+      case 'reverse': return p.text.split('').reverse().join('')
+      case 'extract_numbers': return '提取的数字: ' + (p.text.match(/\d+\.?\d*/g) || []).join(', ')
+      default: return 'Error: 未知操作 ' + p.action
+    }
+  }
+})
+
+// 8. 页面操作类
+var modifyPage = defineTool({
+  name: 'modify_page',
+  description: '修改当前页面的外观：改变背景色、字体大小、切换暗色模式等',
+  parameters: { type: 'object', properties: {
+    action: { type: 'string', description: '操作：set_bg（设置背景色）、dark_mode（暗色模式）、light_mode（亮色模式）、set_font_size（设置字体大小）' },
+    value: { type: 'string', description: '参数值（颜色值如 #ff0000，或字体大小如 16px）' }
+  }, required: ['action'] },
+  execute: async function(p) {
+    switch (p.action) {
+      case 'set_bg':
+        document.body.style.background = p.value || '#f0f2f5'
+        return '已将背景色设置为 ' + (p.value || '#f0f2f5')
+      case 'dark_mode':
+        document.body.style.background = '#1a1a2e'
+        document.body.style.color = '#e0e0e0'
+        return '已切换到暗色模式'
+      case 'light_mode':
+        document.body.style.background = '#f0f2f5'
+        document.body.style.color = '#333'
+        return '已切换到亮色模式'
+      case 'set_font_size':
+        document.body.style.fontSize = p.value || '14px'
+        return '已将字体大小设置为 ' + (p.value || '14px')
+      default: return 'Error: 未知操作 ' + p.action
+    }
+  }
+})
+
+// 9. 本地存储类
+var notepad = defineTool({
+  name: 'notepad',
+  description: '简易记事本：保存、读取、列出、删除笔记。数据存储在浏览器本地。',
+  parameters: { type: 'object', properties: {
+    action: { type: 'string', description: '操作：save（保存）、read（读取）、list（列出所有）、delete（删除）' },
+    key: { type: 'string', description: '笔记标题/键名' },
+    content: { type: 'string', description: '笔记内容（仅 save 时需要）' }
+  }, required: ['action'] },
+  execute: async function(p) {
+    var prefix = 'agent_note_'
+    switch (p.action) {
+      case 'save':
+        if (!p.key || !p.content) return 'Error: save 需要 key 和 content'
+        localStorage.setItem(prefix + p.key, p.content)
+        return '已保存笔记「' + p.key + '」'
+      case 'read':
+        if (!p.key) return 'Error: read 需要 key'
+        var val = localStorage.getItem(prefix + p.key)
+        return val !== null ? '「' + p.key + '」: ' + val : '笔记「' + p.key + '」不存在'
+      case 'list':
+        var keys = []; for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i)
+          if (k.startsWith(prefix)) keys.push(k.slice(prefix.length))
+        }
+        return keys.length > 0 ? '所有笔记: ' + keys.join(', ') : '暂无笔记'
+      case 'delete':
+        if (!p.key) return 'Error: delete 需要 key'
+        localStorage.removeItem(prefix + p.key)
+        return '已删除笔记「' + p.key + '」'
+      default: return 'Error: 未知操作 ' + p.action
+    }
+  }
+})
+
+// 10. 倒计时/计时器类
+var timer = defineTool({
+  name: 'timer',
+  description: '设置一个倒计时提醒，到时间后在页面上弹出通知',
+  parameters: { type: 'object', properties: {
+    seconds: { type: 'number', description: '倒计时秒数（1-300）' },
+    message: { type: 'string', description: '到时间后显示的提醒内容' }
+  }, required: ['seconds', 'message'] },
+  execute: async function(p) {
+    var secs = Math.min(Math.max(Math.floor(p.seconds), 1), 300)
+    setTimeout(function() {
+      var n = document.createElement('div')
+      n.style.cssText = 'position:fixed;top:20px;right:20px;background:#1a1a2e;color:#fff;padding:16px 24px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.3);z-index:9999;font-size:14px;max-width:320px;animation:popIn .3s'
+      n.textContent = '\u23F0 ' + p.message
+      document.body.appendChild(n)
+      setTimeout(function() { if (n.parentNode) n.parentNode.removeChild(n) }, 8000)
+    }, secs * 1000)
+    return '已设置 ' + secs + ' 秒后提醒：' + p.message
+  }
+})
+
 // 模型联动
+// 主模型与简单模型的默认值分开维护：
+//   - 主任务模型走 DEFAULT_MAIN_MODELS（qwen 默认 qwen3.5-plus）
+//   - 简单任务模型走 DEFAULT_MODELS（qwen 默认 qwen-turbo，便宜/快）
+var DEFAULT_MODELS = { qwen: 'qwen-turbo', deepseek: 'deepseek-chat', openai: 'gpt-4', moonshot: 'moonshot-v1-8k', zhipu: 'glm-4' }
+var DEFAULT_MAIN_MODELS = { qwen: 'qwen3.5-plus', deepseek: 'deepseek-chat', openai: 'gpt-4', moonshot: 'moonshot-v1-8k', zhipu: 'glm-4' }
 document.getElementById('provider').addEventListener('change', function() {
-  var models = { qwen: 'qwen-turbo', deepseek: 'deepseek-chat', openai: 'gpt-4', moonshot: 'moonshot-v1-8k', zhipu: 'glm-4' }
-  document.getElementById('model').value = models[this.value] || ''
+  document.getElementById('model').value = DEFAULT_MAIN_MODELS[this.value] || ''
+})
+document.getElementById('simpleProvider').addEventListener('change', function() {
+  // 切换 simpleProvider 时，自动填入该供应商的默认小模型名作为提示值（仅在当前为空或为默认时）
+  var simpleModelInput = document.getElementById('simpleModel')
+  if (this.value && !simpleModelInput.value) {
+    simpleModelInput.value = DEFAULT_MODELS[this.value] || ''
+  }
 })
 
 input.addEventListener('keydown', function(e) { if (e.key === 'Enter') send() })
+
+// ============== MCP 工具代理 ==============
+// 浏览器无法 spawn 子进程,因此不能直接 createMCPClient({ transport: 'stdio' })。
+// 取而代之:服务端(demo/server.js)已经连好了 MCP Server,暴露 /mcp-tools 查询
+// 工具清单 + /mcp-call 代理执行。这里把服务端工具清单包装成本地 defineTool,
+// execute 走 fetch('/mcp-call') 回到服务端,服务端再走 MCP client 的 execute。
+//
+// 这样即便是 stdio-only 的 MCP server(比如社区的 web 搜索、github、playwright),
+// 浏览器一样能用,且 API key / MCP server 子进程都在服务端,安全。
+var mcpTools = []    // [Tool_Def],加载成功后追加到 Agent tools 数组
+
+/** 把 server 端 /mcp-tools 返回的描述包装成本地 defineTool。 */
+function wrapMcpTool(t) {
+  return defineTool({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    execute: async function(args) {
+      var r = await fetch('/mcp-call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: t.name, arguments: args }),
+      })
+      var payload = await r.json().catch(function() { return {} })
+      if (!r.ok) return 'Error from MCP proxy: ' + (payload.error || 'HTTP ' + r.status)
+      return payload.result != null ? String(payload.result) : ''
+    },
+  })
+}
+
+/**
+ * 同步浏览器侧的 MCP 状态:
+ *  1. 拉 /mcp-status 拿当前连接 + 预设清单
+ *  2. 重建 mcpTools(若已 connected,从 /mcp-tools 拿完整工具描述)
+ *  3. 更新徽章 + MCP 配置面板的下拉、状态条
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.silent] true 时不在聊天区追加提示消息(初次加载用)
+ */
+async function syncMcpStatus(opts) {
+  opts = opts || {}
+  var statusEl = document.getElementById('mcpPanelStatus')
+  var presetSel = document.getElementById('mcpPreset')
+  var badge = document.getElementById('mcpBadge')
+  var text = document.getElementById('mcpBadgeText')
+
+  try {
+    var res = await fetch('/mcp-status')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    var s = await res.json()
+
+    // 填充预设下拉(只填一次)
+    if (s.presets && presetSel.options.length <= 1) {
+      s.presets.forEach(function(p) {
+        var opt = document.createElement('option')
+        opt.value = p.id
+        opt.textContent = p.label
+        opt.title = p.description || ''
+        presetSel.appendChild(opt)
+      })
+    }
+
+    if (s.connected && s.toolCount > 0) {
+      // 用 /mcp-tools 拿完整描述,因为 /mcp-status 只给名字
+      var toolsRes = await fetch('/mcp-tools')
+      var toolsData = toolsRes.ok ? await toolsRes.json() : { tools: [] }
+      mcpTools = (toolsData.tools || []).map(wrapMcpTool)
+
+      badge.className = 'mcp-badge on'
+      text.textContent = 'MCP: ' + s.toolCount + ' 工具 (' + s.connections.length + ' server)'
+      badge.title = '已挂载:\n' + s.connections.map(function(c) { return '  • ' + c.name + ' (' + c.toolCount + ' 工具)' }).join('\n')
+
+      statusEl.className = 'mcp-panel-status ok'
+      statusEl.innerHTML = '✓ 已挂载 ' + s.connections.length + ' 个 server(' + s.toolCount + ' 工具): '
+      s.connections.forEach(function(c) {
+        var chip = document.createElement('span')
+        chip.className = 'tool-chip'
+        chip.textContent = c.name + '(' + c.toolCount + ')'
+        chip.title = c.toolNames.join(', ')
+        statusEl.appendChild(chip)
+        statusEl.appendChild(document.createTextNode(' '))
+      })
+      if (!opts.silent) addMsg('phase', '🔌 MCP 已挂载 ' + s.connections.length + ' 个 server,共 ' + s.toolCount + ' 个工具')
+    } else {
+      mcpTools = []
+      badge.className = 'mcp-badge off'
+      text.textContent = 'MCP 未挂载'
+      badge.title = '尚未挂载 MCP server。从下方面板选一个预设挂载,或启动时通过 MCP_SERVER_CMD 环境变量指定。'
+      statusEl.className = 'mcp-panel-status'
+      statusEl.textContent = '未连接 — 选一个预设点"挂载"即可'
+    }
+  } catch (err) {
+    // 没跑 demo server 或 server 没开 MCP — 静默降级,不影响本地工具
+    console.warn('[mcp] 无法获取 MCP 状态(可能是直接打开 browser.html 而没跑 demo server):', err.message)
+    statusEl.className = 'mcp-panel-status err'
+    statusEl.textContent = '✗ 无法连接 demo server。请用 demo server 启动:OPENAI_API_KEY=sk-xxx node demo/server.js,然后访问 http://localhost:3000/browser'
+  }
+}
+
+/** 选中预设并挂载到服务端。成功后自动刷新 Agent 工具列表,不丢对话。 */
+async function mcpConnect() {
+  var preset = document.getElementById('mcpPreset').value
+  if (!preset) { alert('请先在下拉里选一个预设'); return }
+  var btn = document.getElementById('mcpConnectBtn')
+  var statusEl = document.getElementById('mcpPanelStatus')
+  btn.disabled = true
+  statusEl.className = 'mcp-panel-status'
+  statusEl.textContent = '⏳ 正在挂载 ' + preset + '(首次跑 npx 会先下载,可能 10-30s)...'
+  try {
+    var res = await fetch('/mcp-connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: preset }),
+    })
+    var payload = await res.json().catch(function() { return {} })
+    if (!res.ok || !payload.ok) throw new Error(payload.error || 'HTTP ' + res.status)
+    await syncMcpStatus()
+    // 自动刷新 Agent 工具(不需要重新点"连接")
+    await refreshBrowserMcpTools()
+    addMsg('phase', '🔌 已挂载 "' + (payload.serverName || preset) + '"(' + payload.toolCount + ' 工具)。Agent 工具已自动更新,可以直接对话。')
+  } catch (err) {
+    statusEl.className = 'mcp-panel-status err'
+    statusEl.textContent = '✗ 挂载失败:' + err.message
+  } finally {
+    btn.disabled = false
+  }
+}
+
+async function mcpDisconnect() {
+  var statusEl = document.getElementById('mcpPanelStatus')
+  statusEl.className = 'mcp-panel-status'
+  statusEl.textContent = '⏳ 正在卸载...'
+  try {
+    var res = await fetch('/mcp-disconnect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),  // 卸载全部
+    })
+    var payload = await res.json().catch(function() { return {} })
+    if (!res.ok || !payload.ok) throw new Error(payload.error || 'HTTP ' + res.status)
+    await syncMcpStatus()
+    await refreshBrowserMcpTools()
+    addMsg('phase', '已卸载所有 MCP server。Agent 工具已更新。')
+  } catch (err) {
+    statusEl.className = 'mcp-panel-status err'
+    statusEl.textContent = '✗ 卸载失败:' + err.message
+  }
+}
+
+/** 从 /mcp-tools 拉最新工具列表,更新 mcpTools 数组,并热更新已连接的 Agent。 */
+async function refreshBrowserMcpTools() {
+  try {
+    var res = await fetch('/mcp-tools')
+    if (!res.ok) { mcpTools = []; return }
+    var data = await res.json()
+    mcpTools = (data.tools || []).map(wrapMcpTool)
+  } catch {
+    mcpTools = []
+  }
+  // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
+  if (agent) {
+    var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
+    agent.tools = baseTools.concat(mcpTools)
+  }
+}
+
+// 页面加载就尝试拉 MCP 状态,失败不影响其他功能
+if (location.protocol === 'file:') {
+  // 直接打开 HTML 文件时,MCP 代理不可用(需要 demo server)
+  var statusEl = document.getElementById('mcpPanelStatus')
+  statusEl.className = 'mcp-panel-status err'
+  statusEl.textContent = '⚠️ 当前是 file:// 模式,MCP 代理不可用。请用 demo server 启动后访问 http://localhost:3000/browser'
+  document.getElementById('mcpConnectBtn').disabled = true
+} else {
+  syncMcpStatus({ silent: true })
+}
 
 function initAgent() {
   var provider = document.getElementById('provider').value
   var model = document.getElementById('model').value
   var apiKey = document.getElementById('apikey').value.trim()
   var strategy = document.getElementById('strategy').value
+  var simpleProvider = document.getElementById('simpleProvider').value
+  var simpleModel = document.getElementById('simpleModel').value.trim()
+  var simpleApiKey = document.getElementById('simpleApiKey').value.trim()
+  var enableIntent = document.getElementById('enableIntent').checked
+  var enableAskUser = document.getElementById('enableAskUser').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
-  agent = new Agent({
+  var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
+  // MCP 工具追加到末尾,让 LLM 同时看到本地工具与远端 MCP 工具
+  var allTools = baseTools.concat(mcpTools)
+
+  var mcpNote = mcpTools.length > 0
+    ? ' 你还可以使用服务端挂载的 MCP 工具。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在。'
+    : ''
+
+  var agentOpts = {
     provider: provider,
     apiKey: apiKey,
     model: model,
-    systemPrompt: '你是一个有用的助手，可以查询时间和做数学计算。请用中文回答。',
-    tools: [getCurrentTime, calculate, showPopup],
+    systemPrompt: '你是一个功能丰富的助手，拥有多种工具能力：查询时间、数学计算、天气查询、单位换算、随机生成、文本处理、页面操作、记事本、弹窗提示、倒计时提醒。当用户请求信息不充分时（例如没说清城市、金额、单位等），优先使用 ask_user 工具向用户追问，而不是自行猜测。请用中文回答，善用工具完成用户请求。' + mcpNote,
+    tools: allTools,
     strategy: strategy,
+    enableIntentRecognition: enableIntent,
+    // Demo 场景：默认 maxRounds=300 会在 Qwen 长思考时给人"跑不完"的错觉，
+    // 12 轮足够覆盖 ask_user → 工具调用 → 合成回复的典型三轮流程外加几次
+    // 重试空间；超出上限框架会写入 `[max rounds exceeded]` 体面退出。
+    maxRounds: 12,
+  }
+  if (simpleProvider) agentOpts.simpleProvider = simpleProvider
+  if (simpleModel) agentOpts.simpleModel = simpleModel
+  if (simpleApiKey) agentOpts.simpleApiKey = simpleApiKey
+  if (enableAskUser) {
+    agentOpts.hooks = {
+      onAskUser: function(question) {
+        addMsg('phase', '❓ ask_user: ' + question)
+        return askUserDialog(question)
+      },
+    }
+  }
+
+  agent = new Agent(agentOpts)
+
+  // 订阅遥测事件，实时渲染到右侧面板。
+  // 说明：监听器为空时 Agent 也会维护 getLastRunMetrics / getSessionMetrics，
+  // 这里显式订阅以做 UI 可视化。失败时通过 console.warn 暴露。
+  var telemetryTypes = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call']
+  telemetryTypes.forEach(function(t) {
+    agent.on(t, function(payload) { renderTelemetry(t, payload) })
   })
+  // 'warn' 也接入一下，便于发现监听器 bug
+  agent.on('warn', function(w) { console.warn('[telemetry warn]', w) })
 
   var strategyLabel = strategy === 'plan_and_execute' ? 'Plan & Execute' : 'ReAct'
-  document.getElementById('status').textContent = '已连接: ' + provider + ' / ' + model + ' (' + strategyLabel + ')'
+  var simpleLabel = (simpleModel || simpleApiKey || simpleProvider)
+    ? ' | 简单模型: ' + (simpleProvider || provider) + '/' + (simpleModel || model)
+    : ''
+  var intentLabel = enableIntent ? ' | 意图识别: 开' : ''
+  document.getElementById('status').textContent = '已连接: ' + provider + ' / ' + model + ' (' + strategyLabel + ')' + simpleLabel + intentLabel
   document.getElementById('status').className = 'status ok'
   input.disabled = false
   sendBtn.disabled = false
@@ -173,7 +726,9 @@ function initAgent() {
   var tip = strategy === 'plan_and_execute'
     ? '当前使用 Plan & Execute 策略，会先制定计划再逐步执行。适合复杂多步骤任务。'
     : '当前使用 ReAct 策略，边思考边行动。'
-  addMsg('assistant', '已连接 ' + provider + ' (' + model + ')。' + tip + '\n\n试试问我"现在几点了"、"算一下 2^10"，或者"用弹窗告诉我一个笑话"。\n\n💡 切换策略后点击"连接"即可生效。')
+  addMsg('assistant', '已连接 ' + provider + ' (' + model + ')。' + tip + '\n\n我拥有 10 种工具能力，试试：\n  \u2022 "现在几点了" — 时间查询\n  \u2022 "算一下 2^10" — 数学计算\n  \u2022 "北京天气怎么样" — 天气查询\n  \u2022 "把 100 公里换算成英里" — 单位换算\n  \u2022 "帮我生成一个强密码" — 随机生成\n  \u2022 "统计一下这段话的字数：Hello World" — 文本处理\n  \u2022 "把页面切换成暗色模式" — 页面操作\n  \u2022 "帮我记一条笔记：明天开会" — 记事本\n  \u2022 "用弹窗告诉我一个笑话" — 弹窗提示\n  \u2022 "30秒后提醒我喝水" — 倒计时提醒\n\n\uD83E\uDDED 试试模糊请求触发意图识别：\n  \u2022 "帮我做点啥" — AMBIGUOUS 意图\n  \u2022 "查天气" — 不说城市，会触发 ask_user 追问\n  \u2022 "先算一下 100×50 的面积，再用这个值生成一个等长密码，最后把结果存为笔记" — COMPLEX 意图\n\n\uD83D\uDCE1 右侧遥测面板会实时展示：\n  \u2022 每次 LLM 调用的 tokens / 耗时 / operation.name（agent.intent / agent.chat / plan.* 等）\n  \u2022 每次工具执行的结果字节数 / 错误分类\n  \u2022 本次运行与会话累计的聚合指标\n\n\uD83D\uDCA1 切换策略或模型配置后点击"连接"即可生效。')
+  // 新连接 → 重置遥测面板
+  resetTelemetryUI_browser()
   input.focus()
 }
 
@@ -187,6 +742,7 @@ async function send() {
 
   addMsg('user', msg)
   var el = null
+  var reasoningEl = null
 
   try {
     var iter = agent.stream(msg)
@@ -199,13 +755,21 @@ async function send() {
           if (!el) { el = addMsg('assistant', ''); el.classList.add('typing') }
           el.textContent += ev.content
           break
+        case 'reasoning':
+          if (!reasoningEl) { reasoningEl = addMsg('reasoning', '') }
+          reasoningEl.textContent += ev.content
+          break
         case 'tool_start':
-          addMsg('tool', '🔧 ' + ev.name)
+          addMsg('tool', '🔧 ' + ev.name + (ev.arguments ? ' ' + JSON.stringify(ev.arguments) : ''))
           el = null
+          reasoningEl = null
           break
         case 'tool_end':
           addMsg('tool', '✅ ' + ev.name + ' → ' + (ev.result || '').slice(0, 100))
           el = null
+          break
+        case 'intent':
+          renderIntent(ev.intent || {})
           break
         case 'phase':
           addMsg('phase', '📋 ' + ev.message)
@@ -217,7 +781,22 @@ async function send() {
           addMsg('step', '▶ Step ' + (ev.index + 1) + ': ' + ev.description)
           break
         case 'step_complete':
-          addMsg('step', (ev.success ? '✅' : '❌') + ' Step ' + (ev.index + 1) + ' (' + ev.duration + 'ms)')
+          // `ev.step` carries the full PlanStep snapshot (toolCalls / rounds /
+          // usage). We surface the counts that are cheap to read and skip
+          // gracefully when an older server build doesn't supply them.
+          var icon = ev.success ? '✅' : '❌'
+          var extras = []
+          if (ev.step) {
+            if (ev.step.toolCalls && ev.step.toolCalls.length > 0) {
+              extras.push('tools=' + ev.step.toolCalls.length)
+            }
+            if (ev.step.rounds) extras.push('rounds=' + ev.step.rounds)
+            var u = ev.step.usage || {}
+            var tokens = (u.input_tokens || 0) + (u.output_tokens || 0)
+            if (tokens > 0) extras.push('tokens=' + tokens)
+          }
+          var suffix = extras.length ? ', ' + extras.join(', ') : ''
+          addMsg('step', icon + ' Step ' + (ev.index + 1) + ' (' + ev.duration + 'ms' + suffix + ')')
           break
         case 'plan_revised':
           addMsg('plan', '🔄 计划已修订:\n' + ev.plan.map(function(s) { return '  ' + (s.index + 1) + '. ' + s.description + ' [' + s.status + ']' }).join('\n'))
@@ -227,6 +806,9 @@ async function send() {
             el = addMsg('assistant', ev.content)
           }
           if (el && !el.textContent) el.remove()
+          if (ev.toolCallHistory && ev.toolCallHistory.length > 0) {
+            addMsg('phase', '📊 跨步工具调用共 ' + ev.toolCallHistory.length + ' 次')
+          }
           break
         case 'error':
           addMsg('error', '❌ ' + ev.message)
@@ -250,6 +832,235 @@ function addMsg(role, text) {
   chat.appendChild(el)
   chat.scrollTop = chat.scrollHeight
   return el
+}
+
+function renderIntent(it) {
+  var el = document.createElement('div')
+  el.className = 'msg intent'
+
+  var head = document.createElement('div')
+  head.className = 'intent-head'
+  head.appendChild(document.createTextNode('🧭 意图识别  '))
+
+  var complexity = (it.complexity || 'SIMPLE').toUpperCase()
+  var clarity = (it.clarity || 'CLEAR').toUpperCase()
+  var strategy = it.recommendedStrategy || 'react'
+  head.appendChild(tag(complexity, complexity === 'COMPLEX' ? 'complex' : ''))
+  head.appendChild(tag(clarity, clarity === 'AMBIGUOUS' ? 'ambiguous' : ''))
+  head.appendChild(tag('→ ' + strategy, ''))
+  el.appendChild(head)
+
+  if (it.reasoning) {
+    var why = document.createElement('div')
+    why.className = 'reasoning'
+    why.textContent = '理由：' + it.reasoning
+    el.appendChild(why)
+  }
+
+  if (it.filteredToolNames && it.filteredToolNames.length > 0) {
+    var tools = document.createElement('div')
+    tools.className = 'tools-list'
+    tools.textContent = '🛠 建议工具：' + it.filteredToolNames.join(', ') + ' （+ 基础工具集）'
+    el.appendChild(tools)
+  } else {
+    var tools2 = document.createElement('div')
+    tools2.className = 'tools-list'
+    tools2.textContent = '🛠 未过滤工具（回退为全量工具集）'
+    el.appendChild(tools2)
+  }
+
+  chat.appendChild(el)
+  chat.scrollTop = chat.scrollHeight
+  return el
+}
+
+function tag(text, extraCls) {
+  var t = document.createElement('span')
+  t.className = 'tag' + (extraCls ? ' ' + extraCls : '')
+  t.textContent = text
+  return t
+}
+
+// 交互式 ask_user：LLM 调用 ask_user 工具时，弹出对话框由真人回答。
+// 这里做成 Promise，resolve 后把用户回答回传给 Agent。
+function askUserDialog(question) {
+  return new Promise(function(resolve) {
+    var overlay = document.createElement('div')
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s'
+    var box = document.createElement('div')
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:24px 28px;max-width:520px;width:92%;box-shadow:0 8px 32px rgba(0,0,0,.2);animation:popIn .25s'
+    var title = document.createElement('div')
+    title.style.cssText = 'font-size:13px;color:#7e57c2;margin-bottom:8px;font-weight:600'
+    title.textContent = '🤖 Agent 想问你一个问题'
+    var q = document.createElement('div')
+    q.style.cssText = 'font-size:15px;color:#333;line-height:1.6;margin-bottom:14px;white-space:pre-wrap;word-break:break-word'
+    q.textContent = question
+    var inp = document.createElement('input')
+    inp.type = 'text'
+    inp.style.cssText = 'width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px;outline:none'
+    inp.placeholder = '你的回答...'
+    var row = document.createElement('div')
+    row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:14px'
+    var cancelBtn = document.createElement('button')
+    cancelBtn.style.cssText = 'padding:8px 16px;background:#eee;color:#666;border:none;border-radius:6px;font-size:14px;cursor:pointer'
+    cancelBtn.textContent = '跳过'
+    var okBtn = document.createElement('button')
+    okBtn.style.cssText = 'padding:8px 20px;background:#7e57c2;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer'
+    okBtn.textContent = '回答'
+    function submit(answer) { document.body.removeChild(overlay); resolve(answer) }
+    okBtn.onclick = function() { submit(inp.value.trim() || '(用户未提供回答)') }
+    cancelBtn.onclick = function() { submit('(用户跳过了此问题)') }
+    inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') okBtn.click() })
+    box.appendChild(title); box.appendChild(q); box.appendChild(inp); row.appendChild(cancelBtn); row.appendChild(okBtn); box.appendChild(row)
+    overlay.appendChild(box); document.body.appendChild(overlay)
+    setTimeout(function() { inp.focus() }, 50)
+  })
+}
+
+// ==== Telemetry rendering ====
+
+var eventsEl = document.getElementById('events')
+var telemetryPanel = document.getElementById('telemetryPanel')
+
+function toggleTelemetry(on) {
+  telemetryPanel.classList.toggle('collapsed', !on)
+}
+
+function clearEvents() {
+  eventsEl.innerHTML = '<div class="empty">事件流已清空</div>'
+}
+
+/** 毫秒 → 人读字符串：<1s "523ms" · <60s "5.2s" · 否则 "2m18s" */
+function formatDuration(ms) {
+  if (ms < 1000) return Math.round(ms) + 'ms'
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's'
+  var m = Math.floor(ms / 60000)
+  var s = Math.round((ms % 60000) / 1000)
+  return m + 'm' + s + 's'
+}
+
+function renderTelemetry(name, payload) {
+  // 移除空状态提示
+  var empty = eventsEl.querySelector('.empty')
+  if (empty) empty.remove()
+
+  // 更新 trace 标签
+  if (name === 'session.start' && payload.traceId) {
+    document.getElementById('traceBadge').textContent = 'trace ' + payload.traceId.slice(0, 8)
+  }
+  if (name === 'session.end') {
+    updateRunMetricsFromSessionEnd(payload)
+    if (agent) updateSessionMetricsFromAgent()
+  }
+
+  // 同 demo/index.html：round.start 时在主聊天区垫一条 "思考中" 消息，
+  // round.end 时原地替换成耗时。防止用户误以为 Qwen 长思考是卡死。
+  if (name === 'round.start') {
+    var r = addMsg('phase', '⏳ Round ' + payload.round + ' 思考中…')
+    r.dataset.roundSpan = payload.spanId
+  }
+  if (name === 'round.end') {
+    var r2 = chat.querySelector('[data-round-span="' + payload.spanId + '"]')
+    if (r2) r2.textContent = '✓ Round ' + payload.round + ' 完成 (' + formatDuration(payload.durationMs) + ')'
+  }
+
+  var el = document.createElement('div')
+  el.className = 'event'
+
+  var row = document.createElement('div')
+  row.className = 'evt-row'
+
+  var tag = document.createElement('span')
+  tag.className = 'evt-name ' + name.replace('.', '-')
+  if ((name === 'llm.call' || name === 'tool.call') && payload.ok === false) {
+    tag.classList.add('failed')
+  }
+  tag.textContent = name
+  row.appendChild(tag)
+
+  var detail = document.createElement('span')
+  detail.className = 'evt-detail'
+  detail.textContent = formatDetail(name, payload)
+  row.appendChild(detail)
+  el.appendChild(row)
+
+  var meta = buildMeta(payload)
+  if (meta) {
+    var metaRow = document.createElement('div')
+    metaRow.className = 'evt-meta'
+    metaRow.textContent = meta
+    el.appendChild(metaRow)
+  }
+
+  eventsEl.appendChild(el)
+  eventsEl.scrollTop = eventsEl.scrollHeight
+}
+
+function formatDetail(name, p) {
+  switch (name) {
+    case 'session.start':
+      return 'strategy=' + p.strategy
+    case 'session.end': {
+      var u = p.usage || {}
+      return 'ok=' + p.ok + '  rounds=' + p.totalRounds + '  llm=' + p.totalLlmCalls + '  tool=' + p.totalToolCalls + '  tokens=' + (u.input_tokens != null ? u.input_tokens : '—') + '/' + (u.output_tokens != null ? u.output_tokens : '—')
+    }
+    case 'round.start':
+      return '#' + p.round
+    case 'round.end':
+      return '#' + p.round + '  ' + Math.round(p.durationMs) + 'ms'
+    case 'llm.call': {
+      var op = p['gen_ai.operation.name']
+      var sys = p['gen_ai.system']
+      var inTok = p['gen_ai.usage.input_tokens']
+      var outTok = p['gen_ai.usage.output_tokens']
+      var dur = Math.round(p['gen_ai.client.operation.duration'])
+      var errPart = p.ok === false && p.error ? '  ✗ ' + p.error.type + ': ' + (p.error.message || '').slice(0, 40) : ''
+      return op + '  ' + sys + '  ' + (inTok != null ? inTok : '—') + '↓/' + (outTok != null ? outTok : '—') + '↑  ' + dur + 'ms' + errPart
+    }
+    case 'tool.call': {
+      var dur2 = Math.round(p.durationMs)
+      var errPart2 = p.ok === false ? '  ✗ ' + p.errorKind : ''
+      return p.name + '  ' + dur2 + 'ms  ' + p.bytes + 'B' + errPart2
+    }
+    default:
+      return ''
+  }
+}
+
+function buildMeta(p) {
+  if (!p || !p.spanId) return ''
+  var parts = ['span ' + p.spanId.slice(0, 8)]
+  if (p.parentSpanId) parts.push('← ' + p.parentSpanId.slice(0, 8))
+  return parts.join('  ')
+}
+
+function updateRunMetricsFromSessionEnd(payload) {
+  document.getElementById('mRounds').textContent = payload.totalRounds
+  document.getElementById('mWall').textContent = Math.round(payload.wallClockMs) + 'ms'
+  document.getElementById('mLlm').textContent = payload.totalLlmCalls
+  document.getElementById('mTool').textContent = payload.totalToolCalls
+  var u = payload.usage || {}
+  document.getElementById('mIn').textContent = u.input_tokens != null ? u.input_tokens : '—'
+  document.getElementById('mOut').textContent = u.output_tokens != null ? u.output_tokens : '—'
+}
+
+function updateSessionMetricsFromAgent() {
+  var sm = agent.getSessionMetrics()
+  document.getElementById('sRuns').textContent = sm.totalRuns
+  document.getElementById('sRounds').textContent = sm.totalRounds
+  document.getElementById('sLlm').textContent = sm.totalLlmCalls
+  document.getElementById('sTool').textContent = sm.totalToolCalls
+  document.getElementById('sIn').textContent = sm.usage.input_tokens
+  document.getElementById('sOut').textContent = sm.usage.output_tokens
+}
+
+function resetTelemetryUI_browser() {
+  eventsEl.innerHTML = '<div class="empty">发送一条消息即可看到事件流</div>'
+  document.getElementById('traceBadge').textContent = '—'
+  var runIds = ['mRounds','mWall','mLlm','mTool','mIn','mOut']
+  for (var i = 0; i < runIds.length; i++) document.getElementById(runIds[i]).textContent = '—'
+  var sessIds = ['sRuns','sRounds','sLlm','sTool','sIn','sOut']
+  for (var j = 0; j < sessIds.length; j++) document.getElementById(sessIds[j]).textContent = '0'
 }
 </script>
 </body>

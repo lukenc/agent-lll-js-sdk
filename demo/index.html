@@ -10,10 +10,30 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .header { background: #1a1a2e; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
 .header h1 { font-size: 18px; font-weight: 600; }
 .header .tag { background: #16213e; padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #a0a0c0; }
+.header .mcp-badge {
+  background: #1e3a5f;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: #9ccdff;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: 'SF Mono', Menlo, monospace;
+}
+.header .mcp-badge.off { background: #2a2a3e; color: #666; }
+.header .mcp-badge.on { background: #1e4620; color: #a5d6a7; }
+.header .mcp-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
 .header .strategy-switch { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .header .strategy-switch select { padding: 4px 8px; border-radius: 4px; border: 1px solid #444; background: #16213e; color: #e0e0e0; font-size: 12px; cursor: pointer; }
 .header .strategy-label { color: #a0a0c0; font-size: 12px; }
-.chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+.header .telemetry-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a0a0c0; cursor: pointer; user-select: none; }
+.header .telemetry-toggle input { cursor: pointer; }
+
+/* 主体分两栏：左聊天 / 右遥测面板 */
+.main { flex: 1; display: flex; overflow: hidden; }
+.chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
 .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-size: 14px; }
 .msg.user { align-self: flex-end; background: #1a1a2e; color: #fff; border-bottom-right-radius: 4px; }
 .msg.assistant { align-self: flex-start; background: #fff; color: #333; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -25,6 +45,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .typing { display: inline-block; }
 .typing::after { content: '▊'; animation: blink 0.7s infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+
 .input-area { background: #fff; border-top: 1px solid #e0e0e0; padding: 16px 24px; display: flex; gap: 12px; }
 .input-area input { flex: 1; padding: 10px 16px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; outline: none; }
 .input-area input:focus { border-color: #1a1a2e; }
@@ -34,21 +55,191 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .actions { display: flex; gap: 8px; }
 .actions button.secondary { background: transparent; color: #666; border: 1px solid #ddd; }
 .actions button.secondary:hover { background: #f5f5f5; }
+
+/* ===== 遥测面板 ===== */
+.telemetry {
+  width: 380px;
+  border-left: 1px solid #e0e0e0;
+  background: #fafbfc;
+  display: flex;
+  flex-direction: column;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 12px;
+}
+.telemetry.collapsed { display: none; }
+.telemetry .panel-title {
+  padding: 12px 16px;
+  background: #1a1a2e;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #16213e;
+}
+.telemetry .panel-title .badge {
+  background: #16213e;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  color: #a0a0c0;
+  font-weight: normal;
+}
+.telemetry .metrics {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e0e0e0;
+  background: #fff;
+}
+.telemetry .metrics-section { margin-bottom: 10px; }
+.telemetry .metrics-section:last-child { margin-bottom: 0; }
+.telemetry .metrics-section .head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: #666;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.telemetry .metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+}
+.telemetry .metric { display: flex; flex-direction: column; }
+.telemetry .metric .label { color: #999; font-size: 10px; }
+.telemetry .metric .value { color: #1a1a2e; font-size: 14px; font-weight: 600; font-family: 'SF Mono', Menlo, monospace; }
+.telemetry .events {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.telemetry .events-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: #666;
+  font-weight: 600;
+  padding: 4px 4px 6px;
+  border-bottom: 1px solid #e0e0e0;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.telemetry .events-head button {
+  background: transparent;
+  border: 1px solid #ddd;
+  color: #666;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+}
+.telemetry .event {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  font-family: 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.telemetry .event .evt-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.telemetry .event .evt-name {
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.telemetry .event .evt-name.session-start,
+.telemetry .event .evt-name.session-end { background: #ede7f6; color: #4527a0; }
+.telemetry .event .evt-name.round-start,
+.telemetry .event .evt-name.round-end { background: #fff3e0; color: #e65100; }
+.telemetry .event .evt-name.llm-call { background: #e1f5fe; color: #0277bd; }
+.telemetry .event .evt-name.tool-call { background: #e8f5e9; color: #2e7d32; }
+.telemetry .event .evt-name.tool-call.failed { background: #ffebee; color: #c62828; }
+.telemetry .event .evt-name.llm-call.failed { background: #ffebee; color: #c62828; }
+.telemetry .event .evt-detail { color: #555; font-size: 11px; }
+.telemetry .event .evt-meta { color: #999; font-size: 10px; }
+.telemetry .event .span-id { color: #aaa; font-size: 10px; }
+.telemetry .event .arrow { color: #aaa; font-size: 10px; margin-right: 2px; }
+
+.telemetry .empty {
+  color: #bbb;
+  text-align: center;
+  padding: 24px 12px;
+  font-style: italic;
+  font-size: 11px;
+}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>lll-web-agent</h1>
   <span class="tag">Demo</span>
+  <span class="mcp-badge off" id="mcpBadge" title="MCP Server 状态">
+    <span class="dot"></span>
+    <span id="mcpBadgeText">MCP 未连接</span>
+  </span>
   <div class="strategy-switch">
     <span class="strategy-label">执行策略:</span>
     <select id="strategy" onchange="switchStrategy(this.value)">
       <option value="react">ReAct（默认）</option>
       <option value="plan_and_execute">Plan & Execute</option>
     </select>
+    <label class="telemetry-toggle">
+      <input type="checkbox" id="showTelemetry" checked onchange="toggleTelemetry(this.checked)">
+      遥测面板
+    </label>
   </div>
 </div>
-<div class="chat" id="chat"></div>
+<div class="main">
+  <div class="chat" id="chat"></div>
+  <aside class="telemetry" id="telemetryPanel">
+    <div class="panel-title">
+      📡 Telemetry
+      <span class="badge" id="traceBadge">—</span>
+    </div>
+    <div class="metrics" id="metrics">
+      <div class="metrics-section">
+        <div class="head">当前 Run</div>
+        <div class="metrics-grid">
+          <div class="metric"><span class="label">rounds</span><span class="value" id="mRounds">—</span></div>
+          <div class="metric"><span class="label">wall-clock</span><span class="value" id="mWall">—</span></div>
+          <div class="metric"><span class="label">llm calls</span><span class="value" id="mLlm">—</span></div>
+          <div class="metric"><span class="label">tool calls</span><span class="value" id="mTool">—</span></div>
+          <div class="metric"><span class="label">input tokens</span><span class="value" id="mIn">—</span></div>
+          <div class="metric"><span class="label">output tokens</span><span class="value" id="mOut">—</span></div>
+        </div>
+      </div>
+      <div class="metrics-section">
+        <div class="head">Session 累计</div>
+        <div class="metrics-grid">
+          <div class="metric"><span class="label">total runs</span><span class="value" id="sRuns">0</span></div>
+          <div class="metric"><span class="label">total rounds</span><span class="value" id="sRounds">0</span></div>
+          <div class="metric"><span class="label">total llm</span><span class="value" id="sLlm">0</span></div>
+          <div class="metric"><span class="label">total tools</span><span class="value" id="sTool">0</span></div>
+          <div class="metric"><span class="label">total input</span><span class="value" id="sIn">0</span></div>
+          <div class="metric"><span class="label">total output</span><span class="value" id="sOut">0</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="events-head">
+      <span>事件流</span>
+      <button onclick="clearEvents()">清空</button>
+    </div>
+    <div class="events" id="events">
+      <div class="empty">发送一条消息，即可看到 llm.call / tool.call / round.* / session.* 实时事件流</div>
+    </div>
+  </aside>
+</div>
 <div class="input-area">
   <input id="input" placeholder="输入消息..." autocomplete="off" />
   <div class="actions">
@@ -60,6 +251,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 const chat = document.getElementById('chat')
 const input = document.getElementById('input')
 const sendBtn = document.getElementById('send')
+const eventsEl = document.getElementById('events')
+const telemetryPanel = document.getElementById('telemetryPanel')
 let sending = false
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } })
@@ -117,9 +310,25 @@ async function send() {
             case 'step_start':
               addMsg('step', `▶ Step ${event.index + 1}: ${event.description}`)
               break
-            case 'step_complete':
-              addMsg('step', `${event.success ? '✅' : '❌'} Step ${event.index + 1} (${event.duration}ms)`)
+            case 'step_complete': {
+              // `event.step` is the new PlanStep snapshot added alongside the
+              // legacy fields. Fall back to the plain fields when absent (e.g.
+              // older server builds) so the handler remains forward-compat.
+              const s = event.step
+              const icon = event.success ? '✅' : '❌'
+              const extras = []
+              if (s) {
+                if (Array.isArray(s.toolCalls) && s.toolCalls.length > 0) {
+                  extras.push(`tools=${s.toolCalls.length}`)
+                }
+                if (s.rounds) extras.push(`rounds=${s.rounds}`)
+                const tokens = (s.usage?.input_tokens ?? 0) + (s.usage?.output_tokens ?? 0)
+                if (tokens > 0) extras.push(`tokens=${tokens}`)
+              }
+              const suffix = extras.length ? ', ' + extras.join(', ') : ''
+              addMsg('step', `${icon} Step ${event.index + 1} (${event.duration}ms${suffix})`)
               break
+            }
             case 'plan_revised':
               addMsg('plan', '🔄 计划已修订:\n' + event.plan.map(s => `  ${s.index + 1}. ${s.description} [${s.status}]`).join('\n'))
               break
@@ -127,9 +336,21 @@ async function send() {
               if (event.content && !assistantEl) {
                 assistantEl = addMsg('assistant', event.content)
               }
+              // Surface the cross-step tool-call aggregate when running
+              // plan_and_execute — gives the user a one-line summary of
+              // how many tools were invoked across the whole plan.
+              if (Array.isArray(event.toolCallHistory) && event.toolCallHistory.length > 0) {
+                addMsg('phase', `📊 跨步工具调用共 ${event.toolCallHistory.length} 次`)
+              }
               break
             case 'error':
               addMsg('error', `❌ ${event.message}`)
+              break
+            case 'telemetry':
+              renderTelemetry(event.name, event.payload)
+              break
+            case 'metrics':
+              renderMetrics(event.lastRun, event.session)
               break
           }
         } catch {}
@@ -155,11 +376,170 @@ function addMsg(role, text) {
   return el
 }
 
+// ==== Telemetry rendering ====
+
+function renderTelemetry(name, payload) {
+  // 移除空状态提示
+  const empty = eventsEl.querySelector('.empty')
+  if (empty) empty.remove()
+
+  const el = document.createElement('div')
+  el.className = 'event'
+
+  // 更新 traceId 标签
+  if (name === 'session.start' && payload.traceId) {
+    document.getElementById('traceBadge').textContent = 'trace ' + payload.traceId.slice(0, 8)
+  }
+
+  // 在主聊天区推一个 "轮次进行中" 的 phase 条 —— Qwen 单轮可能要 5~15s，
+  // 没有 tool_call 的轮次（例如开场白）会让主区域看起来完全没反应；这里拿
+  // round.start 时垫一条消息，round.end 时原地替换成耗时，既不污染事件流
+  // 面板，也能让用户看到"还在跑"。
+  if (name === 'round.start') {
+    const r = addMsg('phase', `⏳ Round ${payload.round} 思考中…`)
+    r.dataset.roundSpan = payload.spanId
+  }
+  if (name === 'round.end') {
+    const r = chat.querySelector(`[data-round-span="${payload.spanId}"]`)
+    if (r) r.textContent = `✓ Round ${payload.round} 完成 (${formatDuration(payload.durationMs)})`
+  }
+
+  const row = document.createElement('div')
+  row.className = 'evt-row'
+
+  const tag = document.createElement('span')
+  tag.className = 'evt-name ' + name.replace('.', '-')
+  if ((name === 'llm.call' || name === 'tool.call') && payload.ok === false) {
+    tag.classList.add('failed')
+  }
+  tag.textContent = name
+  row.appendChild(tag)
+
+  // 事件特定的摘要信息
+  const detail = document.createElement('span')
+  detail.className = 'evt-detail'
+  detail.textContent = formatDetail(name, payload)
+  row.appendChild(detail)
+
+  el.appendChild(row)
+
+  // meta 行：spanId + 耗时
+  const meta = buildMeta(name, payload)
+  if (meta) {
+    const metaRow = document.createElement('div')
+    metaRow.className = 'evt-meta'
+    metaRow.textContent = meta
+    el.appendChild(metaRow)
+  }
+
+  eventsEl.appendChild(el)
+  eventsEl.scrollTop = eventsEl.scrollHeight
+
+  // 每次 llm.call / tool.call 后立即更新当前 Run 指标（近似值，最终以 metrics 事件为准）。
+  if (name === 'llm.call' || name === 'tool.call' || name === 'round.start') {
+    // 从累计事件里推算不够准确（比如 ok:true 计数），交给服务端下发的 metrics 事件负责最终值。
+    // 这里仅在 session.end 中显式渲染。
+  }
+  if (name === 'session.end') {
+    updateRunMetricsFromSessionEnd(payload)
+  }
+}
+
+function formatDetail(name, p) {
+  switch (name) {
+    case 'session.start':
+      return `strategy=${p.strategy}`
+    case 'session.end': {
+      const u = p.usage || {}
+      return `ok=${p.ok}  rounds=${p.totalRounds}  llm=${p.totalLlmCalls}  tool=${p.totalToolCalls}  tokens=${u.input_tokens ?? '—'}/${u.output_tokens ?? '—'}`
+    }
+    case 'round.start':
+      return `#${p.round}`
+    case 'round.end':
+      return `#${p.round}  ${Math.round(p.durationMs)}ms`
+    case 'llm.call': {
+      const op = p['gen_ai.operation.name']
+      const sys = p['gen_ai.system']
+      const inTok = p['gen_ai.usage.input_tokens']
+      const outTok = p['gen_ai.usage.output_tokens']
+      const dur = Math.round(p['gen_ai.client.operation.duration'])
+      const ok = p.ok
+      const errPart = !ok && p.error ? `  ✗ ${p.error.type}: ${p.error.message.slice(0, 40)}` : ''
+      return `${op}  ${sys}  ${inTok ?? '—'}↓/${outTok ?? '—'}↑ tokens  ${dur}ms${errPart}`
+    }
+    case 'tool.call': {
+      const name = p.name
+      const ok = p.ok
+      const dur = Math.round(p.durationMs)
+      const bytes = p.bytes
+      const errPart = !ok ? `  ✗ ${p.errorKind}` : ''
+      return `${name}  ${dur}ms  ${bytes}B${errPart}`
+    }
+    default:
+      return JSON.stringify(p).slice(0, 60)
+  }
+}
+
+function buildMeta(name, p) {
+  if (!p.spanId) return ''
+  const parts = [`span ${p.spanId.slice(0, 8)}`]
+  if (p.parentSpanId) parts.push(`← ${p.parentSpanId.slice(0, 8)}`)
+  return parts.join('  ')
+}
+
+function updateRunMetricsFromSessionEnd(payload) {
+  document.getElementById('mRounds').textContent = payload.totalRounds
+  document.getElementById('mWall').textContent = Math.round(payload.wallClockMs) + 'ms'
+  document.getElementById('mLlm').textContent = payload.totalLlmCalls
+  document.getElementById('mTool').textContent = payload.totalToolCalls
+  const u = payload.usage || {}
+  document.getElementById('mIn').textContent = u.input_tokens ?? '—'
+  document.getElementById('mOut').textContent = u.output_tokens ?? '—'
+}
+
+function renderMetrics(lastRun, session) {
+  if (lastRun) updateRunMetricsFromSessionEnd(lastRun)
+  if (session) {
+    document.getElementById('sRuns').textContent = session.totalRuns
+    document.getElementById('sRounds').textContent = session.totalRounds
+    document.getElementById('sLlm').textContent = session.totalLlmCalls
+    document.getElementById('sTool').textContent = session.totalToolCalls
+    const u = session.usage || {}
+    document.getElementById('sIn').textContent = u.input_tokens
+    document.getElementById('sOut').textContent = u.output_tokens
+  }
+}
+
+function clearEvents() {
+  eventsEl.innerHTML = '<div class="empty">事件流已清空</div>'
+}
+
+/** 毫秒 → 人读字符串：<1s "523ms" · <60s "5.2s" · 否则 "2m18s" */
+function formatDuration(ms) {
+  if (ms < 1000) return Math.round(ms) + 'ms'
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's'
+  const m = Math.floor(ms / 60000)
+  const s = Math.round((ms % 60000) / 1000)
+  return m + 'm' + s + 's'
+}
+
+function toggleTelemetry(on) {
+  telemetryPanel.classList.toggle('collapsed', !on)
+}
+
 async function resetChat() {
   try {
     await fetch('/reset', { method: 'POST' })
   } catch {}
   chat.innerHTML = ''
+  eventsEl.innerHTML = '<div class="empty">session 已重置</div>'
+  document.getElementById('traceBadge').textContent = '—'
+  for (const id of ['mRounds','mWall','mLlm','mTool','mIn','mOut']) {
+    document.getElementById(id).textContent = '—'
+  }
+  for (const id of ['sRuns','sRounds','sLlm','sTool','sIn','sOut']) {
+    document.getElementById(id).textContent = '0'
+  }
   addMsg('assistant', '会话已重置，请开始新的对话。')
 }
 
@@ -172,19 +552,45 @@ async function switchStrategy(strategy) {
     })
     if (!res.ok) throw new Error('Server returned ' + res.status)
     chat.innerHTML = ''
+    eventsEl.innerHTML = '<div class="empty">策略已切换 — 下一次发送即会展示新的事件流</div>'
+    for (const id of ['mRounds','mWall','mLlm','mTool','mIn','mOut']) {
+      document.getElementById(id).textContent = '—'
+    }
+    for (const id of ['sRuns','sRounds','sLlm','sTool','sIn','sOut']) {
+      document.getElementById(id).textContent = '0'
+    }
     const label = strategy === 'plan_and_execute' ? 'Plan & Execute' : 'ReAct'
-    addMsg('assistant', `已切换到 ${label} 策略。${strategy === 'plan_and_execute' ? '\n\nPlan & Execute 模式会先制定执行计划，再逐步执行。适合复杂多步骤任务。' : '\n\nReAct 模式边思考边行动，适合简单直接的任务。'}`)
+    addMsg('assistant', `已切换到 ${label} 策略。${strategy === 'plan_and_execute' ? '\n\nPlan & Execute 模式会先制定执行计划，再逐步执行。适合复杂多步骤任务。遥测面板会展示 plan.planner / plan.step / plan.synthesizer 不同 operation.name 的 llm.call 事件。' : '\n\nReAct 模式边思考边行动，适合简单直接的任务。遥测面板会展示每一轮的 round.start → llm.call → tool.call → round.end 事件。'}`)
   } catch (err) {
     addMsg('error', `切换策略失败: ${err.message}\n请确认已启动 Demo 服务器: OPENAI_API_KEY=sk-xxx node demo/server.js`)
   }
 }
 
-addMsg('assistant', '你好！我是 lll-web-agent 的 Demo。我可以查询时间和做数学计算。\n\n💡 右上角可以切换执行策略：\n  • ReAct — 边思考边行动（默认）\n  • Plan & Execute — 先规划再执行（适合复杂任务）')
+addMsg('assistant', '你好！我是 lll-web-agent 的 Demo。我可以查询时间和做数学计算。\n\n💡 右上角可以切换执行策略：\n  • ReAct — 边思考边行动（默认）\n  • Plan & Execute — 先规划再执行（适合复杂任务）\n\n📡 右侧遥测面板会实时展示事件流和聚合指标：\n  • llm.call — 每次 LLM 调用的 tokens / 耗时 / operation.name\n  • tool.call — 每次工具执行的结果 / 错误分类 / 字节数\n  • round.* / session.* — ReAct 轮次和会话生命周期\n\n🔌 MCP 集成：启动服务器时设置 MCP_SERVER_CMD 可挂载社区/自建 MCP Server 的工具到 agent.tools（状态见左上角徽章）')
 input.focus()
 
-// 页面加载时同步服务端当前策略
+// 页面加载时同步服务端当前策略与 session 指标
 fetch('/strategy').then(r => r.json()).then(({ strategy }) => {
   document.getElementById('strategy').value = strategy
+}).catch(() => {})
+fetch('/metrics').then(r => r.json()).then(({ lastRun, session }) => {
+  renderMetrics(lastRun, session)
+}).catch(() => {})
+
+// 查询当前 MCP 挂载状态，渲染左上角徽章
+fetch('/mcp-status').then(r => r.json()).then((s) => {
+  const badge = document.getElementById('mcpBadge')
+  const text = document.getElementById('mcpBadgeText')
+  if (s.connected && s.toolCount > 0) {
+    badge.className = 'mcp-badge on'
+    text.textContent = `MCP: ${s.toolCount} 工具 (${s.serverName})`
+    badge.title = `MCP Server "${s.serverName}" 已挂载:\n` + s.toolNames.map(n => '  • ' + n).join('\n')
+    addMsg('phase', `🔌 已挂载 MCP Server "${s.serverName}"，工具数 ${s.toolCount}: ${s.toolNames.join(', ')}`)
+  } else {
+    badge.className = 'mcp-badge off'
+    text.textContent = 'MCP 未挂载'
+    badge.title = '服务器未配置 MCP_SERVER_CMD 环境变量，未挂载任何 MCP Server。\n\n示例:\n  MCP_SERVER_CMD=node \\\n  MCP_SERVER_ARGS="src/mcp/__fixtures__/mock-mcp-server.js" \\\n  OPENAI_API_KEY=sk-xxx node demo/server.js'
+  }
 }).catch(() => {})
 </script>
 </body>

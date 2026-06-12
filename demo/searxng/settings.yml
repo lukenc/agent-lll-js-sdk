@@ -1,0 +1,37 @@
+# SearXNG 配置 — 仅用于本仓库 demo 的 MCP 搜索后端
+# 关键点:
+#   1. formats 里必须含 json,否则 MCP server 拿不到结构化结果
+#   2. 国内网络下 Google/DuckDuckGo/Brave/Wikipedia 全部超时,
+#      这里只启用国内可直连的引擎(百度/必应),并调长超时
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - baidu
+
+server:
+  secret_key: "lll-web-agent-demo-searxng-secret-change-me"
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+  default_lang: "zh-CN"
+  safe_search: 0
+
+outgoing:
+  # 调长超时(默认 3s 对国内访问 bing.com 偏紧)
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+
+engines:
+  - name: bing
+    engine: bing
+    disabled: false
+    timeout: 10.0
+  - name: baidu
+    engine: baidu
+    disabled: false
+    timeout: 10.0
