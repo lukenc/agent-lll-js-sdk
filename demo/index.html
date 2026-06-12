@@ -42,6 +42,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .msg.plan { align-self: flex-start; background: #e3f2fd; color: #1565c0; font-size: 13px; border-radius: 8px; border-left: 3px solid #1565c0; }
 .msg.phase { align-self: center; background: #f3e5f5; color: #7b1fa2; font-size: 12px; border-radius: 16px; padding: 6px 16px; }
 .msg.step { align-self: flex-start; background: #fff8e1; color: #f57f17; font-size: 12px; font-family: monospace; border-radius: 8px; border-left: 3px solid #f57f17; }
+.msg.context { align-self: flex-start; background: #eef7f4; color: #24564a; font-size: 12px; font-family: 'SF Mono', Menlo, monospace; border-radius: 8px; border-left: 3px solid #2a7c68; max-width: 90%; }
 .typing { display: inline-block; }
 .typing::after { content: '▊'; animation: blink 0.7s infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -352,6 +353,9 @@ async function send() {
             case 'metrics':
               renderMetrics(event.lastRun, event.session)
               break
+            case 'context':
+              renderContextSnapshot(event.context)
+              break
           }
         } catch {}
       }
@@ -374,6 +378,24 @@ function addMsg(role, text) {
   chat.appendChild(el)
   chat.scrollTop = chat.scrollHeight
   return el
+}
+
+function renderContextSnapshot(context) {
+  if (!context || !context.counts) return
+  const counts = context.counts
+  const visible = context.tracks?.visible || []
+  const artifacts = context.tracks?.artifacts || []
+  const latestVisible = visible.slice(-2).map(m => `${m.role}: ${String(m.content || '').slice(0, 40)}`).join('\n')
+  addMsg(
+    'context',
+    '🧠 RuntimeHistory 轨道快照\n' +
+    `all: ${counts.all} events\n` +
+    `visible: ${counts.visible} messages\n` +
+    `model: ${counts.model} messages\n` +
+    `artifacts: ${counts.artifacts} items` +
+    (latestVisible ? `\n\nvisible 最近内容:\n${latestVisible}` : '') +
+    (artifacts.length ? `\n\nartifacts: ${artifacts.map(a => a.kind || a.type || 'event').join(', ')}` : '')
+  )
 }
 
 // ==== Telemetry rendering ====
@@ -576,6 +598,7 @@ fetch('/strategy').then(r => r.json()).then(({ strategy }) => {
 fetch('/metrics').then(r => r.json()).then(({ lastRun, session }) => {
   renderMetrics(lastRun, session)
 }).catch(() => {})
+fetch('/context').then(r => r.json()).then(renderContextSnapshot).catch(() => {})
 
 // 查询当前 MCP 挂载状态，渲染左上角徽章
 fetch('/mcp-status').then(r => r.json()).then((s) => {
