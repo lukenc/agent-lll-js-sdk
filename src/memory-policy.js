@@ -115,5 +115,8 @@ export class SummaryPolicy {
 
 export function cloneMessage(message) {
   if (message == null || typeof message !== 'object') return message
-  return JSON.parse(JSON.stringify(message))
+  if (Array.isArray(message)) return message.map(cloneMessage)
+  const out = Object.create(Object.getPrototypeOf(message))
+  for (const key of Object.keys(message)) out[key] = cloneMessage(message[key])
+  return out
 }

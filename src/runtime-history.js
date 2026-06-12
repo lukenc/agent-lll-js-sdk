@@ -2,7 +2,10 @@ const BUILTIN_TRACKS = new Set(['all', 'visible', 'model', 'artifacts', 'interna
 
 function clonePlain(value) {
   if (value == null || typeof value !== 'object') return value
-  return JSON.parse(JSON.stringify(value))
+  if (Array.isArray(value)) return value.map(clonePlain)
+  const out = Object.create(Object.getPrototypeOf(value))
+  for (const key of Object.keys(value)) out[key] = clonePlain(value[key])
+  return out
 }
 
 function defaultMessageTracks(message) {
