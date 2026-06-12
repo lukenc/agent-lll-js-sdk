@@ -12,6 +12,7 @@
 
 import { syncChat, streamChat } from './llm-client.js'
 import { formatToolsForOpenAI, parseToolCalls, formatToolResult } from './tool.js'
+import { childContext, extractUsage, utf8ByteLength } from './telemetry.js'
 
 /** 计划步骤状态 */
 export const StepStatus = {
@@ -22,7 +23,46 @@ export const StepStatus = {
   SKIPPED: 'skipped',
 }
 
-/** 单个计划步骤 */
+/**
+ * Zero-valued `Usage_Object` — matches the shape produced by
+ * `extractUsage()` / `_sumUsage()` in telemetry/agent. Every field is a
+ * number (no `null`) so callers can always sum into it without null-checks;
+ * this is the per-step accumulator, not a direct provider echo.
+ */
+function _zeroStepUsage() {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_tokens: 0,
+    reasoning_tokens: 0,
+  }
+}
+
+/**
+ * Null-safe addition of a provider-normalized Usage_Object into an
+ * accumulator. `null` contributes 0 so that steps without usage reports
+ * don't poison the total (matches agent.js::_foldRunIntoSession).
+ * @param {{input_tokens:number,output_tokens:number,cached_tokens:number,reasoning_tokens:number}} acc
+ * @param {{input_tokens:number|null,output_tokens:number|null,cached_tokens:number|null,reasoning_tokens:number|null}} usage
+ */
+function _addUsage(acc, usage) {
+  if (!usage) return
+  acc.input_tokens += usage.input_tokens ?? 0
+  acc.output_tokens += usage.output_tokens ?? 0
+  acc.cached_tokens += usage.cached_tokens ?? 0
+  acc.reasoning_tokens += usage.reasoning_tokens ?? 0
+}
+
+/**
+ * 单个计划步骤 — 持有该步骤的完整执行轨迹，便于审计 / 回放 / UI 渲染 / replan。
+ *
+ * 字段约定（与 Agent 的 Run_Metrics / OTel GenAI 语义约定对齐）：
+ *   - `toolCalls`:   该步骤内实际发起的工具调用的结构化记录
+ *   - `messages`:    该步骤内部 ReAct 循环的完整消息序列（OpenAI 格式）
+ *   - `usage`:       该步骤跨轮累积的 token 使用量（null-safe 求和）
+ *   - `rounds`:      该步骤内部 ReAct 循环的实际轮数
+ *   - `durationMs`:  该步骤从 markInProgress 到 markCompleted/markFailed 的墙钟耗时
+ */
 export class PlanStep {
   constructor(index, description) {
     this.index = index
@@ -30,6 +70,13 @@ export class PlanStep {
     this.status = StepStatus.PENDING
     this.result = null
     this.durationMs = 0
+    // Structured trace — populated by `_reactLoop` during step execution.
+    // Initialized to empty collections so consumers can iterate without
+    // null-checks even on PENDING / SKIPPED steps.
+    this.toolCalls = []
+    this.messages = []
+    this.usage = _zeroStepUsage()
+    this.rounds = 0
   }
 
   markInProgress() { this.status = StepStatus.IN_PROGRESS }
@@ -68,7 +115,7 @@ const DEFAULTS = {
  * @param {string} opts.url - LLM API URL
  * @param {string} opts.apiKey - API Key
  * @param {string} opts.model - 模型名称
- * @param {number} [opts.temperature=1]
+ * @param {number} [opts.temperature=0]
  * @param {import('./tool.js').ToolDef[]} [opts.tools=[]]
  * @param {number} [opts.maxPlanSteps=35]
  * @param {number} [opts.stepMaxRounds=300]
@@ -78,8 +125,14 @@ const DEFAULTS = {
  * @param {boolean} [opts.useStreaming=false] - 使用流式 API 调用（浏览器端建议开启）
  * @param {function} [opts.onPhase] - (phase, message) => void
  * @param {function} [opts.onPlanGenerated] - (steps: PlanStep[]) => void
- * @param {function} [opts.onStepStart] - (index, description) => void
- * @param {function} [opts.onStepComplete] - (index, success, result) => void
+ * @param {function} [opts.onStepStart] - (index, description, step: PlanStep) => void
+ *   第三个参数是完整的 PlanStep（含 `status` / `toolCalls` / `messages` /
+ *   `usage` / `rounds`，此时均为初始化后的空集合）。原 `(index, description)`
+ *   签名完全保留 — 仅在末尾追加了 `step`，老代码无需修改。
+ * @param {function} [opts.onStepComplete] - (index, success, result, step: PlanStep) => void
+ *   第四个参数是完整的 PlanStep，包含 `status` / `result` / `durationMs` /
+ *   `toolCalls` / `messages` / `usage` / `rounds`，适合做审计 / 回放 / UI
+ *   渲染 / replan prompt 注入。原 `(index, success, result)` 签名完全保留。
  * @param {function} [opts.onPlanRevised] - (steps: PlanStep[]) => void
  */
 export class PlanAndExecuteStrategy {
@@ -87,7 +140,7 @@ export class PlanAndExecuteStrategy {
     this.url = opts.url
     this.apiKey = opts.apiKey
     this.model = opts.model
-    this.temperature = opts.temperature ?? 1
+    this.temperature = opts.temperature ?? 0
     this.tools = opts.tools ?? []
     this.maxPlanSteps = opts.maxPlanSteps ?? DEFAULTS.maxPlanSteps
     this.stepMaxRounds = opts.stepMaxRounds ?? DEFAULTS.stepMaxRounds
@@ -109,19 +162,41 @@ export class PlanAndExecuteStrategy {
    * @param {string} userMessage
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
+   * @param {Array<{role:string,content:string}>} [opts.history] - 对话历史（user/assistant 明文消息，不含当前 userMessage），用于规划与汇总阶段感知上下文
+   * @param {object} [opts.telemetry] - 根 TelemetryContext（来自 Agent 当前 run）。传 null 则全链路 no-op。
    * @returns {Promise<{ content: string, plan: PlanStep[], toolCallHistory: object[] }>}
+   *   `toolCallHistory` 是所有已执行 step 的 `toolCalls` 的 flat-map，按
+   *   步骤顺序聚合；每条记录包含 `{ stepIndex, name, arguments, result, ok,
+   *   errorKind?, durationMs, bytes }`。
    */
-  async execute(userMessage, { signal } = {}) {
-    const allToolCallHistory = []
+  async execute(userMessage, { signal, history = [], telemetry = null } = {}) {
+    // Per-run root context — used by _callLlm to derive per-operation child
+    // contexts. Assigning on each invocation is sufficient for the strategy's
+    // existing single-run-at-a-time usage pattern (matches how callbacks
+    // like onPhase / onStepStart are already scoped).
+    this._rootCtx = telemetry
+    const cleanHistory = sanitizeHistory(history)
 
     // ============ Phase 1: Planning ============
     this.onPhase('planning', '正在分析任务并制定执行计划...')
 
-    let plan = await this._generatePlan(userMessage, signal)
+    let plan = await this._generatePlan(userMessage, signal, cleanHistory)
     if (!plan || plan.length === 0) {
       this.onPhase('fallback', '计划生成失败，切换到 ReAct 模式...')
-      const result = await this._reactLoop(userMessage, null, this.stepMaxRounds, signal)
-      return { content: result, plan: [], toolCallHistory: allToolCallHistory }
+      // Fallback 路径也要留下 trace：合成一个 "step 0" 作为载体，
+      // 这样 toolCallHistory / plan 对消费者仍然是 well-formed。
+      const fallbackStep = new PlanStep(0, userMessage)
+      fallbackStep.markInProgress()
+      const startedAt = Date.now()
+      const result = await this._reactLoop(
+        userMessage, null, this.stepMaxRounds, signal, cleanHistory, fallbackStep,
+      )
+      fallbackStep.markCompleted(result, Date.now() - startedAt)
+      return {
+        content: result,
+        plan: [fallbackStep],
+        toolCallHistory: _flattenToolCalls([fallbackStep]),
+      }
     }
 
     this.onPlanGenerated(plan)
@@ -137,7 +212,11 @@ export class PlanAndExecuteStrategy {
       const step = plan[i]
 
       step.markInProgress()
-      this.onStepStart(step.index, step.description)
+      // Keep the historical positional signature `(index, description)` as
+      // the leading arguments so existing callbacks remain source-compatible;
+      // append the full PlanStep as a trailing argument for new consumers
+      // that want the structured trace.
+      this.onStepStart(step.index, step.description, step)
 
       const stepStart = Date.now()
       try {
@@ -146,13 +225,13 @@ export class PlanAndExecuteStrategy {
 
         step.markCompleted(stepResult, duration)
         stepsContext += `\n[Step ${step.index + 1} completed]: ${truncate(stepResult, 500)}`
-        this.onStepComplete(step.index, true, stepResult)
+        this.onStepComplete(step.index, true, stepResult, step)
       } catch (err) {
         const duration = Date.now() - stepStart
         const errorMsg = err.message || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
-        this.onStepComplete(step.index, false, errorMsg)
+        this.onStepComplete(step.index, false, errorMsg, step)
 
         // 尝试重规划
         if (replanCount < this.maxReplanAttempts && i < plan.length - 1) {
@@ -169,10 +248,14 @@ export class PlanAndExecuteStrategy {
     // ============ Phase 3: Synthesis ============
     this.onPhase('synthesizing', '正在汇总执行结果...')
 
-    const synthesis = await this._synthesizeResults(userMessage, plan, stepsContext, signal)
+    const synthesis = await this._synthesizeResults(userMessage, plan, stepsContext, signal, cleanHistory)
     this.onPhase('completed', '执行完成')
 
-    return { content: synthesis, plan, toolCallHistory: allToolCallHistory }
+    return {
+      content: synthesis,
+      plan,
+      toolCallHistory: _flattenToolCalls(plan),
+    }
   }
 
   /**
@@ -180,21 +263,38 @@ export class PlanAndExecuteStrategy {
    * @param {string} userMessage
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
+   * @param {Array<{role:string,content:string}>} [opts.history] - 对话历史（同 execute()）
+   * @param {object} [opts.telemetry] - 根 TelemetryContext（同 execute()）
    * @yields {{ type: string, ... }}
+   *   `step_start` / `step_complete` 附带 `step` 字段（完整 PlanStep 快照，
+   *   便于审计 / UI 渲染）。`done` 附带 `toolCallHistory: object[]`。
    */
-  async *stream(userMessage, { signal } = {}) {
+  async *stream(userMessage, { signal, history = [], telemetry = null } = {}) {
+    this._rootCtx = telemetry
     let plan = null
     let stepsContext = ''
     let replanCount = 0
+    const cleanHistory = sanitizeHistory(history)
 
     // Phase 1: Planning
     yield { type: 'phase', phase: 'planning', message: '正在分析任务并制定执行计划...' }
 
-    plan = await this._generatePlan(userMessage, signal)
+    plan = await this._generatePlan(userMessage, signal, cleanHistory)
     if (!plan || plan.length === 0) {
       yield { type: 'phase', phase: 'fallback', message: '计划生成失败，切换到 ReAct 模式...' }
-      const result = await this._reactLoop(userMessage, null, this.stepMaxRounds, signal)
-      yield { type: 'done', content: result, plan: [] }
+      const fallbackStep = new PlanStep(0, userMessage)
+      fallbackStep.markInProgress()
+      const startedAt = Date.now()
+      const result = await this._reactLoop(
+        userMessage, null, this.stepMaxRounds, signal, cleanHistory, fallbackStep,
+      )
+      fallbackStep.markCompleted(result, Date.now() - startedAt)
+      yield {
+        type: 'done',
+        content: result,
+        plan: [snapshotStep(fallbackStep)],
+        toolCallHistory: _flattenToolCalls([fallbackStep]),
+      }
       return
     }
 
@@ -207,7 +307,7 @@ export class PlanAndExecuteStrategy {
       signal?.throwIfAborted()
       const step = plan[i]
       step.markInProgress()
-      yield { type: 'step_start', index: step.index, description: step.description }
+      yield { type: 'step_start', index: step.index, description: step.description, step: snapshotStep(step) }
 
       const stepStart = Date.now()
       try {
@@ -215,13 +315,27 @@ export class PlanAndExecuteStrategy {
         const duration = Date.now() - stepStart
         step.markCompleted(stepResult, duration)
         stepsContext += `\n[Step ${step.index + 1} completed]: ${truncate(stepResult, 500)}`
-        yield { type: 'step_complete', index: step.index, success: true, result: stepResult, duration }
+        yield {
+          type: 'step_complete',
+          index: step.index,
+          success: true,
+          result: stepResult,
+          duration,
+          step: snapshotStep(step),
+        }
       } catch (err) {
         const duration = Date.now() - stepStart
         const errorMsg = err.message || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
-        yield { type: 'step_complete', index: step.index, success: false, result: errorMsg, duration }
+        yield {
+          type: 'step_complete',
+          index: step.index,
+          success: false,
+          result: errorMsg,
+          duration,
+          step: snapshotStep(step),
+        }
 
         if (replanCount < this.maxReplanAttempts && i < plan.length - 1) {
           const revised = await this._attemptReplan(userMessage, plan, i, stepsContext, signal)
@@ -236,9 +350,14 @@ export class PlanAndExecuteStrategy {
 
     // Phase 3: Synthesis
     yield { type: 'phase', phase: 'synthesizing', message: '正在汇总执行结果...' }
-    const synthesis = await this._synthesizeResults(userMessage, plan, stepsContext, signal)
+    const synthesis = await this._synthesizeResults(userMessage, plan, stepsContext, signal, cleanHistory)
     yield { type: 'phase', phase: 'completed', message: '执行完成' }
-    yield { type: 'done', content: synthesis, plan: plan.map(s => ({ index: s.index, description: s.description, status: s.status, result: s.result })) }
+    yield {
+      type: 'done',
+      content: synthesis,
+      plan: plan.map(s => ({ index: s.index, description: s.description, status: s.status, result: s.result })),
+      toolCallHistory: _flattenToolCalls(plan),
+    }
   }
 
   // ==================== Planning ====================
@@ -246,15 +365,22 @@ export class PlanAndExecuteStrategy {
   /**
    * 统一的 LLM 调用方法 — 根据 useStreaming 选择 syncChat 或 streamChat。
    * streamChat 返回的格式与 syncChat 一致（已内部重构），因此调用方无需区分。
+   *
+   * `operationName` 用于派生 TelemetryContext 的 `gen_ai.operation.name`
+   * 标签（`'plan.planner'` / `'plan.synthesizer'` / `'plan.replan'` /
+   * `'plan.step'`）。当策略未收到 `telemetry`（`_rootCtx == null`），
+   * `childContext` 返回 `null`，llm-client 自动降级为 no-op。
    */
-  async _callLlm(body, signal) {
+  async _callLlm(body, signal, operationName) {
+    const ctx = childContext(this._rootCtx ?? null, operationName)
+    const telemetry = ctx ? { ctx } : undefined
     if (this.useStreaming) {
-      return streamChat({ url: this.url, apiKey: this.apiKey, body, signal, onDelta: () => {} })
+      return streamChat({ url: this.url, apiKey: this.apiKey, body, signal, onDelta: () => {}, telemetry })
     }
-    return syncChat({ url: this.url, apiKey: this.apiKey, body, signal })
+    return syncChat({ url: this.url, apiKey: this.apiKey, body, signal, telemetry })
   }
 
-  async _generatePlan(userMessage, signal) {
+  async _generatePlan(userMessage, signal, history = []) {
     const toolSummary = this.tools.map(t => `- ${t.name}: ${t.description}`).join('\n') || '(no tools available)'
 
     const planPrompt =
@@ -266,7 +392,10 @@ export class PlanAndExecuteStrategy {
       '2. Each step should be independently executable\n' +
       '3. Consider dependencies between steps\n' +
       '4. Keep the plan concise (max ' + this.maxPlanSteps + ' steps)\n' +
-      '5. Each step description should be specific enough for an executor to understand\n\n' +
+      '5. Each step description should be specific enough for an executor to understand\n' +
+      '6. If the prior conversation already contains concrete values/results the user refers to ' +
+      '(e.g. "上个结果", "the previous answer"), INLINE those concrete values directly into the ' +
+      'relevant step descriptions so the executor does not need to look them up again\n\n' +
       'Output your plan as a JSON array. Example format:\n' +
       '```json\n' +
       '[\n' +
@@ -281,6 +410,7 @@ export class PlanAndExecuteStrategy {
       model: this.model,
       messages: [
         { role: 'system', content: planPrompt },
+        ...history,
         { role: 'user', content: userMessage },
       ],
       temperature: this.temperature,
@@ -288,7 +418,7 @@ export class PlanAndExecuteStrategy {
 
     try {
       const response = await callWithTimeout(
-        () => this._callLlm(body, signal),
+        () => this._callLlm(body, signal, 'plan.planner'),
         this.planningTimeoutMs,
       )
       const content = response.choices?.[0]?.message?.content ?? ''
@@ -307,24 +437,39 @@ export class PlanAndExecuteStrategy {
       systemPrompt,
       this.stepMaxRounds,
       signal,
+      [],
+      step,
     )
   }
 
   /**
    * 内部 ReAct 循环 — 复用 Agent 的核心逻辑，用于执行单个步骤。
+   *
+   * 若传入 `step`（PlanStep 实例），会把该次循环的 messages / toolCalls /
+   * usage / rounds 写入 step，让上层（execute / onStepComplete）能拿到完整
+   * trace 做审计、replan prompt 注入或可视化。传 null 时（无 step 上下文的
+   * 场景，如 fallback）退化为不写 trace。
+   *
    * @param {string} userMessage
    * @param {string|null} systemPrompt - 步骤级 system prompt（null 时使用默认）
    * @param {number} maxRounds
    * @param {AbortSignal} [signal]
+   * @param {Array<{role:string,content:string}>} [history]
+   * @param {PlanStep|null} [step] - 可选的 trace 接收方；populated in-place
    * @returns {Promise<string>}
    */
-  async _reactLoop(userMessage, systemPrompt, maxRounds, signal) {
+  async _reactLoop(userMessage, systemPrompt, maxRounds, signal, history = [], step = null) {
     const toolMap = Object.fromEntries(this.tools.map(t => [t.name, t]))
     const openaiTools = this.tools.length > 0 ? formatToolsForOpenAI(this.tools) : undefined
 
     const messages = []
     if (systemPrompt) {
       messages.push({ role: 'system', content: systemPrompt })
+    }
+    // 仅在 fallback（无 step 上下文）场景注入历史；步骤执行时 history 为 []，
+    // 因为 step description 已经由 planner 内联了需要的具体值。
+    if (history.length > 0) {
+      messages.push(...history)
     }
     messages.push({ role: 'user', content: userMessage })
 
@@ -338,14 +483,25 @@ export class PlanAndExecuteStrategy {
         ...(openaiTools ? { tools: openaiTools } : {}),
       }
 
-      const response = await this._callLlm(body, signal)
+      const response = await this._callLlm(body, signal, 'plan.step')
       const message = response.choices?.[0]?.message
       if (!message) throw new Error('Empty LLM response')
+
+      // Accumulate usage into the step trace (null-safe; see _addUsage).
+      if (step) {
+        step.rounds += 1
+        _addUsage(step.usage, extractUsage(response))
+      }
 
       const textContent = message.content ?? ''
       const toolCalls = parseToolCalls(response)
 
       if (toolCalls.length === 0) {
+        // Capture the final assistant turn so the step's message trace ends
+        // with the same content the caller observes as `step.result`.
+        const finalAssistant = { role: 'assistant', content: textContent }
+        messages.push(finalAssistant)
+        if (step) step.messages = messages.slice()
         return textContent
       }
 
@@ -359,20 +515,52 @@ export class PlanAndExecuteStrategy {
       // 执行工具并添加结果
       for (const call of toolCalls) {
         const tool = toolMap[call.name]
+        const toolStartPerf = _perfNow()
         let result
-        if (!tool) {
+        /** @type {undefined | 'not_found' | 'truncated_args' | 'aborted' | 'exception'} */
+        let errorKind
+        if (call._truncated && call._parseError) {
+          errorKind = 'truncated_args'
+          result = `Error: Tool call "${call.name}" was truncated by the model (finish_reason=length). ` +
+            `The arguments JSON is incomplete and could not be parsed. Please retry with shorter arguments.`
+        } else if (!tool) {
+          errorKind = 'not_found'
           result = `Error: Tool "${call.name}" not found. Available: ${this.tools.map(t => t.name).join(', ')}`
         } else {
           try {
-            result = await tool.execute(call.arguments)
+            result = await tool.execute(call.arguments, { signal })
           } catch (err) {
+            errorKind = (err?.name === 'AbortError' || signal?.aborted)
+              ? 'aborted'
+              : 'exception'
             result = `Error executing ${call.name}: ${err.message}`
           }
         }
         messages.push(formatToolResult(call.id, call.name, result))
+
+        // Record the call on the step's structured trace. `bytes` mirrors
+        // the utf-8 length of the string appended to `messages`, matching
+        // the Agent ReAct-loop tool.call payload shape.
+        if (step) {
+          /** @type {{stepIndex:number,id:string,name:string,arguments:object|null,result:string,ok:boolean,errorKind?:string,durationMs:number,bytes:number}} */
+          const record = {
+            stepIndex: step.index,
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments,
+            result: typeof result === 'string' ? result : JSON.stringify(result),
+            ok: errorKind === undefined,
+            durationMs: _perfNow() - toolStartPerf,
+            bytes: utf8ByteLength(String(result)),
+          }
+          if (errorKind !== undefined) record.errorKind = errorKind
+          step.toolCalls.push(record)
+        }
       }
     }
 
+    // 达到 maxRounds — 保存 trace（含所有 tool_calls / tool 结果）并返回。
+    if (step) step.messages = messages.slice()
     return '[max rounds exceeded]'
   }
 
@@ -387,10 +575,19 @@ export class PlanAndExecuteStrategy {
     const failedStep = `❌ Step ${failedStepIndex + 1}: ${currentPlan[failedStepIndex].description}` +
       ` — ${currentPlan[failedStepIndex].result}`
 
+    // Inline the failed step's tool-call trace into the replan prompt so the
+    // planner can see *what was actually attempted* (previously lost — see
+    // improvements.md F-A2 / D-10 / D-11). The trace is kept compact: the
+    // tool name, stringified arguments, a summary of the outcome, and
+    // truncated result text. Empty trace yields the empty string so
+    // prompt shape is preserved.
+    const failedTrace = _formatFailedStepTrace(currentPlan[failedStepIndex])
+
     const replanPrompt =
       `The original task was: ${userMessage}\n\n` +
       `Completed steps:\n${completedSteps}\n\n` +
       `Failed step:\n${failedStep}\n\n` +
+      (failedTrace ? `Failed step tool calls:\n${failedTrace}\n\n` : '') +
       `Context:\n${stepsContext}\n\n` +
       'Please create a revised plan for the REMAINING work, taking into account ' +
       'what has already been completed and the failure reason.\n\n' +
@@ -408,7 +605,7 @@ export class PlanAndExecuteStrategy {
 
     try {
       const response = await callWithTimeout(
-        () => this._callLlm(body, signal),
+        () => this._callLlm(body, signal, 'plan.replan'),
         this.planningTimeoutMs,
       )
       const content = response.choices?.[0]?.message?.content ?? ''
@@ -425,7 +622,7 @@ export class PlanAndExecuteStrategy {
 
   // ==================== Synthesis ====================
 
-  async _synthesizeResults(userMessage, plan, stepsContext, signal) {
+  async _synthesizeResults(userMessage, plan, stepsContext, signal, history = []) {
     const fallback = buildFallbackSynthesis(plan)
 
     const completedCount = plan.filter(s => s.status === StepStatus.COMPLETED).length
@@ -437,12 +634,14 @@ export class PlanAndExecuteStrategy {
       `Original request: ${userMessage}\n\n` +
       `Steps and results:\n${stepsContext}\n\n` +
       'Please provide a comprehensive final answer to the original request, ' +
-      'incorporating the results from all completed steps. Be concise but thorough.'
+      'incorporating the results from all completed steps and any relevant context from the ' +
+      'prior conversation. Be concise but thorough.'
 
     const body = {
       model: this.model,
       messages: [
-        { role: 'system', content: 'You are a helpful assistant. Synthesize the results of a multi-step execution plan into a final answer.' },
+        { role: 'system', content: 'You are a helpful assistant. Synthesize the results of a multi-step execution plan into a final answer, using prior conversation turns as context when relevant.' },
+        ...history,
         { role: 'user', content: synthesisPrompt },
       ],
       temperature: this.temperature,
@@ -450,7 +649,7 @@ export class PlanAndExecuteStrategy {
 
     try {
       const response = await callWithTimeout(
-        () => this._callLlm(body, signal),
+        () => this._callLlm(body, signal, 'plan.synthesizer'),
         this.synthesisTimeoutMs,
       )
       const content = response.choices?.[0]?.message?.content ?? ''
@@ -462,6 +661,104 @@ export class PlanAndExecuteStrategy {
 }
 
 // ==================== Utility Functions ====================
+
+/**
+ * High-resolution monotonic clock helper. `performance.now()` exists in
+ * Node ≥16 and all modern browsers; the `Date.now()` fallback keeps the
+ * file robust against edge runtimes without performance timing.
+ */
+function _perfNow() {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now()
+}
+
+/**
+ * Flatten every step's `toolCalls` into a single ordered array. Used by
+ * `execute()` and `stream()`'s `done` event to produce the long-promised
+ * `toolCallHistory`. The result preserves step order (stable sort by
+ * appearance, since `plan` is already ordered) and each record already
+ * carries its originating `stepIndex`.
+ * @param {PlanStep[]} plan
+ */
+function _flattenToolCalls(plan) {
+  if (!Array.isArray(plan) || plan.length === 0) return []
+  const out = []
+  for (const step of plan) {
+    if (step && Array.isArray(step.toolCalls)) {
+      for (const rec of step.toolCalls) out.push(rec)
+    }
+  }
+  return out
+}
+
+/**
+ * Build a plain-object snapshot of a PlanStep for emission on the stream —
+ * stream consumers need a defensive clone so mid-run mutations of the
+ * PlanStep don't retroactively change a past event. The snapshot includes
+ * the structured trace fields (toolCalls / messages / usage / rounds /
+ * durationMs) alongside the basic fields.
+ * @param {PlanStep} step
+ */
+function snapshotStep(step) {
+  return {
+    index: step.index,
+    description: step.description,
+    status: step.status,
+    result: step.result,
+    durationMs: step.durationMs,
+    rounds: step.rounds,
+    usage: { ...step.usage },
+    // Shallow-clone the collection arrays; individual records are already
+    // plain objects constructed inside the loop so reference-sharing is safe.
+    toolCalls: step.toolCalls.slice(),
+    messages: step.messages.slice(),
+  }
+}
+
+/**
+ * Render a failed step's tool-call trace as a compact, LLM-readable string
+ * for use in the replan prompt. Returns `''` when the step executed no
+ * tool calls (e.g. the failure happened before any tool was invoked), so
+ * the caller can conditionally drop the "Failed step tool calls" section.
+ * @param {PlanStep} step
+ */
+function _formatFailedStepTrace(step) {
+  if (!step || !Array.isArray(step.toolCalls) || step.toolCalls.length === 0) {
+    return ''
+  }
+  return step.toolCalls.map((tc, i) => {
+    const args = _compactJson(tc.arguments)
+    const status = tc.ok ? 'ok' : `error:${tc.errorKind ?? 'unknown'}`
+    const result = truncate(String(tc.result ?? ''), 300)
+    return `  ${i + 1}. ${tc.name}(${args}) → [${status}] ${result}`
+  }).join('\n')
+}
+
+/** Best-effort JSON stringify for replan prompts; falls back to `"<unserializable>"`. */
+function _compactJson(value) {
+  if (value === null || value === undefined) return ''
+  try { return JSON.stringify(value) }
+  catch { return '"<unserializable>"' }
+}
+
+/**
+ * 清洗对话历史，仅保留 user/assistant 的纯文本消息。
+ * 剥除：system（策略内部自己提供 system prompt）、tool（ReAct 的 tool_call 轮次，
+ * 可能没有成对的 assistant+tool，混入会引起 LLM 报错）、任何 assistant(tool_calls) 消息。
+ * @param {Array<any>} history
+ * @returns {Array<{role:'user'|'assistant',content:string}>}
+ */
+function sanitizeHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) return []
+  return history.filter(m =>
+    m
+    && (m.role === 'user' || m.role === 'assistant')
+    && typeof m.content === 'string'
+    && m.content.length > 0
+    && !m.tool_calls,
+  ).map(m => ({ role: m.role, content: m.content }))
+}
 
 function truncate(text, maxLen) {
   if (!text) return ''

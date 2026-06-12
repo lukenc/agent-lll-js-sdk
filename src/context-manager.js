@@ -8,13 +8,9 @@
 
 import { formatToolsForOpenAI } from './tool.js'
 import { sliceWithoutOrphanTools } from './memory.js'
+import { BASE_TOOLS } from './tool-filter.js'
 
 const CHARS_PER_TOKEN = 4
-
-/** 基础工具集合 — 裁剪时优先保留 */
-const BASE_TOOLS = new Set([
-  'keyword_search', 'read_file', 'write_file', 'shell_exec', 'project_tree',
-])
 
 /**
  * @typedef {object} TokenBudget

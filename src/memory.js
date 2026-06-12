@@ -173,7 +173,12 @@ export class SummarizingMemory {
    * @param {object} opts
    * @param {number} [opts.threshold=20] - 触发摘要的消息数阈值
    * @param {number} [opts.keepRecent=5] - 摘要后保留的最近消息数
-   * @param {(text: string) => Promise<string>} opts.summarizer - 摘要函数
+   * @param {((text: string) => Promise<string>) | ((text: string, ctx: object|null) => Promise<string>)} opts.summarizer - 摘要函数。
+   *   兼容两种签名：
+   *     - `(text) => Promise<string>`（原签名，仍然可用）
+   *     - `(text, ctx) => Promise<string>`（附加重载，`ctx` 为当前
+   *       `TelemetryContext` 或 `null`）。
+   *   `_doSummarize` 始终传入第二个参数，旧签名会被 JS 自动忽略。
    */
   constructor({ threshold = 20, keepRecent = 5, summarizer } = {}) {
     this.threshold = threshold
@@ -184,12 +189,33 @@ export class SummarizingMemory {
     this.lastSummary = null
     /**
      * 正在进行的摘要压缩 Promise（in-flight cache）。并发的
-     * `getMessages()` / `getHistory()` 会共享这一个 Promise，
+     * `getMessages()` / `getHistory()` 会共享这一个 Promise,
      * 避免两个压缩任务同时 race-condition 地重写 `this.messages`。
      * 见 todo.md R-2。
      * @type {Promise<void>|null}
      */
     this._summarizePromise = null
+    /**
+     * 可选的 `TelemetryContext`，用户自定义 `summarizer` 时由
+     * `Agent`（或应用）通过 `setSummaryContext(ctx)` 注入。
+     * `_doSummarize` 会把它作为第二个实参传给 `summarizer`,
+     * 用户可据此派生 `'agent.summarize'` 子上下文并透传给 llm-client。
+     * 默认的 `Agent` 内置 summarizer 不依赖此字段（它会直接从
+     * 闭包里读取当前运行的 root context），但保留字段以支持用户
+     * 提供自定义 summarizer 时的显式线程化需求（Req 4.3 / 9.1 / 9.2）。
+     * @type {object|null}
+     */
+    this._summaryCtx = null
+  }
+
+  /**
+   * 注入当前运行的 `TelemetryContext`，后续 `_doSummarize` 会把它
+   * 作为第二个实参传给 `summarizer`。`null` / 省略代表 "telemetry disabled",
+   * 用户 summarizer 应把该情况当作 no-op 分支。
+   * @param {object|null} ctx
+   */
+  setSummaryContext(ctx) {
+    this._summaryCtx = ctx ?? null
   }
 
   add(message) {
@@ -276,7 +302,11 @@ export class SummarizingMemory {
     const text = prevBlock + toSummarize.map(m => `[${m.role}]: ${m.content ?? ''}`).join('\n')
 
     try {
-      this.lastSummary = await this.summarizer(text)
+      // Pass `_summaryCtx` as second arg so user-supplied summarizers with
+      // the `(text, ctx) => Promise<string>` signature can derive a child
+      // telemetry context. Single-arg summarizers still work — JS silently
+      // ignores extra arguments.
+      this.lastSummary = await this.summarizer(text, this._summaryCtx ?? null)
       const summaryMsg = {
         role: 'system',
         content: `[Previous conversation summary]: ${this.lastSummary}`,

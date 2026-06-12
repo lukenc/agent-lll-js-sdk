@@ -58,11 +58,17 @@ export function formatToolsForOpenAI(tools) {
 export function parseToolCalls(response) {
   const message = response.choices?.[0]?.message
   if (!message?.tool_calls?.length) return []
-  return message.tool_calls.map(tc => ({
-    id: tc.id,
-    name: tc.function.name,
-    arguments: safeParseJSON(tc.function.arguments),
-  }))
+  const finishReason = response.choices?.[0]?.finish_reason
+  return message.tool_calls.map(tc => {
+    const parsed = safeParseJSON(tc.function.arguments)
+    return {
+      id: tc.id,
+      name: tc.function.name,
+      arguments: parsed.value,
+      _parseError: parsed.error,
+      _truncated: finishReason === 'length',
+    }
+  })
 }
 
 /** 将工具执行结果格式化为对话消息 */
@@ -76,5 +82,6 @@ export function formatToolResult(callId, toolName, result) {
 }
 
 function safeParseJSON(str) {
-  try { return JSON.parse(str) } catch { return {} }
+  try { return { value: JSON.parse(str), error: null } }
+  catch (e) { return { value: {}, error: e.message } }
 }

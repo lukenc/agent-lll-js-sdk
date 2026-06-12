@@ -12,6 +12,7 @@ import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { Agent } from './agent.js'
 import { defineTool } from './tool.js'
+import { SlidingWindowMemory } from './memory.js'
 
 // ---- Minimal fetch mock ----
 
@@ -69,6 +70,7 @@ describe('P0-4: max rounds exceeded writes final assistant to memory', () => {
       model: 'gpt-4',
       tools: [tool],
       maxRounds: 2,
+      memory: new SlidingWindowMemory(),
     })
 
     // Both rounds the LLM keeps calling the tool — never naturally ends.
@@ -109,6 +111,7 @@ describe('P0-4: max rounds exceeded writes final assistant to memory', () => {
       model: 'gpt-4',
       tools: [tool],
       maxRounds: 1,
+      memory: new SlidingWindowMemory(),
     })
 
     // streamChat uses the SSE API; here we only test the memory side effect
@@ -140,6 +143,7 @@ describe('P0-4: max rounds exceeded writes final assistant to memory', () => {
       model: 'gpt-4',
       tools: [tool],
       maxRounds: 1,
+      memory: new SlidingWindowMemory(),
     })
 
     queueResponse({
@@ -212,6 +216,7 @@ describe('P0-5: subsequent rounds reuse filteredTools, not this.tools', () => {
       model: 'gpt-4',
       tools: [toolA, toolB, toolC],
       maxRounds: 3,
+      memory: new SlidingWindowMemory(),
     })
 
     // Inject an intent that limits tools to just alpha+beta (simulating
@@ -280,6 +285,7 @@ describe('P0-5: subsequent rounds reuse filteredTools, not this.tools', () => {
       model: 'gpt-4',
       tools: [toolA, toolB],
       maxRounds: 3,
+      memory: new SlidingWindowMemory(),
     })
 
     queueResponse({
