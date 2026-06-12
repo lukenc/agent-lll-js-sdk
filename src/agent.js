@@ -550,6 +550,35 @@ export class Agent {
     return [...this.tools]
   }
 
+  /**
+   * Return a projected history track. RuntimeHistory-backed memories provide
+   * rich tracks; custom memories fall back to their existing history/messages
+   * projection.
+   * @param {string} [trackName='model']
+   * @returns {Promise<object[]>}
+   */
+  async getHistory(trackName = 'model') {
+    const rh = this.memory?.runtimeHistory
+    if (rh && typeof rh.project === 'function') {
+      if (trackName === 'model' || trackName === 'visible') {
+        return rh.projectMessages(trackName)
+      }
+      return rh.project(trackName)
+    }
+    if (trackName === 'artifacts' || trackName === 'internal') return []
+    return await this._getHistory()
+  }
+
+  /**
+   * Return model/tool artifacts captured by RuntimeHistory-backed memories.
+   * @returns {Promise<object[]>}
+   */
+  async getArtifacts() {
+    const rh = this.memory?.runtimeHistory
+    if (rh && typeof rh.project === 'function') return rh.project('artifacts')
+    return []
+  }
+
   // ---- Telemetry public API ----
 
   /**
