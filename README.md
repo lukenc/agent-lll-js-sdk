@@ -252,7 +252,10 @@ for await (const event of agent.stream('分析项目架构并生成文档')) {
     case 'plan_generated': console.log('计划:', event.plan); break
     case 'step_start':    console.log(`▶ Step ${event.index + 1}: ${event.description}`); break
     case 'step_complete':
-      console.log(`${event.success ? '✅' : '❌'} Step ${event.index + 1} (${event.duration}ms)`)
+      console.log(
+        `${event.success ? '✅' : '❌'} Step ${event.index + 1} (${event.duration}ms, ` +
+        `tools=${event.step.toolCalls.length})`
+      )
       break
     case 'plan_revised':  console.log('计划已修订:', event.plan); break
     case 'done':          console.log('最终结果:', event.content); break
@@ -327,7 +330,10 @@ const strategy = new PlanAndExecuteStrategy({
     steps.forEach(s => console.log(`  ${s.index + 1}. ${s.description}`))
   },
   onStepStart: (i, desc) => console.log(`▶ 开始步骤 ${i + 1}: ${desc}`),
-  onStepComplete: (i, ok, result) => console.log(`${ok ? '✅' : '❌'} 步骤 ${i + 1}: ${result}`),
+  onStepComplete: (i, ok, result, step) => console.log(
+    `${ok ? '✅' : '❌'} 步骤 ${i + 1}: ${result} ` +
+    `(rounds=${step.rounds}, tools=${step.toolCalls.length})`
+  ),
   onPlanRevised: (steps) => console.log('计划已修订，剩余步骤:', steps.length),
 })
 
@@ -353,8 +359,8 @@ for await (const event of strategy.stream('批量修复所有 lint 错误')) {
 | `synthesisTimeoutMs` | `120000` | 合成阶段 LLM 调用超时（毫秒） |
 | `onPhase` | - | 阶段变更回调 `(phase, message) => void` |
 | `onPlanGenerated` | - | 计划生成回调 `(steps) => void` |
-| `onStepStart` | - | 步骤开始回调 `(index, description) => void` |
-| `onStepComplete` | - | 步骤完成回调 `(index, success, result) => void` |
+| `onStepStart` | - | 步骤开始回调 `(index, description, step: PlanStep) => void`。前两个参数保持与旧签名一致，第三个参数是完整 `PlanStep`（trace 此时为空） |
+| `onStepComplete` | - | 步骤完成回调 `(index, success, result, step: PlanStep) => void`。前三个参数保持与旧签名一致，第四个参数是完整 `PlanStep`（含 `status / result / durationMs / toolCalls / messages / usage / rounds`）|
 | `onPlanRevised` | - | 计划修订回调 `(steps) => void` |
 
 #### 流式事件类型
@@ -363,10 +369,23 @@ for await (const event of strategy.stream('批量修复所有 lint 错误')) {
 |-----------|------|------|
 | `phase` | `phase`, `message` | 阶段变更（planning / executing / synthesizing / completed / fallback） |
 | `plan_generated` | `plan` | 计划生成完成 |
-| `step_start` | `index`, `description` | 步骤开始执行 |
-| `step_complete` | `index`, `success`, `result`, `duration` | 步骤执行完成 |
+| `step_start` | `index`, `description`, `step` | 步骤开始执行。`step` 为 `PlanStep` 快照（含 `toolCalls / messages / usage / rounds`，开始时均为空/零）|
+| `step_complete` | `index`, `success`, `result`, `duration`, `step` | 步骤执行完成。`step` 为完整 `PlanStep` 快照，可直接用于审计 / 回放 / UI 渲染 |
 | `plan_revised` | `plan` | 计划被修订（步骤失败后重规划） |
-| `done` | `content`, `plan` | 全部完成，包含最终结果和计划快照 |
+| `done` | `content`, `plan`, `toolCallHistory` | 全部完成。`toolCallHistory` 是所有步骤的 `toolCalls` 按执行顺序展平 |
+
+#### 结构化返回值（`strategy.execute()`）
+
+```js
+const { content, plan, toolCallHistory } = await strategy.execute('batch task')
+//   content            → string          最终回答
+//   plan               → PlanStep[]      每个 step 含：
+//                                          status, result, durationMs,
+//                                          toolCalls, messages, usage, rounds
+//   toolCallHistory    → ToolCallRecord[]  跨步展平的工具调用序列，
+//                                          每条含 stepIndex / name / arguments /
+//                                          result / ok / errorKind? / durationMs / bytes
+```
 
 ## 与 Java Runtime 的对应关系
 
@@ -398,6 +417,274 @@ for await (const event of strategy.stream('批量修复所有 lint 错误')) {
 </script>
 ```
 
+## 可观测性 / Telemetry
+
+`Agent` 提供一个轻量级事件总线与 per-run / per-session 指标聚合，字段命名对齐
+[OpenTelemetry GenAI 语义约定](https://opentelemetry.io/docs/specs/semconv/gen-ai/)。
+框架本身**不捆绑**任何 OTel SDK 或第三方导出器 — 只发射事件，你负责转发到
+自己选择的后端（LangFuse / LangSmith / Datadog / 自建 pipeline）。
+
+订阅事件即可拿到结构化遥测：
+
+```js
+const agent = new Agent({ provider: 'openai', apiKey, model: 'gpt-4o-mini', tools: [...] })
+
+agent.on('llm.call', e => {
+  console.log(
+    e['gen_ai.operation.name'],        // 'agent.chat' / 'agent.intent' / 'agent.summarize' / 'plan.*'
+    e['gen_ai.system'],                // 'openai' / 'deepseek' / 'qwen' / ...
+    e['gen_ai.request.model'],
+    e['gen_ai.usage.input_tokens'],
+    e['gen_ai.usage.output_tokens'],
+    e['gen_ai.client.operation.duration'],
+    e.ok,
+  )
+})
+
+agent.on('tool.call', e => {
+  console.log(e.name, e.ok, e.errorKind, e.durationMs, e.bytes)
+})
+
+agent.on('session.end', metrics => {
+  // metrics === Run_Metrics 完整副本 + ok + endedAt
+  console.log('run usage:', metrics.usage, 'rounds:', metrics.totalRounds)
+})
+
+await agent.chat('帮我分析项目架构')
+
+// 不需要订阅事件也能拿到聚合结果
+const run = agent.getLastRunMetrics()       // 最近一次 chat/stream 的 Run_Metrics
+const session = agent.getSessionMetrics()   // 所有 run 的累计 Session_Metrics
+```
+
+发射的事件类型：
+
+| 事件 | 触发时机 | 关键字段 |
+|------|----------|----------|
+| `session.start` | `chat()` / `stream()` 开始 | `traceId`, `spanId`, `parentSpanId: null`, `strategy`, `startedAt` |
+| `session.end` | `chat()` / `stream()` 结束（成功或失败） | 完整 `Run_Metrics` + `endedAt` + `ok` |
+| `round.start` / `round.end` | ReAct 每一轮开始 / 结束 | `traceId`, `spanId`, `parentSpanId`（指向 session root）, `round`, `durationMs` |
+| `llm.call` | 每次 LLM HTTP 调用完成（含 sidecar） | OTel GenAI 字段 + `traceId` / `spanId` / `parentSpanId`, `ok`, `error?` |
+| `tool.call` | 每次工具执行结束 | `name`, `arguments`, `durationMs`, `bytes`, `ok`, `errorKind?` |
+| `warn` | 监听器抛异常时 | `source`, `eventType`, `error` |
+
+监听器为空时不会改变 `chat()` / `stream()` 的返回值、`hooks.*` 的参数或任何现有
+事件的字段 — 纯加法，可直接升级。 `agent.reset()` 会把 `getLastRunMetrics()`
+清为 `null` 并归零 `getSessionMetrics()`，但保留已注册的监听器。
+
+## MCP Client（Model Context Protocol）
+
+接入社区 MCP Server（filesystem / github / postgres / playwright / slack / jira / notion …）
+不需要写胶水代码。`createMCPClient(options)` 返回的 `listTools()` 结果形状与
+`defineTool` 完全一致，直接塞进 `new Agent({ tools: [...] })`。
+
+实现遵循 [MCP 2025-03-26 规范](https://modelcontextprotocol.io/specification/2025-03-26/index)，
+零新增 runtime 依赖（只用 Node 18+ 内置 `child_process` / `fetch` / `http`）。
+
+### 基础用法（stdio 子进程 MCP Server）
+
+```js
+import { Agent, createMCPClient, registerBaseTool } from 'lll-web-agent'
+
+// 连接一个本地 MCP Server（如社区 filesystem server）
+const mcp = await createMCPClient({
+  transport: 'stdio',
+  command: 'npx',
+  args: ['-y', '@modelcontextprotocol/server-filesystem', '/workspace'],
+  name: 'filesystem',               // 可选：工具名前缀将形如 mcp__filesystem__read_file
+})
+
+// 拿到形状与 defineTool 完全一致的 Tool_Def[]
+const mcpTools = await mcp.listTools()
+
+// 如果开启了意图识别或 token 预算，建议把 MCP 工具标记为 base tool
+// 避免被 ToolFilter / ContextManager.trimTools 过早裁剪
+mcpTools.forEach(t => registerBaseTool(t.name))
+
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  model: 'gpt-4',
+  tools: [...mcpTools, ...myLocalTools],
+})
+
+const reply = await agent.chat('读取项目根目录结构并给出概览')
+await mcp.close()
+```
+
+### 传输层
+
+| transport | 用途 | 规范状态 |
+|-----------|------|---------|
+| `'stdio'` | 本地子进程（最常用） | MCP 2025-03-26 一等 |
+| `'http'`（别名 `'streamable-http'`） | 远程 Streamable HTTP | MCP 2025-03-26 推荐 |
+| `'sse'` | legacy SSE（GET 长连 + POST /messages） | 存量兼容 |
+
+未内置的传输（如 websocket）通过 `registerTransport(name, factory)` 自定义注入：
+
+```js
+import { registerTransport } from 'lll-web-agent'
+
+registerTransport('ws', (options) => {
+  // 返回 { send, onMessage, onError, onClose, close }
+})
+```
+
+### 工具名命名空间
+
+MCP 工具名自动前缀化为 `mcp__<serverName>__<toolName>`，符合 OpenAI / Anthropic
+工具名正则 `^[a-zA-Z0-9_-]{1,64}$`。多个 Server 同时挂载也不会碰撞 ——
+冲突时自动追加 `_2` / `_3` 数字后缀。非法字符（emoji / 中文 / 空格等）替换为 `_`。
+
+### BASE_TOOLS 运行时扩展
+
+当开启 `enableIntentRecognition: true` 或配置了 `tokenBudget` 时，`ToolFilter` 会
+按意图结果过滤工具、`ContextManager.trimTools` 会在预算紧张时优先保留
+"base tool"。把 MCP 工具标记为 base 可避免它们被误过滤 / 过早裁剪：
+
+```js
+import {
+  registerBaseTool,     // 增（幂等）
+  unregisterBaseTool,   // 删（返回 boolean）
+  setBaseTools,         // 覆盖（原子，参数校验在 mutation 前完成）
+  clearBaseTools,       // 清空
+  resetBaseTools,       // 复位为 6 个初始名
+  isBaseTool,           // 查询（非 string 输入返回 false，不抛）
+  getBaseTools,         // 快照数组（修改返回数组不影响注册表）
+} from 'lll-web-agent'
+
+// 模式 A：增量追加
+mcpTools.forEach(t => registerBaseTool(t.name))
+
+// 模式 B：按角色整体覆盖
+setBaseTools([
+  'ask_user',
+  ...mcpTools.filter(t => t._mcp.annotations?.readOnlyHint).map(t => t.name),
+])
+
+// 模式 C：测试隔离复位
+beforeEach(() => resetBaseTools())
+```
+
+### 工具执行 & 错误类型
+
+MCP 工具的 `execute` 透明地走 JSON-RPC `tools/call`；返回值始终是字符串
+（与 `defineTool` 的契约一致，方便 LLM 直接消费）。错误分 4 个可 `instanceof`
+判断的类型：
+
+```js
+import {
+  UnsupportedTransportError,  // 未知 transport 名
+  MCPProtocolError,           // 握手 / 协议版本 / 畸形帧
+  MCPRequestError,            // tools/call 返回 JSON-RPC error 或超时（code: -32000）
+  MCPClosedError,             // 连接已关闭 / 进程退出
+} from 'lll-web-agent'
+```
+
+`tool.call` 遥测事件对 MCP 工具与本地工具一视同仁（`Agent` 层统一发射），
+`hooks.beforeToolCall` / `hooks.afterToolCall` 也照常生效。
+
+### 配置选项
+
+```js
+const mcp = await createMCPClient({
+  transport: 'stdio',
+  command: 'npx',
+  args: ['-y', '@modelcontextprotocol/server-filesystem', '/workspace'],
+  env: { FOO: 'bar' },              // 可选环境变量
+  cwd: '/tmp',                      // 可选工作目录
+  onStderr: (chunk) => { },         // 可选 stderr 回调（默认 console.warn）
+
+  // 通用选项（所有 transport）
+  name: 'filesystem',               // 命名空间前缀 + 日志
+  protocolVersion: '2025-03-26',    // 默认即此
+  requestTimeoutMs: 60000,          // 默认 60s
+  clientInfo: { name: 'my-app', version: '1.0.0' },  // 默认 {name:'lll-web-agent', version:<pkg>}
+  signal: myAbortController.signal, // 握手阶段响应 abort
+  onToolsChanged: (tools) => { },   // tools/list_changed 通知触发刷新后回调
+  onClose: (reason) => { },         // 连接断开回调
+})
+```
+
+### 浏览器端使用 MCP（通过服务端代理）
+
+浏览器没有 `child_process`，不能直接跑 `createMCPClient({ transport: 'stdio' })`；
+直连远程 MCP Server 又受 CORS 和 API key 暴露约束。推荐走**服务端代理**：
+`demo/server.js` 自带现成实现，随时可拷到自己的项目里。
+
+启动（把 stdio-only 的 MCP Server 挂到 demo server）：
+
+```bash
+npm run build          # 先构建浏览器 bundle
+
+MCP_SERVER_CMD=node \
+MCP_SERVER_ARGS="src/mcp/__fixtures__/mock-mcp-server.js" \
+MCP_SERVER_NAME=mock \
+OPENAI_API_KEY=sk-xxx \
+node demo/server.js
+
+# 打开 http://localhost:3000/browser
+```
+
+也可以换成真正的搜索 / 文件系统 / GitHub 等 stdio MCP Server：
+
+```bash
+# 免费 web 搜索 —— open-websearch(无 API key,多引擎)
+# MCP_SERVER_ENV 是 JSON,专门传给 MCP 子进程的环境变量,避免和 demo server
+# 自己的 PORT / OPENAI_API_KEY 混在一起
+MCP_SERVER_CMD=npx \
+MCP_SERVER_ARGS="-y open-websearch@latest" \
+MCP_SERVER_NAME=search \
+MCP_SERVER_ENV='{"MODE":"stdio","DEFAULT_SEARCH_ENGINE":"bing"}' \
+OPENAI_API_KEY=sk-xxx node demo/server.js
+
+# 挂载 6 个搜索/抓取工具:
+#   mcp__search__search              多引擎搜索(bing/duckduckgo/baidu/brave/...)
+#   mcp__search__fetchWebContent     抓取任意 HTTPS 页面
+#   mcp__search__fetchGithubReadme   抓取 GitHub 仓库 README
+#   mcp__search__fetchCsdnArticle    CSDN 文章正文
+#   mcp__search__fetchJuejinArticle  掘金文章正文
+#   mcp__search__fetchLinuxDoArticle Linux.do 帖子正文
+
+# 社区 filesystem server(需要 Node 20+)
+MCP_SERVER_CMD=npx \
+MCP_SERVER_ARGS="-y @modelcontextprotocol/server-filesystem /tmp" \
+OPENAI_API_KEY=sk-xxx node demo/server.js
+```
+
+`demo/server.js` 暴露两个代理端点给浏览器：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /mcp-tools` | 拿工具清单（name / description / parameters / rawName） |
+| `POST /mcp-call` | body `{ name, arguments }` —— 转发到服务端的 `MCP_Client.execute` |
+
+`demo/browser.html` 里 `loadMcpTools()` 把 `/mcp-tools` 的每一项包成本地 `defineTool`，
+`execute` 实现就是 `fetch('/mcp-call', ...)`。对浏览器 Agent 而言，MCP 工具和本地工具
+没有任何区别。API Key 和 MCP server 子进程都留在服务端，浏览器零暴露、零 CORS。
+
+架构：
+
+```
+Browser Agent
+    │
+    │ tool.execute(args)
+    ▼
+[ defineTool wrapper (浏览器端) ]
+    │
+    │ fetch POST /mcp-call { name, arguments }
+    ▼
+demo/server.js  ────► MCP_Client.execute() ────► MCP Server (stdio / http / sse)
+    │
+    │ JSON { result: "..." }
+    ▼
+Browser Agent 继续 ReAct 循环
+```
+
+想在自己的 Web 应用里复用：把 `demo/server.js` 里 `/mcp-tools` + `/mcp-call` 两段代码
+（约 40 行）抄过去即可；前端包装逻辑见 `demo/browser.html` 里的 `loadMcpTools()`。
+
 ## License
 
 MIT
+
