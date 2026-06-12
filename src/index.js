@@ -1,6 +1,7 @@
 export { Agent } from './agent.js'
 export { defineTool, formatToolsForOpenAI, parseToolCalls, formatToolResult } from './tool.js'
 export { SlidingWindowMemory, SummarizingMemory, TokenAwareMemory } from './memory.js'
+export { RuntimeHistory } from './runtime-history.js'
 export { resolveProviderUrl, registerProvider } from './providers.js'
 export { IntentRecognizer, defaultIntentResult } from './intent-recognizer.js'
 export {
