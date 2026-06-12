@@ -1633,7 +1633,8 @@ export class Agent {
     // 在写入当前轮之前拿历史，传给 strategy 供 planner/synthesizer 使用（P1-2）
     const history = await this._getHistory()
     const telemetry = this._currentRun?.rootCtx ?? null
-    const { content } = await strategy.execute(message, { signal, history, telemetry })
+    const { content, plan, toolCallHistory } = await strategy.execute(message, { signal, history, telemetry })
+    this._recordPlanArtifacts({ message, content, plan, toolCallHistory })
     // 将最终结果写入 memory 以保持对话连续性
     this.memory.add({ role: 'user', content: message })
     this.memory.add({ role: 'assistant', content })
@@ -1645,18 +1646,65 @@ export class Agent {
     const history = await this._getHistory()
     const telemetry = this._currentRun?.rootCtx ?? null
     let finalContent = ''
+    let finalPlan = null
+    let finalToolCallHistory = []
     for await (const event of strategy.stream(message, { signal, history, telemetry })) {
       if (event.type === 'done' && typeof event.content === 'string') {
         finalContent = event.content
       }
+      if (event.type === 'done') {
+        if (Array.isArray(event.plan)) finalPlan = event.plan
+        if (Array.isArray(event.toolCallHistory)) finalToolCallHistory = event.toolCallHistory
+      }
       yield event
     }
+    this._recordPlanArtifacts({
+      message,
+      content: finalContent,
+      plan: finalPlan,
+      toolCallHistory: finalToolCallHistory,
+    })
     // 将最终结果写入 memory 以保持对话连续性（对齐 _planAndExecuteChat）
     this.memory.add({ role: 'user', content: message })
     this.memory.add({ role: 'assistant', content: finalContent })
   }
 
   // ---- 辅助方法 ----
+
+  _recordPlanArtifacts({ message, content, plan, toolCallHistory }) {
+    const rh = this.memory?.runtimeHistory
+    if (!rh || typeof rh.appendArtifact !== 'function') return
+    if (Array.isArray(plan)) {
+      rh.appendArtifact({
+        kind: 'plan',
+        request: message,
+        steps: plan.map(step => ({
+          index: step.index,
+          description: step.description,
+          status: step.status,
+          result: step.result,
+          durationMs: step.durationMs,
+          rounds: step.rounds,
+        })),
+      })
+      for (const step of plan) {
+        rh.appendArtifact({
+          kind: 'plan_step',
+          index: step.index,
+          description: step.description,
+          status: step.status,
+          result: step.result,
+          toolCalls: Array.isArray(step.toolCalls) ? step.toolCalls.slice() : [],
+        })
+      }
+    }
+    rh.appendArtifact({
+      kind: 'final_answer',
+      request: message,
+      content,
+      toolCallHistory: Array.isArray(toolCallHistory) ? toolCallHistory.slice() : [],
+    })
+  }
 
   /**
    * 统一读取 memory 中的 messages，兼容同步/异步 getMessages。
