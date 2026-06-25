@@ -23,6 +23,7 @@ import {
   resetBaseTools,
   getBaseTools,
   isBaseTool,
+  formatMcpToolSummary,
 } from '../src/index.js'
 
 // 用仓库里的 mock-mcp-server.js 作为演示用的 stdio MCP Server
@@ -49,12 +50,15 @@ async function example1_basics() {
   const tools = await client.listTools()
   console.log(`\n发现 ${tools.length} 个工具:`)
   for (const t of tools) {
-    console.log(`  • ${t.name}  (rawName=${t._mcp.rawName}, serverName=${t._mcp.serverName})`)
-    console.log(`    描述: ${t.description}`)
+    console.log(`  • ${formatMcpToolSummary(t)}`)
+    console.log(`    LLM 描述: ${t.description}`)
+    console.log(`    metadata: title=${t.title ?? '-'}, taskSupport=${t.execution?.taskSupport ?? 'forbidden'}`)
   }
 
-  // 演示 _mcp 是非可枚举的 —— 不会被序列化给 LLM
+  // 演示官方 metadata / _mcp 是非可枚举的 —— 不会污染 SDK tool schema
   console.log('\n_mcp 元数据非可枚举:', Object.keys(tools[0]).includes('_mcp') === false)
+  console.log('title/outputSchema 等 metadata 非可枚举:',
+    ['title', 'outputSchema', 'execution'].every((k) => !Object.keys(tools[0]).includes(k)))
 
   // 执行一个工具 —— 这里调用 echo,mock server 会把参数 JSON 原样回显
   const echo = tools.find(t => t._mcp.rawName === 'echo')
@@ -113,6 +117,8 @@ async function example3_withAgent() {
     name: 'demo',
   })
   const mcpTools = await client.listTools()
+  console.log('MCP 工具摘要:')
+  for (const t of mcpTools) console.log('  - ' + formatMcpToolSummary(t))
 
   // 2. 一个本地工具 —— 演示 MCP 与 defineTool 在 Agent 眼里完全等价
   const sayHello = defineTool({
@@ -145,7 +151,10 @@ async function example3_withAgent() {
     provider: 'openai',
     apiKey: process.env.OPENAI_API_KEY,
     model: 'gpt-4',
-    systemPrompt: '你是一个助手,可以使用 echo / add / say_hello 工具。',
+    systemPrompt:
+      '你是一个助手,可以使用 echo / add / say_hello 工具。' +
+      'MCP 工具摘要: ' + mcpTools.map(formatMcpToolSummary).join('；') +
+      '。请结合工具描述里的 outputSchema 和 taskSupport 选择工具。',
     tools: [...mcpTools, sayHello],
   })
 

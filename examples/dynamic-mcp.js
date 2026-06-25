@@ -24,7 +24,7 @@
  * 注:示例 2/3 的 search 工具需要网络连通(搜狗);get_time 离线也能跑。
  */
 import { fileURLToPath } from 'node:url'
-import { Agent, defineTool, isBaseTool } from '../src/index.js'
+import { Agent, defineTool, isBaseTool, formatMcpToolSummary } from '../src/index.js'
 
 // 仓库自带的内置搜索 MCP Server —— stdio 子进程,零依赖、免 API Key。
 const WEB_SEARCH_SERVER = fileURLToPath(
@@ -145,6 +145,8 @@ async function example2_loadMcpMetaTool() {
   // 新增的 MCP 工具立即出现在工具集,且被注册为 Base_Tool(不会被意图过滤剔除)
   const mcpTools = agent.getTools().filter(t => t.name.startsWith('mcp__'))
   console.log('\n加载后新增 MCP 工具:', mcpTools.map(t => t.name).join(', '))
+  console.log('MCP 工具 metadata 摘要:')
+  for (const t of mcpTools) console.log('  - ' + formatMcpToolSummary(t))
   console.log('均已注册为 Base_Tool:', mcpTools.every(t => isBaseTool(t.name)))
 
   // 实际调用一个加载进来的工具 —— get_time 离线可跑
@@ -156,7 +158,8 @@ async function example2_loadMcpMetaTool() {
   if (search) {
     try {
       const raw = await search.execute({ query: 'Model Context Protocol', limit: 2 })
-      const hits = JSON.parse(raw)
+      const payload = JSON.parse(raw)
+      const hits = Array.isArray(payload) ? payload : (payload.results || [])
       console.log(`调用 mcp__web__search → 命中 ${hits.length} 条,首条: ${hits[0]?.title ?? '(无)'}`)
     } catch (err) {
       console.log('调用 mcp__web__search → (网络不可用,跳过):', err.message)
@@ -201,7 +204,7 @@ async function example3_llmDriven() {
       '需要联网搜索时,用以下参数加载内置搜索服务器:' +
       `transport="stdio"、command="${process.execPath}"、` +
       `args=["${WEB_SEARCH_SERVER}"]、serverKey="web-search"、name="web"。` +
-      '加载成功后会得到 mcp__web__search 与 mcp__web__fetch_page 工具,用它们搜索并回答。用中文回答。',
+      '加载成功后会得到 mcp__web__search 与 mcp__web__fetch_page 工具,返回信息会包含 title、outputSchema、execution.taskSupport 等摘要;用它们搜索并回答。用中文回答。',
   })
 
   console.log('起步工具(仅元工具):', agent.getTools().map(t => t.name).join(', '))

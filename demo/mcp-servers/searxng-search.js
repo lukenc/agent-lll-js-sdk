@@ -19,7 +19,7 @@
 
 import readline from 'node:readline'
 
-const PROTOCOL_VERSION = '2025-03-26'
+const PROTOCOL_VERSION = '2025-11-25'
 const SEARXNG_URL = (process.env.SEARXNG_URL || 'http://localhost:8888').replace(/\/$/, '')
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
@@ -36,10 +36,20 @@ async function search(query, limit = 5) {
       headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
     })
   } catch (err) {
-    return `搜索失败: 无法连接 SearXNG (${SEARXNG_URL}). 请确认 SearXNG 已启动. 原因: ${err.message}`
+    return {
+      query,
+      totalResults: 0,
+      error: `搜索失败: 无法连接 SearXNG (${SEARXNG_URL}). 请确认 SearXNG 已启动. 原因: ${err.message}`,
+      results: [],
+    }
   }
   if (!res.ok) {
-    return `搜索失败: SearXNG 返回 HTTP ${res.status}. 如果是 403,请确认 settings.yml 里 formats 含 json.`
+    return {
+      query,
+      totalResults: 0,
+      error: `搜索失败: SearXNG 返回 HTTP ${res.status}. 如果是 403,请确认 settings.yml 里 formats 含 json.`,
+      results: [],
+    }
   }
 
   const data = await res.json()
@@ -51,19 +61,19 @@ async function search(query, limit = 5) {
   }))
 
   if (results.length === 0) {
-    return JSON.stringify({
+    return {
       query,
       totalResults: 0,
       note: '无结果. 可能所有引擎都超时(国内网络下 Google/DDG 常超时),或搜索词太特殊.',
       results: [],
-    }, null, 2)
+    }
   }
 
-  return JSON.stringify({
+  return {
     query,
     totalResults: results.length,
     results,
-  }, null, 2)
+  }
 }
 
 /**
@@ -94,10 +104,46 @@ async function fetchPage(url, maxChars = 8000) {
 
 // ==================== MCP 协议 ====================
 
+const SEARCH_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    query: { type: 'string' },
+    totalResults: { type: 'number' },
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          url: { type: 'string' },
+          description: { type: 'string' },
+          engine: { type: 'string' },
+        },
+      },
+    },
+    note: { type: 'string' },
+    error: { type: 'string' },
+  },
+  required: ['query', 'totalResults', 'results'],
+}
+
+const FETCH_PAGE_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    url: { type: 'string' },
+    text: { type: 'string' },
+    chars: { type: 'number' },
+    truncated: { type: 'boolean' },
+  },
+  required: ['url', 'text', 'chars', 'truncated'],
+}
+
 const TOOLS = [
   {
     name: 'search',
+    title: 'SearXNG Web Search',
     description: '网络搜索 — 通过 SearXNG 聚合 Google/Bing/DuckDuckGo/百度 等多引擎的实时搜索结果,返回标题、URL、摘要。免费,无需 API Key。',
+    icons: [{ src: 'https://docs.searxng.org/_static/searxng-wordmark.svg', mimeType: 'image/svg+xml', sizes: ['any'] }],
     inputSchema: {
       type: 'object',
       properties: {
@@ -106,10 +152,20 @@ const TOOLS = [
       },
       required: ['query'],
     },
+    outputSchema: SEARCH_OUTPUT_SCHEMA,
+    execution: { taskSupport: 'optional' },
+    annotations: {
+      title: 'SearXNG Web Search',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   {
     name: 'fetch_page',
+    title: 'Fetch Web Page',
     description: '抓取网页内容 — 获取指定 URL 的文本内容(去 HTML 标签)。适合读取搜索结果里的具体页面。',
+    icons: [{ src: 'https://docs.searxng.org/_static/searxng-wordmark.svg', mimeType: 'image/svg+xml', sizes: ['any'] }],
     inputSchema: {
       type: 'object',
       properties: {
@@ -117,6 +173,14 @@ const TOOLS = [
         maxChars: { type: 'number', description: '最大返回字符数(默认 8000)' },
       },
       required: ['url'],
+    },
+    outputSchema: FETCH_PAGE_OUTPUT_SCHEMA,
+    execution: { taskSupport: 'optional' },
+    annotations: {
+      title: 'Fetch Web Page',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
     },
   },
 ]
@@ -153,15 +217,27 @@ async function handleToolCall(msg) {
   const args = msg.params?.arguments ?? {}
   try {
     let text
+    let structuredContent
+    let isError = false
     switch (toolName) {
       case 'search': {
         const limit = Math.min(Math.max(args.limit || 5, 1), 10)
-        text = await search(args.query || '', limit)
+        structuredContent = await search(args.query || '', limit)
+        text = JSON.stringify(structuredContent, null, 2)
+        isError = !!structuredContent.error
         break
       }
-      case 'fetch_page':
-        text = await fetchPage(args.url || '', args.maxChars || 8000)
+      case 'fetch_page': {
+        const url = args.url || ''
+        text = await fetchPage(url, args.maxChars || 8000)
+        structuredContent = {
+          url,
+          text,
+          chars: text.length,
+          truncated: text.endsWith('\n...(已截断)'),
+        }
         break
+      }
       default:
         return {
           jsonrpc: '2.0',
@@ -172,7 +248,7 @@ async function handleToolCall(msg) {
     return {
       jsonrpc: '2.0',
       id: msg.id,
-      result: { content: [{ type: 'text', text }], isError: false },
+      result: { content: [{ type: 'text', text }], structuredContent, isError },
     }
   } catch (err) {
     return {

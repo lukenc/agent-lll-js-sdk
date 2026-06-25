@@ -42,6 +42,8 @@ import {
   createMCPClient,
   registerBaseTool,
   unregisterBaseTool,
+  formatMcpToolSummary,
+  serializeMcpToolForBrowser,
 } from '../src/index.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
@@ -175,6 +177,16 @@ function getAllMcpTools() {
   return all
 }
 
+function getMcpToolSummaries(tools = getAllMcpTools()) {
+  return tools.map((t) => formatMcpToolSummary(t))
+}
+
+function getMcpPromptNote() {
+  const summaries = getMcpToolSummaries()
+  if (summaries.length === 0) return ''
+  return '。当前已挂载 MCP 工具摘要: ' + summaries.join('；')
+}
+
 /** 重建 agent 的 tools(不重建 agent 本身,保留对话历史) */
 function refreshAgentTools() {
   if (!agent) return
@@ -231,8 +243,8 @@ async function connectMcp(spec) {
   mcpConnections.set(name, { client, tools, spec })
   refreshAgentTools()
 
-  console.log(`[mcp] 已挂载 "${name}" (${tools.length} 个工具):`,
-    tools.map((t) => t.name).join(', '))
+  console.log(`[mcp] 已挂载 "${name}" (${tools.length} 个工具):\n` +
+    getMcpToolSummaries(tools).map((s) => `  - ${s}`).join('\n'))
   return tools
 }
 
@@ -289,6 +301,7 @@ function createAgent(strategy) {
     model: MODEL,
     systemPrompt: '你是一个有用的助手,可以查询时间、做数学计算,并可使用当前已挂载的 MCP 工具'
       + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在'
+      + getMcpPromptNote()
       + (ENABLE_DYNAMIC_MCP
         ? '。你还可以用 load_mcp_server 工具在对话中按需加载新的 MCP 服务器'
           + `(例如 transport="stdio"、command="node"、args=["demo/mcp-servers/web-search.js"]、serverKey="web"、name="web" 可加载内置搜索服务器,得到 mcp__web__search / mcp__web__fetch_page)`
@@ -429,20 +442,33 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/mcp-status') {
     const connections = []
     for (const [name, entry] of mcpConnections) {
+      const serializedTools = entry.tools.map((t) => serializeMcpToolForBrowser(t))
       connections.push({
         name,
         toolCount: entry.tools.length,
-        toolNames: entry.tools.map((t) => t.name),
+        toolNames: serializedTools.map((t) => t.name),
+        toolSummaries: entry.tools.map((t) => formatMcpToolSummary(t)),
+        tools: serializedTools.map((t) => ({
+          name: t.name,
+          title: t.title,
+          rawName: t.rawName,
+          serverName: t.serverName,
+          taskSupport: t.execution?.taskSupport,
+          outputSchema: t.outputSchema,
+        })),
         command: entry.spec.command,
       })
     }
     const allTools = getAllMcpTools()
+    const allSerializedTools = allTools.map((t) => serializeMcpToolForBrowser(t))
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
     res.end(JSON.stringify({
       connected: mcpConnections.size > 0,
       connections,
       toolCount: allTools.length,
-      toolNames: allTools.map((t) => t.name),
+      toolNames: allSerializedTools.map((t) => t.name),
+      toolSummaries: allTools.map((t) => formatMcpToolSummary(t)),
+      serverName: connections.length === 1 ? connections[0].name : undefined,
       presets: MCP_PRESETS,
     }))
     return
@@ -470,6 +496,8 @@ const server = createServer(async (req, res) => {
         serverName: spec.name,
         toolCount: tools.length,
         toolNames: tools.map((t) => t.name),
+        toolSummaries: tools.map((t) => formatMcpToolSummary(t)),
+        tools: tools.map((t) => serializeMcpToolForBrowser(t)),
         totalConnections: mcpConnections.size,
       }))
     } catch (err) {
@@ -501,13 +529,7 @@ const server = createServer(async (req, res) => {
     const allTools = getAllMcpTools()
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
     res.end(JSON.stringify({
-      tools: allTools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters,
-        rawName: t._mcp.rawName,
-        serverName: t._mcp.serverName,
-      })),
+      tools: allTools.map((t) => serializeMcpToolForBrowser(t)),
     }))
     return
   }

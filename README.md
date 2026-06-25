@@ -478,7 +478,7 @@ const session = agent.getSessionMetrics()   // 所有 run 的累计 Session_Metr
 不需要写胶水代码。`createMCPClient(options)` 返回的 `listTools()` 结果形状与
 `defineTool` 完全一致，直接塞进 `new Agent({ tools: [...] })`。
 
-实现遵循 [MCP 2025-03-26 规范](https://modelcontextprotocol.io/specification/2025-03-26/index)，
+实现遵循 [MCP 2025-11-25 规范](https://modelcontextprotocol.io/specification/2025-11-25/index)，
 零新增 runtime 依赖（只用 Node 18+ 内置 `child_process` / `fetch` / `http`）。
 
 ### 基础用法（stdio 子进程 MCP Server）
@@ -516,9 +516,13 @@ await mcp.close()
 
 | transport | 用途 | 规范状态 |
 |-----------|------|---------|
-| `'stdio'` | 本地子进程（最常用） | MCP 2025-03-26 一等 |
-| `'http'`（别名 `'streamable-http'`） | 远程 Streamable HTTP | MCP 2025-03-26 推荐 |
+| `'stdio'` | 本地子进程（最常用） | MCP 2025-11-25 一等 |
+| `'http'`（别名 `'streamable-http'`） | 远程 Streamable HTTP | MCP 2025-11-25 推荐 |
 | `'sse'` | legacy SSE（GET 长连 + POST /messages） | 存量兼容 |
+
+Streamable HTTP 会在 `initialize` 响应里记录 `MCP-Session-Id`（若 server 下发），
+后续请求自动带上 `MCP-Session-Id` 与协商后的 `MCP-Protocol-Version`；`close()` 会尽力
+发送带 session header 的 `DELETE` 结束会话。
 
 未内置的传输（如 websocket）通过 `registerTransport(name, factory)` 自定义注入：
 
@@ -535,6 +539,39 @@ registerTransport('ws', (options) => {
 MCP 工具名自动前缀化为 `mcp__<serverName>__<toolName>`，符合 OpenAI / Anthropic
 工具名正则 `^[a-zA-Z0-9_-]{1,64}$`。多个 Server 同时挂载也不会碰撞 ——
 冲突时自动追加 `_2` / `_3` 数字后缀。非法字符（emoji / 中文 / 空格等）替换为 `_`。
+
+### MCP 工具元数据
+
+`listTools()` 会保留官方 `Tool` descriptor 的 UI / 执行 metadata。除
+`name` / `description` / `parameters` / `execute` 外，MCP 工具还可通过属性读取：
+
+```js
+const [tool] = await mcp.listTools()
+
+tool.title                  // descriptor.title
+tool.icons                  // descriptor.icons
+tool.outputSchema           // descriptor.outputSchema
+tool.execution?.taskSupport // descriptor.execution.taskSupport
+tool.annotations            // descriptor.annotations
+
+tool._mcp.rawName           // server 原始工具名
+tool._mcp.outputSchema      // 同一份官方 metadata 也保留在 _mcp 中
+```
+
+这些 metadata 属性和 `_mcp` 都是非枚举属性，不会进入 `Object.keys(tool)` 或
+`formatToolsForOpenAI()` 的 JSON Schema 字段。为了让大模型也能理解这些信息，
+MCP 工具的 `description` 会自动追加精简的 `title`、`outputSchema`、
+`execution.taskSupport` 与 annotations 摘要；原始描述保存在 `tool._mcp.rawDescription`。
+
+需要自己做 UI 代理或日志时，也可以用内置 helper：
+
+```js
+import {
+  serializeMcpToolForBrowser,
+  attachMcpToolMetadata,
+  formatMcpToolSummary,
+} from 'lll-web-agent'
+```
 
 ### BASE_TOOLS 运行时扩展
 
@@ -597,7 +634,7 @@ const mcp = await createMCPClient({
 
   // 通用选项（所有 transport）
   name: 'filesystem',               // 命名空间前缀 + 日志
-  protocolVersion: '2025-03-26',    // 默认即此
+  protocolVersion: '2025-11-25',    // 默认即此
   requestTimeoutMs: 60000,          // 默认 60s
   clientInfo: { name: 'my-app', version: '1.0.0' },  // 默认 {name:'lll-web-agent', version:<pkg>}
   signal: myAbortController.signal, // 握手阶段响应 abort
@@ -656,12 +693,14 @@ OPENAI_API_KEY=sk-xxx node demo/server.js
 
 | 端点 | 用途 |
 |---|---|
-| `GET /mcp-tools` | 拿工具清单（name / description / parameters / rawName） |
+| `GET /mcp-tools` | 拿工具清单（name / description / parameters / rawName / title / icons / outputSchema / execution / annotations / modelDescription） |
 | `POST /mcp-call` | body `{ name, arguments }` —— 转发到服务端的 `MCP_Client.execute` |
 
-`demo/browser.html` 里 `loadMcpTools()` 把 `/mcp-tools` 的每一项包成本地 `defineTool`，
+`demo/browser.html` 里会把 `/mcp-tools` 的每一项包成本地 `defineTool`，并把
+`title` / `icons` / `outputSchema` / `execution` / `annotations` 重新挂回非枚举属性；
 `execute` 实现就是 `fetch('/mcp-call', ...)`。对浏览器 Agent 而言，MCP 工具和本地工具
-没有任何区别。API Key 和 MCP server 子进程都留在服务端，浏览器零暴露、零 CORS。
+没有任何区别，且意图识别开启时这些 MCP 工具也会注册为 Base Tool。API Key 和 MCP server
+子进程都留在服务端，浏览器零暴露、零 CORS。
 
 架构：
 
@@ -687,4 +726,3 @@ Browser Agent 继续 ReAct 循环
 ## License
 
 MIT
-

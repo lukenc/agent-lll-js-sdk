@@ -58,7 +58,7 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 - ✅ 服务端 Agent 对话（ReAct / Plan & Execute 两种策略可切换）
 - ✅ 浏览器端 Agent（前提：第 1 步已 `npm run build`）
 - ✅ 遥测面板：实时事件流 + Run/Session 聚合指标
-- ✅ MCP 面板一键挂载（内置搜索、SearXNG、mock 等预设）
+- ✅ MCP 面板一键挂载（内置搜索、SearXNG、mock 等预设），并保留 `title` / `icons` / `outputSchema` / `execution.taskSupport` / `annotations`
 - ✅ `DYNAMIC_MCP=1` 动态 MCP：LLM 可在对话中自主调用 `load_mcp_server` 加载工具
 
 > 用 DeepSeek：把第 3 步换成 `DYNAMIC_MCP=1 DEEPSEEK_API_KEY=sk-xxx node demo/server.js`。
@@ -190,6 +190,9 @@ demo 支持把外部 MCP server 的工具挂到 Agent 上。有三种挂法。
 | 🧪 mock | 仓库自带的 echo / add 测试 server | 无 |
 
 挂载后工具名会自动加命名空间前缀 `mcp__<name>__<tool>`，Agent 立即可用，不丢对话。
+demo 会把 MCP 官方工具 metadata 一并透传到服务端 Agent 和浏览器端 Agent：UI 可读到
+`title` / `icons`，大模型可在工具 description 与系统提示里看到 `outputSchema` 和
+`execution.taskSupport` 摘要。
 
 ### 方式 B：启动时用环境变量挂载
 
@@ -236,7 +239,7 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 | GET | `/mcp-status` | 已挂载的 MCP server 状态 + 可用预设清单 |
 | POST | `/mcp-connect` | 挂载 MCP server，body `{ preset }` 或完整 spec |
 | POST | `/mcp-disconnect` | 卸载 MCP server，body `{ name }`（不传则全卸） |
-| GET | `/mcp-tools` | 列出所有已挂载 MCP 工具（供浏览器端代理调用） |
+| GET | `/mcp-tools` | 列出所有已挂载 MCP 工具（含 title/icons/outputSchema/execution/annotations/modelDescription，供浏览器端代理调用） |
 | POST | `/mcp-call` | 代理执行某个 MCP 工具，body `{ name, arguments }` |
 
 ---

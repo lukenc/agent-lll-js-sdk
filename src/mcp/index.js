@@ -69,7 +69,7 @@ async function readPkgVersion() {
  * 默认协议版本。与 design §Overview "默认值"表一致。
  * @see Requirement 1.9
  */
-const DEFAULT_PROTOCOL_VERSION = '2025-03-26'
+const DEFAULT_PROTOCOL_VERSION = '2025-11-25'
 
 /**
  * 默认请求超时。与 design §Overview "默认值"表一致。
@@ -188,7 +188,7 @@ async function ensureBuiltinTransportLoaded(transport) {
  *   `deriveServerName` 规则派生。
  * @param {{ name: string, version: string }} [options.clientInfo]
  *   调用方身份;未提供默认 `{ name: 'lll-web-agent', version: <package.json .version> }`。
- * @param {string} [options.protocolVersion]  未提供默认 `'2025-03-26'`。
+ * @param {string} [options.protocolVersion]  未提供默认 `'2025-11-25'`。
  * @param {number} [options.requestTimeoutMs]  未提供默认 `60000`。
  * @param {AbortSignal} [options.signal]  外部取消源;handshake 途中 abort → AbortError。
  * @param {(reason?: object) => void} [options.onClose]  transport-initiated 关闭回调。
@@ -275,3 +275,12 @@ export {
   MCPProtocolError,
 } from './errors.js'
 export { registerTransport } from './transports/index.js'
+export {
+  MCP_TOOL_METADATA_KEYS,
+  attachMcpToolMetadata,
+  describeMcpToolForModel,
+  formatMcpToolSummary,
+  readMcpToolMetadata,
+  serializeMcpToolForBrowser,
+  summarizeMcpOutputSchema,
+} from './metadata.js'
