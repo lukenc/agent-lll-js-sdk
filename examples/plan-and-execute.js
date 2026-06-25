@@ -74,6 +74,16 @@ async function example1_agentChat() {
 
   const reply = await agent.chat('读取 package.json，分析项目依赖，然后列出 src 目录结构')
   console.log('Agent 回复:', reply)
+
+  const artifacts = await agent.getArtifacts()
+  console.log('\nRuntimeHistory artifacts:')
+  for (const artifact of artifacts) {
+    if (artifact.kind === 'plan') {
+      console.log(`  plan: ${artifact.steps.length} 步`)
+    } else if (artifact.kind === 'final_answer') {
+      console.log(`  final_answer: ${artifact.content.slice(0, 80)}...`)
+    }
+  }
 }
 
 // ==================== 示例 2: 流式 + 进度事件 ====================
@@ -113,6 +123,9 @@ async function example2_agentStream() {
         break
     }
   }
+
+  const artifacts = await agent.getArtifacts()
+  console.log('\nArtifacts 轨道:', artifacts.map(a => a.kind).join(', '))
 }
 
 // ==================== 示例 3: 独立使用 PlanAndExecuteStrategy ====================
