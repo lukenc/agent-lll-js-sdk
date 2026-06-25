@@ -199,6 +199,30 @@ const ta = new TokenAwareMemory(50000)
 const agent = new Agent({ ..., memory: sm })
 ```
 
+### RuntimeHistory 与轨道
+
+内置 Memory 类现在内部基于 `RuntimeHistory` 保存完整会话事实，同时继续保持原来的 `add()` / `getMessages()` / `getHistory()` 接口。
+
+默认轨道：
+
+| 轨道 | 用途 |
+|------|------|
+| `all` | 完整事实源：system、user、assistant、tool、summary、artifact、diagnostic |
+| `visible` | 适合 UI 展示的用户可见内容 |
+| `model` | 发送给大模型的上下文投影，会受滑窗、摘要、token 策略影响 |
+| `artifacts` | 计划、步骤结果、最终产物、文件改动记录 |
+| `internal` | 摘要、主题切换、诊断等运行时内部事件 |
+
+```js
+const agent = new Agent({ provider, apiKey, memory: new SummarizingMemory({ summarizer }) })
+
+const visible = await agent.getHistory('visible')
+const modelContext = await agent.getHistory('model')
+const artifacts = await agent.getArtifacts()
+```
+
+`SlidingWindowMemory`、`SummarizingMemory`、`TokenAwareMemory` 仍然是控制模型上下文长度的策略；它们不再代表完整历史本身。完整历史保存在 `RuntimeHistory` 的 `all` 轨道中。
+
 ### ToolFilter
 
 ```js

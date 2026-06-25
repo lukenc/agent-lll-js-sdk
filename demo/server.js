@@ -321,6 +321,28 @@ function createAgent(strategy) {
 
 let agent = createAgent('react')
 
+async function buildContextSnapshot(agent) {
+  if (!agent) {
+    return {
+      tracks: { all: [], visible: [], model: [], artifacts: [] },
+      counts: { all: 0, visible: 0, model: 0, artifacts: 0 },
+    }
+  }
+  const all = await agent.getHistory('all')
+  const visible = await agent.getHistory('visible')
+  const model = await agent.getHistory('model')
+  const artifacts = await agent.getArtifacts()
+  return {
+    tracks: { all, visible, model, artifacts },
+    counts: {
+      all: all.length,
+      visible: visible.length,
+      model: model.length,
+      artifacts: artifacts.length,
+    },
+  }
+}
+
 /**
  * 订阅 agent 的遥测事件，把每一条事件通过 res (SSE) 转发给浏览器。
  * 注册于 chat() 前，在 session.end 后自动解绑，避免跨请求泄漏。
@@ -401,6 +423,8 @@ const server = createServer(async (req, res) => {
       const lastRun = agent.getLastRunMetrics()
       const session = agent.getSessionMetrics()
       res.write(`data: ${JSON.stringify({ type: 'metrics', lastRun, session })}\n\n`)
+      const context = await buildContextSnapshot(agent)
+      res.write(`data: ${JSON.stringify({ type: 'context', context })}\n\n`)
     } catch (err) {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`)
     } finally {
@@ -408,6 +432,14 @@ const server = createServer(async (req, res) => {
     }
     res.write('data: [DONE]\n\n')
     res.end()
+    return
+  }
+
+  // 当前会话的 RuntimeHistory 轨道快照。
+  if (req.method === 'GET' && req.url === '/context') {
+    const context = await buildContextSnapshot(agent)
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify(context))
     return
   }
 

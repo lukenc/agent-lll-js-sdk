@@ -111,3 +111,15 @@ test('[SMOKE] INITIAL_BASE_TOOLS is a frozen array of exactly 6 initial names', 
     'INITIAL_BASE_TOOLS must contain exactly the 6 documented names'
   )
 })
+
+test('[SMOKE] src/index.js — runtime history and memory policy APIs exported', () => {
+  for (const name of [
+    'RuntimeHistory',
+    'SlidingWindowPolicy',
+    'TokenBudgetPolicy',
+    'SummaryPolicy',
+    'estimateMessageTokens',
+  ]) {
+    assert.ok(name in pkg, `${name} should be exported`)
+  }
+})
