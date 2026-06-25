@@ -16,7 +16,7 @@
 
 import readline from 'node:readline'
 
-const PROTOCOL_VERSION = '2025-03-26'
+const PROTOCOL_VERSION = '2025-11-25'
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 // ==================== 工具实现 ====================
@@ -99,10 +99,53 @@ async function fetchPage(url, maxChars = 8000) {
 
 // ==================== MCP 协议处理 ====================
 
+const SEARCH_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    query: { type: 'string' },
+    totalResults: { type: 'number' },
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          url: { type: 'string' },
+          description: { type: 'string' },
+        },
+      },
+    },
+  },
+  required: ['query', 'totalResults', 'results'],
+}
+
+const FETCH_PAGE_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    url: { type: 'string' },
+    text: { type: 'string' },
+    chars: { type: 'number' },
+    truncated: { type: 'boolean' },
+  },
+  required: ['url', 'text', 'chars', 'truncated'],
+}
+
+const TIME_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    timestamp: { type: 'string' },
+    locale: { type: 'string' },
+    timezone: { type: 'string' },
+  },
+  required: ['timestamp', 'locale', 'timezone'],
+}
+
 const TOOLS = [
   {
     name: 'search',
+    title: 'Sogou Web Search',
     description: '网络搜索 — 使用搜狗搜索引擎查找信息,返回标题、URL 和摘要。免费,无需 API Key,国内直连。',
+    icons: [{ src: 'https://www.sogou.com/favicon.ico', mimeType: 'image/x-icon', sizes: ['16x16'] }],
     inputSchema: {
       type: 'object',
       properties: {
@@ -111,10 +154,20 @@ const TOOLS = [
       },
       required: ['query'],
     },
+    outputSchema: SEARCH_OUTPUT_SCHEMA,
+    execution: { taskSupport: 'optional' },
+    annotations: {
+      title: 'Sogou Web Search',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   {
     name: 'fetch_page',
+    title: 'Fetch Web Page',
     description: '抓取网页内容 — 获取指定 URL 的文本内容(自动去除 HTML 标签)。适合读取搜索结果中的具体页面。',
+    icons: [{ src: 'https://www.sogou.com/favicon.ico', mimeType: 'image/x-icon', sizes: ['16x16'] }],
     inputSchema: {
       type: 'object',
       properties: {
@@ -123,13 +176,30 @@ const TOOLS = [
       },
       required: ['url'],
     },
+    outputSchema: FETCH_PAGE_OUTPUT_SCHEMA,
+    execution: { taskSupport: 'optional' },
+    annotations: {
+      title: 'Fetch Web Page',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   {
     name: 'get_time',
+    title: 'Current Time',
     description: '获取当前日期和时间',
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+    outputSchema: TIME_OUTPUT_SCHEMA,
+    execution: { taskSupport: 'forbidden' },
+    annotations: {
+      title: 'Current Time',
+      readOnlyHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
     },
   },
 ]
@@ -147,7 +217,7 @@ function handleMessage(msg) {
           protocolVersion: PROTOCOL_VERSION,
           serverInfo: { name: 'builtin-web-search', version: '1.0.0' },
           capabilities: { tools: {} },
-          instructions: '内置网络搜索 MCP Server — 支持 Bing 搜索和网页抓取,零 API Key。',
+          instructions: '内置网络搜索 MCP Server — 支持搜狗搜索和网页抓取,零 API Key。',
         },
       }
 
@@ -177,19 +247,38 @@ async function handleToolCall(msg) {
 
   try {
     let text
+    let structuredContent
     switch (toolName) {
       case 'search': {
         const limit = Math.min(Math.max(args.limit || 5, 1), 10)
         const results = await searchWeb(args.query || '', limit)
-        text = JSON.stringify(results, null, 2)
+        structuredContent = {
+          query: args.query || '',
+          totalResults: results.length,
+          results,
+        }
+        text = JSON.stringify(structuredContent, null, 2)
         break
       }
       case 'fetch_page': {
-        text = await fetchPage(args.url || '', args.maxChars || 8000)
+        const url = args.url || ''
+        text = await fetchPage(url, args.maxChars || 8000)
+        structuredContent = {
+          url,
+          text,
+          chars: text.length,
+          truncated: text.endsWith('\n...(已截断)'),
+        }
         break
       }
       case 'get_time': {
-        text = new Date().toLocaleString('zh-CN', { dateStyle: 'full', timeStyle: 'medium' })
+        const now = new Date()
+        text = now.toLocaleString('zh-CN', { dateStyle: 'full', timeStyle: 'medium' })
+        structuredContent = {
+          timestamp: now.toISOString(),
+          locale: 'zh-CN',
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        }
         break
       }
       default:
@@ -207,6 +296,7 @@ async function handleToolCall(msg) {
       id: msg.id,
       result: {
         content: [{ type: 'text', text }],
+        structuredContent,
         isError: false,
       },
     }

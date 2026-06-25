@@ -1,7 +1,7 @@
 /**
  * MCP Streamable HTTP Transport — 单端点 POST + 可选 SSE 响应流的传输。
  *
- * 对齐 MCP 2025-03-26 规范定义的 "streamable-http":每一次 client → server
+ * 对齐 MCP 2025-11-25 规范定义的 Streamable HTTP:每一次 client → server
  * 的消息都是一次独立的 `POST <url>`,body 是单条 JSON-RPC 消息;server 的
  * 响应有两种合法形态:
  *
@@ -141,6 +141,10 @@ export function httpFactory(options) {
   let closeReason = null
   /** close() 幂等 Promise. */
   let closePromise = null
+  /** Streamable HTTP 会话 ID;由 initialize 响应头 MCP-Session-Id 赋值. */
+  let sessionId = null
+  /** initialize 响应中协商出的协议版本;用于后续 MCP-Protocol-Version 头. */
+  let protocolVersion = null
 
   /**
    * 触发一次 onClose(最多一次)。用 try/catch 包住回调异常,避免 transport
@@ -174,6 +178,76 @@ export function httpFactory(options) {
     }
   }
 
+  function isInitializeMessage(msg) {
+    return msg && typeof msg === 'object' && msg.method === 'initialize'
+  }
+
+  function captureSessionId(sentMsg, response) {
+    if (!isInitializeMessage(sentMsg)) return
+    const nextSessionId = response.headers.get('mcp-session-id')
+    if (typeof nextSessionId === 'string' && nextSessionId.length > 0) {
+      sessionId = nextSessionId
+    }
+  }
+
+  function captureProtocolVersion(sentMsg, receivedMsg) {
+    if (!isInitializeMessage(sentMsg)) return
+    if (sentMsg.id == null || receivedMsg?.id !== sentMsg.id) return
+    const nextVersion = receivedMsg?.result?.protocolVersion
+    if (typeof nextVersion === 'string' && nextVersion.length > 0) {
+      protocolVersion = nextVersion
+    }
+  }
+
+  function buildRequestHeaders(msg) {
+    const headers = new Headers(userHeaders ?? undefined)
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, text/event-stream')
+
+    if (!isInitializeMessage(msg)) {
+      if (sessionId) headers.set('MCP-Session-Id', sessionId)
+      if (protocolVersion) headers.set('MCP-Protocol-Version', protocolVersion)
+    }
+
+    return headers
+  }
+
+  function buildSessionHeaders() {
+    const headers = new Headers(userHeaders ?? undefined)
+    headers.set('Accept', 'application/json, text/event-stream')
+    if (sessionId) headers.set('MCP-Session-Id', sessionId)
+    if (protocolVersion) headers.set('MCP-Protocol-Version', protocolVersion)
+    return headers
+  }
+
+  async function terminateSession() {
+    if (!sessionId) return
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      try { controller.abort() } catch { /* ignore */ }
+    }, 2000)
+
+    try {
+      const response = await fetch(url, {
+        method: 'DELETE',
+        headers: buildSessionHeaders(),
+        signal: controller.signal,
+      })
+      try {
+        if (response && typeof response.arrayBuffer === 'function') {
+          await response.arrayBuffer()
+        }
+      } catch {
+        // best-effort drain only
+      }
+    } catch {
+      // Session termination is best-effort; local close must still complete.
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // SSE 响应流消费 — 供 send() 内部调用
   // ─────────────────────────────────────────────────────────────────────
@@ -194,7 +268,7 @@ export function httpFactory(options) {
    *
    * @param {Response} response
    */
-  function consumeSseResponse(response) {
+  function consumeSseResponse(response, sentMsg) {
     if (!response.body || typeof response.body.getReader !== 'function') {
       // server 声明了 SSE 但没给 body — 视为协议问题但非致命,fireError 后返回。
       fireError({
@@ -243,6 +317,7 @@ export function httpFactory(options) {
           fireError({ kind: 'malformed_frame', cause: err })
           continue
         }
+        captureProtocolVersion(sentMsg, msg)
         if (onMessageCb) {
           try { onMessageCb(msg) } catch { /* 吞掉用户回调异常 */ }
         }
@@ -292,11 +367,7 @@ export function httpFactory(options) {
     }
     // 形状断言 + 单行 JSON 输出;失败同步抛,不触发任何网络动作。
     const body = codec.encode(msg)
-    const headers = {
-      ...(userHeaders ?? {}),
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-    }
+    const headers = buildRequestHeaders(msg)
 
     // 每次 send 合并一次 user signal + internal abort signal。abortController
     // 是 transport 生命周期内单例,因此多次 send 共享同一 close-on-demand 源。
@@ -331,11 +402,13 @@ export function httpFactory(options) {
       throw err
     }
 
+    captureSessionId(msg, response)
+
     const contentType = String(response.headers.get('content-type') ?? '').toLowerCase()
 
     if (contentType.includes('text/event-stream')) {
       // SSE 路径:异步消费,不等流关闭(否则 send 会挂住后续调用)。
-      consumeSseResponse(response)
+      consumeSseResponse(response, msg)
       return
     }
 
@@ -362,6 +435,7 @@ export function httpFactory(options) {
         fireError({ kind: 'malformed_frame', cause: err })
         return
       }
+      captureProtocolVersion(msg, parsed)
       if (onMessageCb) {
         try { onMessageCb(parsed) } catch { /* 吞掉用户回调异常 */ }
       }
@@ -420,7 +494,11 @@ export function httpFactory(options) {
     if (closePromise) return closePromise
     closePromise = (async () => {
       if (closed) return
+      const shouldTerminateSession = Boolean(sessionId)
       fireClose({ reason: 'client-initiated' })
+      if (shouldTerminateSession) {
+        await terminateSession()
+      }
     })()
     return closePromise
   }

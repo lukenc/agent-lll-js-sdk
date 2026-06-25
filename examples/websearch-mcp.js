@@ -20,7 +20,7 @@
  * 环境变量:
  *   SEARXNG_URL — SearXNG 地址,默认 http://localhost:8888
  */
-import { createMCPClient, registerBaseTool } from '../src/index.js'
+import { createMCPClient, registerBaseTool, formatMcpToolSummary } from '../src/index.js'
 
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888'
 
@@ -61,7 +61,8 @@ console.log(`   状态: ${client.state}\n`)
 const tools = await client.listTools()
 console.log(`📦 可用工具(${tools.length} 个):`)
 for (const t of tools) {
-  console.log(`   • ${t.name} — ${t.description}`)
+  console.log(`   • ${formatMcpToolSummary(t)}`)
+  console.log(`     ${t.description}`)
 }
 console.log()
 
@@ -115,7 +116,10 @@ if (process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY) {
     apiKey: process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY,
     model: process.env.DEEPSEEK_API_KEY ? 'deepseek-chat' : 'gpt-4',
     tools: tools,
-    systemPrompt: '你是一个能联网的助手。回答前先用 search 搜索,必要时用 fetch_page 抓取页面正文,再综合回答。用中文回答。',
+    systemPrompt:
+      '你是一个能联网的助手。回答前先用 search 搜索,必要时用 fetch_page 抓取页面正文,再综合回答。' +
+      'MCP 工具摘要: ' + tools.map(formatMcpToolSummary).join('；') +
+      '。请结合工具 outputSchema 组织最终答案。用中文回答。',
   })
 
   console.log('Agent 已创建,正在对话...\n')

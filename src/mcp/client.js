@@ -29,6 +29,10 @@ import { MCPClosedError, MCPProtocolError, MCPRequestError } from './errors.js'
 import { codec } from './codec.js'
 import { assignUniqueNames } from './namespace.js'
 import { normalizeCallToolResult } from './normalize.js'
+import {
+  attachMcpToolMetadata,
+  describeMcpToolForModel,
+} from './metadata.js'
 
 /**
  * JSON-RPC 超时沿用规范未分配区间中的保留值 `-32000`(Req 6.11)。
@@ -527,7 +531,7 @@ export class MCP_Client {
         {
           protocolVersion: this._options.protocolVersion,
           clientInfo: this._options.clientInfo,
-          capabilities: { tools: {} },
+          capabilities: {},
         },
         {
           allowConnecting: true,
@@ -713,38 +717,46 @@ export class MCP_Client {
    *
    * 形状(Req 4.4 / 4.5):
    *   - `name`:已分配的 namespaced 名(`mcp__<server>__<tool>` 形态)
-   *   - `description`:descriptor.description 或空串(Agent 层不接受 undefined)
+   *   - `description`:descriptor.description + 官方 metadata 摘要,供 LLM 理解
    *   - `parameters`:直接透传 descriptor.inputSchema(JSON Schema 对象)
    *   - `execute`:闭包绑定 this,调用时走 `_executeTool(rawName, args, ctx)`;
    *     因此若在 `listTools()` 后 client 变为 closed/closing,`execute` 会在
    *     每次调用入口拿到最新 state 并立即 reject MCPClosedError。
+   *   - MCP 官方 Tool metadata: title / icons / outputSchema / execution /
+   *     annotations 作为非枚举属性暴露在 toolDef 上,方便 UI / 调度层读取,
+   *     但不污染 `Object.keys(toolDef)` / `formatToolsForOpenAI`。
    *   - `_mcp`:非可枚举元数据,让 `JSON.stringify(toolDef)` 与
-   *     `formatToolsForOpenAI` 看不到它,避免泄露到 LLM(design §Overview)。
-   *     字段包含 serverName / rawName / annotations 三项。
+   *     `formatToolsForOpenAI` 看不到原始对象;LLM 只通过 description 摘要
+   *     看到必要 metadata。
+   *     字段包含 serverName / rawName 以及上述官方 metadata。
    *
    * @param {string} namespaced
    * @param {object} descriptor  MCP_Tool_Descriptor
    * @returns {object}  Mcp_Tool_Def
    */
   _buildToolDef(namespaced, descriptor) {
+    const metadata = {
+      serverName: this._serverName,
+      rawName: descriptor.name,
+      rawDescription: descriptor.description ?? '',
+      title: descriptor.title,
+      icons: descriptor.icons,
+      outputSchema: descriptor.outputSchema,
+      execution: descriptor.execution,
+      annotations: descriptor.annotations,
+    }
     const toolDef = {
       name: namespaced,
-      description: descriptor.description ?? '',
+      description: describeMcpToolForModel({
+        name: namespaced,
+        description: descriptor.description ?? '',
+        ...metadata,
+      }),
       parameters: descriptor.inputSchema,
       execute: (args, ctx) => this._executeTool(descriptor.name, args, ctx),
     }
-    // 非枚举元数据(见 design §Overview "_mcp 非枚举" 段)
-    Object.defineProperty(toolDef, '_mcp', {
-      value: {
-        serverName: this._serverName,
-        rawName: descriptor.name,
-        annotations: descriptor.annotations,
-      },
-      enumerable: false,
-      writable: false,
-      configurable: false,
-    })
-    return toolDef
+
+    return attachMcpToolMetadata(toolDef, metadata)
   }
 
   /**
