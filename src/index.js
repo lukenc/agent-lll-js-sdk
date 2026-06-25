@@ -28,4 +28,11 @@ export {
   MCPClosedError,
   MCPRequestError,
   MCPProtocolError,
+  MCP_TOOL_METADATA_KEYS,
+  attachMcpToolMetadata,
+  describeMcpToolForModel,
+  formatMcpToolSummary,
+  readMcpToolMetadata,
+  serializeMcpToolForBrowser,
+  summarizeMcpOutputSchema,
 } from './mcp/index.js'

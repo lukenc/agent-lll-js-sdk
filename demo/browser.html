@@ -235,11 +235,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <script>
 var Agent = LllWebAgent.Agent
 var defineTool = LllWebAgent.defineTool
+var registerBaseTool = LllWebAgent.registerBaseTool
+var unregisterBaseTool = LllWebAgent.unregisterBaseTool
+var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
 var agent = null
 var sending = false
 var chat = document.getElementById('chat')
 var input = document.getElementById('input')
 var sendBtn = document.getElementById('send')
+var registeredMcpToolNames = new Set()
 
 // 浏览器端可用的工具
 
@@ -492,9 +496,9 @@ var mcpTools = []    // [Tool_Def],加载成功后追加到 Agent tools 数组
 
 /** 把 server 端 /mcp-tools 返回的描述包装成本地 defineTool。 */
 function wrapMcpTool(t) {
-  return defineTool({
+  var tool = defineTool({
     name: t.name,
-    description: t.description,
+    description: t.modelDescription || t.description,
     parameters: t.parameters,
     execute: async function(args) {
       var r = await fetch('/mcp-call', {
@@ -507,6 +511,57 @@ function wrapMcpTool(t) {
       return payload.result != null ? String(payload.result) : ''
     },
   })
+  if (attachMcpToolMetadata) {
+    attachMcpToolMetadata(tool, t)
+  } else {
+    attachBrowserMcpMetadata(tool, t)
+  }
+  return tool
+}
+
+function attachBrowserMcpMetadata(tool, meta) {
+  ;['title', 'icons', 'outputSchema', 'execution', 'annotations'].forEach(function(key) {
+    if (meta[key] !== undefined) {
+      Object.defineProperty(tool, key, { value: meta[key], enumerable: false })
+    }
+  })
+  Object.defineProperty(tool, '_mcp', {
+    value: {
+      rawName: meta.rawName,
+      serverName: meta.serverName,
+      rawDescription: meta.rawDescription,
+      title: meta.title,
+      icons: meta.icons,
+      outputSchema: meta.outputSchema,
+      execution: meta.execution,
+      annotations: meta.annotations,
+    },
+    enumerable: false,
+  })
+}
+
+function syncMcpBaseTools() {
+  if (!registerBaseTool || !unregisterBaseTool) return
+  var next = new Set(mcpTools.map(function(t) { return t.name }))
+  registeredMcpToolNames.forEach(function(name) {
+    if (!next.has(name)) unregisterBaseTool(name)
+  })
+  next.forEach(function(name) {
+    if (!registeredMcpToolNames.has(name)) registerBaseTool(name)
+  })
+  registeredMcpToolNames = next
+}
+
+function summarizeBrowserMcpTool(t) {
+  var parts = [t.name]
+  var title = t.title || (t.annotations && t.annotations.title)
+  if (title) parts.push('title=' + title)
+  if (t.execution && t.execution.taskSupport) parts.push('taskSupport=' + t.execution.taskSupport)
+  if (t.outputSchema) {
+    var props = t.outputSchema.properties ? Object.keys(t.outputSchema.properties).slice(0, 8) : []
+    parts.push('outputSchema=' + (t.outputSchema.type || 'object') + (props.length ? ' properties: ' + props.join(', ') : ''))
+  }
+  return parts.join(' | ')
 }
 
 /**
@@ -546,10 +601,14 @@ async function syncMcpStatus(opts) {
       var toolsRes = await fetch('/mcp-tools')
       var toolsData = toolsRes.ok ? await toolsRes.json() : { tools: [] }
       mcpTools = (toolsData.tools || []).map(wrapMcpTool)
+      syncMcpBaseTools()
 
       badge.className = 'mcp-badge on'
       text.textContent = 'MCP: ' + s.toolCount + ' 工具 (' + s.connections.length + ' server)'
-      badge.title = '已挂载:\n' + s.connections.map(function(c) { return '  • ' + c.name + ' (' + c.toolCount + ' 工具)' }).join('\n')
+      badge.title = '已挂载:\n' + s.connections.map(function(c) {
+        var details = (c.toolSummaries && c.toolSummaries.length ? c.toolSummaries : c.toolNames || []).map(function(n) { return '      - ' + n }).join('\n')
+        return '  • ' + c.name + ' (' + c.toolCount + ' 工具)' + (details ? '\n' + details : '')
+      }).join('\n')
 
       statusEl.className = 'mcp-panel-status ok'
       statusEl.innerHTML = '✓ 已挂载 ' + s.connections.length + ' 个 server(' + s.toolCount + ' 工具): '
@@ -557,13 +616,14 @@ async function syncMcpStatus(opts) {
         var chip = document.createElement('span')
         chip.className = 'tool-chip'
         chip.textContent = c.name + '(' + c.toolCount + ')'
-        chip.title = c.toolNames.join(', ')
+        chip.title = (c.toolSummaries && c.toolSummaries.length ? c.toolSummaries : c.toolNames).join('\n')
         statusEl.appendChild(chip)
         statusEl.appendChild(document.createTextNode(' '))
       })
       if (!opts.silent) addMsg('phase', '🔌 MCP 已挂载 ' + s.connections.length + ' 个 server,共 ' + s.toolCount + ' 个工具')
     } else {
       mcpTools = []
+      syncMcpBaseTools()
       badge.className = 'mcp-badge off'
       text.textContent = 'MCP 未挂载'
       badge.title = '尚未挂载 MCP server。从下方面板选一个预设挂载,或启动时通过 MCP_SERVER_CMD 环境变量指定。'
@@ -632,11 +692,13 @@ async function mcpDisconnect() {
 async function refreshBrowserMcpTools() {
   try {
     var res = await fetch('/mcp-tools')
-    if (!res.ok) { mcpTools = []; return }
+    if (!res.ok) { mcpTools = []; syncMcpBaseTools(); return }
     var data = await res.json()
     mcpTools = (data.tools || []).map(wrapMcpTool)
+    syncMcpBaseTools()
   } catch {
     mcpTools = []
+    syncMcpBaseTools()
   }
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
@@ -673,7 +735,7 @@ function initAgent() {
   var allTools = baseTools.concat(mcpTools)
 
   var mcpNote = mcpTools.length > 0
-    ? ' 你还可以使用服务端挂载的 MCP 工具。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在。'
+    ? ' 你还可以使用服务端挂载的 MCP 工具。当前 MCP 工具摘要: ' + mcpTools.map(summarizeBrowserMcpTool).join('；') + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在。'
     : ''
 
   var agentOpts = {

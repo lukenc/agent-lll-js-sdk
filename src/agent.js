@@ -36,6 +36,7 @@ import { ContextManager, defaultTokenBudget } from './context-manager.js'
 import { PlanAndExecuteStrategy } from './plan-and-execute.js'
 import { TelemetryBus, newTraceId, newSpanId, utf8ByteLength, childContext } from './telemetry.js'
 import { createMCPClient } from './mcp/index.js'
+import { formatMcpToolSummary } from './mcp/metadata.js'
 
 /**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
@@ -1143,7 +1144,8 @@ export class Agent {
     const toolNames = tools.map((t) => t.name)
     this._managedClients.set(serverKey, { serverKey, client, toolNames: new Set(toolNames) })
 
-    return `Successfully loaded MCP server "${serverKey}" with ${toolNames.length} tool(s): ${toolNames.join(', ')}.`
+    const summaries = tools.map((t) => `  - ${formatMcpToolSummary(t)}`).join('\n')
+    return `Successfully loaded MCP server "${serverKey}" with ${toolNames.length} tool(s):\n${summaries}`
   }
 
   /**

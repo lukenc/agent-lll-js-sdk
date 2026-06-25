@@ -583,9 +583,13 @@ fetch('/mcp-status').then(r => r.json()).then((s) => {
   const text = document.getElementById('mcpBadgeText')
   if (s.connected && s.toolCount > 0) {
     badge.className = 'mcp-badge on'
-    text.textContent = `MCP: ${s.toolCount} 工具 (${s.serverName})`
-    badge.title = `MCP Server "${s.serverName}" 已挂载:\n` + s.toolNames.map(n => '  • ' + n).join('\n')
-    addMsg('phase', `🔌 已挂载 MCP Server "${s.serverName}"，工具数 ${s.toolCount}: ${s.toolNames.join(', ')}`)
+    const serverLabel = s.connections && s.connections.length
+      ? s.connections.map(c => c.name).join(', ')
+      : (s.serverName || 'MCP')
+    const summaries = s.toolSummaries && s.toolSummaries.length ? s.toolSummaries : s.toolNames
+    text.textContent = `MCP: ${s.toolCount} 工具 (${serverLabel})`
+    badge.title = `MCP Server 已挂载 (${serverLabel}):\n` + summaries.map(n => '  • ' + n).join('\n')
+    addMsg('phase', `🔌 已挂载 MCP Server "${serverLabel}"，工具数 ${s.toolCount}:\n${summaries.map(n => '  • ' + n).join('\n')}`)
   } else {
     badge.className = 'mcp-badge off'
     text.textContent = 'MCP 未挂载'
