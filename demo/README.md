@@ -58,6 +58,7 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 - ✅ 服务端 Agent 对话（ReAct / Plan & Execute 两种策略可切换）
 - ✅ 浏览器端 Agent（前提：第 1 步已 `npm run build`）
 - ✅ 遥测面板：实时事件流 + Run/Session 聚合指标
+- ✅ RuntimeHistory 上下文轨道快照：`all` / `visible` / `model` / `artifacts`
 - ✅ MCP 面板一键挂载（内置搜索、SearXNG、mock 等预设），并保留 `title` / `icons` / `outputSchema` / `execution.taskSupport` / `annotations`
 - ✅ `DYNAMIC_MCP=1` 动态 MCP：LLM 可在对话中自主调用 `load_mcp_server` 加载工具
 
@@ -225,6 +226,28 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 
 ## 服务端接口速查（给想二次开发的人）
 
+### RuntimeHistory 与上下文轨道
+
+demo 会在每轮对话结束后展示当前 Agent 的 RuntimeHistory 轨道快照，帮助你区分：
+
+| 轨道 | demo 中的用途 |
+|---|---|
+| `all` | 完整事件事实源，包含 system / user / assistant / tool / artifact |
+| `visible` | 适合展示给用户看的消息投影 |
+| `model` | 下一轮会进入模型上下文的消息投影 |
+| `artifacts` | Plan & Execute 的计划、步骤结果、最终产物 |
+
+服务端 demo 也提供 `GET /context`，返回同一份快照：
+
+```json
+{
+  "counts": { "all": 6, "visible": 2, "model": 4, "artifacts": 0 },
+  "tracks": { "all": [], "visible": [], "model": [], "artifacts": [] }
+}
+```
+
+浏览器端 demo 不经过 server 读取上下文，而是直接调用本地 `agent.getHistory('all')`、`agent.getHistory('visible')`、`agent.getHistory('model')` 和 `agent.getArtifacts()`。
+
 `server.js` 暴露的 HTTP 接口：
 
 | 方法 | 路径 | 作用 |
@@ -236,6 +259,7 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 | POST | `/reset` | 重置会话历史 |
 | GET/POST | `/strategy` | 查询 / 切换执行策略（react / plan_and_execute） |
 | GET | `/metrics` | 当前 Run 和 Session 的聚合指标 |
+| GET | `/context` | 当前 RuntimeHistory 轨道快照 |
 | GET | `/mcp-status` | 已挂载的 MCP server 状态 + 可用预设清单 |
 | POST | `/mcp-connect` | 挂载 MCP server，body `{ preset }` 或完整 spec |
 | POST | `/mcp-disconnect` | 卸载 MCP server，body `{ name }`（不传则全卸） |

@@ -43,6 +43,7 @@ const agent = new Agent({
 console.log('--- 同步对话 ---')
 const reply = await agent.chat('现在几点了？然后帮我算一下 123 * 456')
 console.log('Agent:', reply)
+await printContextTracks(agent)
 
 // 流式对话
 console.log('\n--- 流式对话 ---')
@@ -62,4 +63,16 @@ for await (const event of agent.stream('先告诉我现在的时间，再算 2^1
       console.log('\n--- 完成 ---')
       break
   }
+}
+await printContextTracks(agent)
+
+async function printContextTracks(agent) {
+  const all = await agent.getHistory('all')
+  const visible = await agent.getHistory('visible')
+  const model = await agent.getHistory('model')
+
+  console.log('\n--- RuntimeHistory 上下文轨道 ---')
+  console.log('all（完整事实源）事件数:', all.length)
+  console.log('visible（适合 UI 展示）:', visible.map(m => `${m.role}: ${m.content}`).join(' | '))
+  console.log('model（发送给大模型的投影）消息数:', model.length)
 }

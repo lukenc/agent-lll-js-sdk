@@ -1,154 +1,140 @@
 /**
  * 对话记忆策略 — 对应 Java 框架的 fc.memory 包
  *
- * - SlidingWindowMemory: 滑动窗口（按消息数量裁剪）
- * - SummarizingMemory: 摘要记忆（超阈值时通过 LLM 压缩旧消息）
- * - TokenAwareMemory: token 感知记忆（按 token 预算裁剪）
+ * 内置 Memory 类对外保持原有接口；内部通过 RuntimeHistory 保存完整事实，
+ * 再用不同策略投影出发送给模型的上下文。
  */
 
-// ---- Helper: adjust trim cut point to respect tool-call groups ----
+import { RuntimeHistory } from './runtime-history.js'
+import {
+  SlidingWindowPolicy,
+  SummaryPolicy,
+  TokenBudgetPolicy,
+  adjustCutPointForToolPairs,
+  cloneMessage,
+  estimateMessageTokens,
+  projectSummaryForWire,
+  sliceWithoutOrphanTools,
+} from './memory-policy.js'
 
-/**
- * If the initial cut point lands on a `tool` message, walk backward to include
- * the parent `assistant(tool_calls)` message so the kept portion never starts
- * with orphaned tool responses.
- *
- * Exported so other modules (e.g. ContextManager.trimHistory) can reuse the
- * same invariant without duplicating the logic.
- *
- * @param {object[]} nonSystem - array of non-system messages
- * @param {number} cutIndex - initial index where kept messages start
- * @returns {number} adjusted cutIndex (same or smaller)
- */
-/**
- * Collapse `_isSummary`-tagged system messages into the first non-summary
- * system message and strip the internal `_isSummary` field, producing a
- * clean OpenAI-compatible message list with exactly one system message at
- * most (modulo any system messages the caller added by hand).
- *
- * Used by `SummarizingMemory.getMessages` so the internal summary tag never
- * leaks onto the wire and so we never emit two system messages from a single
- * summarization event. See todo.md R-1.
- *
- * @param {object[]} messages
- * @returns {object[]}
- */
-export function projectSummaryForWire(messages) {
-  const summaryTexts = []
-  const rest = []
-  for (const m of messages) {
-    if (m && m.role === 'system' && m._isSummary === true) {
-      if (m.content) summaryTexts.push(m.content)
-    } else {
-      rest.push(m)
+export { adjustCutPointForToolPairs, projectSummaryForWire, sliceWithoutOrphanTools }
+
+class RuntimeBackedMemory {
+  constructor() {
+    this.runtimeHistory = new RuntimeHistory()
+    this._legacyRaw = []
+    this._legacyDirty = false
+    this._legacyProxy = this._createLegacyProxy(this._legacyRaw)
+  }
+
+  get messages() {
+    return this._legacyProxy
+  }
+
+  set messages(value) {
+    if (!Array.isArray(value)) {
+      throw new TypeError('messages must be assigned an array')
     }
+    this._legacyRaw = value.map(cloneMessage)
+    this._legacyProxy = this._createLegacyProxy(this._legacyRaw)
+    this._legacyDirty = false
+    this.runtimeHistory.rebuildFromMessages(this._legacyRaw)
   }
-  if (summaryTexts.length === 0) return rest
-  const summaryBlock = summaryTexts.join('\n\n')
-  const firstSysIdx = rest.findIndex(m => m && m.role === 'system')
-  if (firstSysIdx === -1) {
-    return [{ role: 'system', content: summaryBlock }, ...rest]
-  }
-  const orig = rest[firstSysIdx]
-  const base = orig.content ?? ''
-  const merged = { ...orig, content: base ? `${base}\n\n${summaryBlock}` : summaryBlock }
-  // Defensive: strip internal-only field if the caller has somehow placed it
-  // on the primary system message too.
-  delete merged._isSummary
-  const out = rest.slice()
-  out[firstSysIdx] = merged
-  return out
-}
 
-export function adjustCutPointForToolPairs(nonSystem, cutIndex) {
-  if (cutIndex <= 0 || cutIndex >= nonSystem.length) return cutIndex
-  const originalCutIndex = cutIndex
-  // Walk backward while the message at cutIndex is a tool message
-  while (cutIndex > 0 && nonSystem[cutIndex].role === 'tool') {
-    cutIndex--
+  add(message) {
+    this._syncFromLegacyIfDirty()
+    this.runtimeHistory.appendMessage(message)
+    this._legacyRaw.push(cloneMessage(message))
+    this._refreshLegacyFromProjection()
   }
-  // Now cutIndex should point to the assistant(tool_calls) message
-  // Verify it's an assistant with tool_calls; if not, we've hit an edge case
-  if (nonSystem[cutIndex].role === 'assistant' && nonSystem[cutIndex].tool_calls?.length > 0) {
-    return cutIndex
-  }
-  // Fallback: return original position (shouldn't happen with well-formed history)
-  return originalCutIndex
-}
 
-/**
- * Slice `nonSystem` starting from `cutIndex`, keeping the orphan-tool
- * invariant: the returned array will never start with a `role: 'tool'`
- * message that lacks a preceding `assistant(tool_calls)`.
- *
- * Strategy:
- *   1. Let `adjustCutPointForToolPairs` try to pull the parent
- *      `assistant(tool_calls)` back into the slice.
- *   2. If adjustment failed (malformed history: tool messages whose parent
- *      was trimmed away), strip the leading orphan `tool` messages so we
- *      never hand a broken sequence to the LLM.
- *
- * Used by all memory `_trim` implementations and by
- * `ContextManager.trimHistory`, so behavior stays consistent across the
- * four call sites. See todo.md R-4.
- *
- * @param {object[]} nonSystem
- * @param {number} cutIndex
- * @returns {object[]}
- */
-export function sliceWithoutOrphanTools(nonSystem, cutIndex) {
-  const adjusted = adjustCutPointForToolPairs(nonSystem, cutIndex)
-  const sliced = nonSystem.slice(adjusted)
-  let stripFrom = 0
-  while (stripFrom < sliced.length && sliced[stripFrom].role === 'tool') {
-    stripFrom++
+  addAll(messages) {
+    this._syncFromLegacyIfDirty()
+    for (const message of messages) {
+      this.runtimeHistory.appendMessage(message)
+      this._legacyRaw.push(cloneMessage(message))
+    }
+    this._refreshLegacyFromProjection()
   }
-  return stripFrom === 0 ? sliced : sliced.slice(stripFrom)
+
+  clear() {
+    this.runtimeHistory.clear()
+    this._legacyRaw.length = 0
+    this._legacyDirty = false
+    this._onClear()
+  }
+
+  get size() {
+    this._syncFromLegacyIfDirty()
+    return this._projectedMessages().length
+  }
+
+  _onClear() {}
+
+  _createLegacyProxy(raw) {
+    return new Proxy(raw, {
+      set: (target, prop, value) => {
+        target[prop] = value
+        this._legacyDirty = true
+        return true
+      },
+      deleteProperty: (target, prop) => {
+        delete target[prop]
+        this._legacyDirty = true
+        return true
+      },
+    })
+  }
+
+  _syncFromLegacyIfDirty() {
+    if (!this._legacyDirty) return
+    this.runtimeHistory.rebuildFromMessages(this._legacyRaw.filter(Boolean))
+    this._legacyDirty = false
+  }
+
+  _refreshLegacyFromProjection() {
+    const projected = this._projectedMessages()
+    this._legacyRaw.length = 0
+    this._legacyRaw.push(...projected.map(cloneMessage))
+    this._legacyDirty = false
+  }
+
+  _baseModelMessages(options = {}) {
+    this._syncFromLegacyIfDirty()
+    return this.runtimeHistory.projectMessages('model', options)
+  }
+
+  _projectedMessages() {
+    return this._baseModelMessages({ includeSummary: true })
+  }
 }
 
 // ---- SlidingWindowMemory ----
 
-export class SlidingWindowMemory {
+export class SlidingWindowMemory extends RuntimeBackedMemory {
   /** @param {number} maxMessages 最大消息数（不含 system prompt） */
   constructor(maxMessages = 40) {
+    super()
     this.maxMessages = maxMessages
-    this.messages = []
-  }
-
-  add(message) {
-    this.messages.push(message)
-    this._trim()
-  }
-
-  addAll(messages) {
-    this.messages.push(...messages)
-    this._trim()
+    this._policy = new SlidingWindowPolicy(maxMessages)
   }
 
   getMessages() {
-    return [...this.messages]
+    this._syncFromLegacyIfDirty()
+    return this._policy.apply(this.runtimeHistory.projectMessages('model', { includeSummary: true }))
   }
 
   /** 返回非 system 消息（用于 ContextManager 的 history 输入） */
   getHistory() {
-    return this.messages.filter(m => m.role !== 'system')
+    return this.getMessages().filter(m => m.role !== 'system')
   }
 
-  clear() {
-    this.messages = []
-  }
-
-  get size() {
-    return this.messages.length
+  _projectedMessages() {
+    return this.getMessages()
   }
 
   _trim() {
-    const system = this.messages.filter(m => m.role === 'system')
-    const nonSystem = this.messages.filter(m => m.role !== 'system')
-    if (nonSystem.length > this.maxMessages) {
-      const cutIndex = nonSystem.length - this.maxMessages
-      this.messages = [...system, ...sliceWithoutOrphanTools(nonSystem, cutIndex)]
-    }
+    this._refreshLegacyFromProjection()
   }
 }
 
@@ -157,122 +143,71 @@ export class SlidingWindowMemory {
 /**
  * 摘要记忆 — 超过阈值时通过 summarizer 函数压缩旧消息。
  * 对应 Java 框架的 fc.memory.SummarizingMemory。
- *
- * @example
- * const memory = new SummarizingMemory({
- *   threshold: 20,
- *   keepRecent: 5,
- *   summarizer: async (text) => {
- *     // 调用 LLM 生成摘要
- *     return await llmSummarize(text)
- *   },
- * })
  */
-export class SummarizingMemory {
+export class SummarizingMemory extends RuntimeBackedMemory {
   /**
    * @param {object} opts
    * @param {number} [opts.threshold=20] - 触发摘要的消息数阈值
    * @param {number} [opts.keepRecent=5] - 摘要后保留的最近消息数
    * @param {((text: string) => Promise<string>) | ((text: string, ctx: object|null) => Promise<string>)} opts.summarizer - 摘要函数。
-   *   兼容两种签名：
-   *     - `(text) => Promise<string>`（原签名，仍然可用）
-   *     - `(text, ctx) => Promise<string>`（附加重载，`ctx` 为当前
-   *       `TelemetryContext` 或 `null`）。
-   *   `_doSummarize` 始终传入第二个参数，旧签名会被 JS 自动忽略。
    */
   constructor({ threshold = 20, keepRecent = 5, summarizer } = {}) {
+    super()
     this.threshold = threshold
     this.keepRecent = keepRecent
     this.summarizer = summarizer
-    this.messages = []
     /** @type {string|null} 上一次摘要内容 */
     this.lastSummary = null
-    /**
-     * 正在进行的摘要压缩 Promise（in-flight cache）。并发的
-     * `getMessages()` / `getHistory()` 会共享这一个 Promise,
-     * 避免两个压缩任务同时 race-condition 地重写 `this.messages`。
-     * 见 todo.md R-2。
-     * @type {Promise<void>|null}
-     */
+    /** @type {Promise<void>|null} 正在进行的摘要压缩 Promise */
     this._summarizePromise = null
-    /**
-     * 可选的 `TelemetryContext`，用户自定义 `summarizer` 时由
-     * `Agent`（或应用）通过 `setSummaryContext(ctx)` 注入。
-     * `_doSummarize` 会把它作为第二个实参传给 `summarizer`,
-     * 用户可据此派生 `'agent.summarize'` 子上下文并透传给 llm-client。
-     * 默认的 `Agent` 内置 summarizer 不依赖此字段（它会直接从
-     * 闭包里读取当前运行的 root context），但保留字段以支持用户
-     * 提供自定义 summarizer 时的显式线程化需求（Req 4.3 / 9.1 / 9.2）。
-     * @type {object|null}
-     */
+    /** @type {object|null} 当前运行的 TelemetryContext */
     this._summaryCtx = null
+    this._summaryPolicy = new SummaryPolicy({ threshold, keepRecent })
   }
 
   /**
    * 注入当前运行的 `TelemetryContext`，后续 `_doSummarize` 会把它
-   * 作为第二个实参传给 `summarizer`。`null` / 省略代表 "telemetry disabled",
-   * 用户 summarizer 应把该情况当作 no-op 分支。
+   * 作为第二个实参传给 `summarizer`。
    * @param {object|null} ctx
    */
   setSummaryContext(ctx) {
     this._summaryCtx = ctx ?? null
   }
 
-  add(message) {
-    this.messages.push(message)
-  }
-
-  addAll(messages) {
-    this.messages.push(...messages)
-  }
-
   /**
    * 获取消息列表。如果超过阈值且有 summarizer，自动触发摘要压缩。
-   * 注意：此方法是异步的（与 SlidingWindowMemory 不同）。
-   *
-   * 返回值是"可直接送入 LLM"的形态：`_isSummary` 标记的摘要 system
-   * 消息会被 **合并到第一条非摘要 system 消息** 里，并剥除 `_isSummary`
-   * 内部字段，避免 wire 协议泄漏、避免出现两条 system。见 todo.md R-1。
+   * 返回值是可直接送入 LLM 的 wire-safe 投影，不泄漏 `_isSummary`。
    * @returns {Promise<object[]>}
    */
   async getMessages() {
     await this._maybeSummarize()
-    return projectSummaryForWire([...this.messages])
+    return projectSummaryForWire(this.runtimeHistory.projectMessages('model', { includeSummary: true }))
   }
 
   /** 同步获取（不触发摘要），同样做摘要合并 / 剥除。 */
   getMessagesSync() {
-    return projectSummaryForWire([...this.messages])
+    this._syncFromLegacyIfDirty()
+    return projectSummaryForWire(this.runtimeHistory.projectMessages('model', { includeSummary: true }))
   }
 
   /**
-   * 返回对话历史（供 ContextManager 使用）。
-   * 注意：此方法为 async —— 会主动触发摘要压缩，并保留带 `_isSummary`
-   * 标记的 system 消息（即压缩后的摘要），避免摘要在 ContextManager 路径
-   * 下被悄无声息地丢掉。见 todo.md P0-2。
-   *
-   * 不同于 `getMessages()`，此处 **保留** `_isSummary` 标记，因为
-   * `ContextManager.assemblePrompt` 需要识别并与 `systemPrompt` /
-   * `knowledgeContent` 合并。ContextManager 会在输出前负责剥除标记。
+   * 返回对话历史（供 ContextManager 使用）。保留 `_isSummary` 标记，
+   * 让 ContextManager 能把摘要合并进最终 system prompt。
    */
   async getHistory() {
     await this._maybeSummarize()
-    return this.messages.filter(m => m.role !== 'system' || m._isSummary === true)
+    return this.runtimeHistory
+      .projectMessages('model', { includeSummary: true })
+      .filter(m => m.role !== 'system' || m._isSummary === true)
   }
 
-  clear() {
-    this.messages = []
+  _onClear() {
     this.lastSummary = null
-  }
-
-  get size() {
-    return this.messages.length
+    this._summarizePromise = null
   }
 
   /**
-   * 幂等的摘要触发入口：并发调用会共享同一个在途 Promise，避免两个
-   * `await this.summarizer(...)` 同时 race 地重写 `this.messages`。
-   * 见 todo.md R-2。
+   * 幂等的摘要触发入口：并发调用会共享同一个在途 Promise。
    */
   _maybeSummarize() {
     if (this._summarizePromise) return this._summarizePromise
@@ -283,109 +218,73 @@ export class SummarizingMemory {
   }
 
   async _doSummarize() {
-    const nonSystem = this.messages.filter(m => m.role !== 'system')
-    if (nonSystem.length <= this.threshold || !this.summarizer) return
-
-    const system = this.messages.filter(m => m.role === 'system')
-    const cutIndex = adjustCutPointForToolPairs(nonSystem, nonSystem.length - this.keepRecent)
-    const toSummarize = nonSystem.slice(0, cutIndex)
-    // `toKeep` uses the orphan-safe slice so the kept portion never begins
-    // with a dangling `tool` message even if the parent assistant was
-    // pushed into `toSummarize`. See todo.md R-4.
-    const toKeep = sliceWithoutOrphanTools(nonSystem, cutIndex)
-
-    // 将上一次摘要作为前缀一并送入 summarizer，防止多次压缩后
-    // 早期对话语义彻底丢失（long-term amnesia）。见 todo.md R-3。
-    const prevBlock = this.lastSummary
-      ? `[Previous summary]\n${this.lastSummary}\n\n[New messages]\n`
-      : ''
-    const text = prevBlock + toSummarize.map(m => `[${m.role}]: ${m.content ?? ''}`).join('\n')
+    this._syncFromLegacyIfDirty()
+    const previousSummaryIds = this.runtimeHistory
+      .getEvents('model')
+      .filter(event => event.type === 'summary')
+      .flatMap(event => event.sourceEventIds ?? [])
+    const alreadyCovered = new Set(previousSummaryIds)
+    const messageEvents = this.runtimeHistory
+      .getEvents('model')
+      .filter(event => event.type === 'message')
+      .filter(event => !alreadyCovered.has(event.id))
+    const plan = this._summaryPolicy.plan(messageEvents, this.lastSummary)
+    if (!plan || !this.summarizer) return
 
     try {
-      // Pass `_summaryCtx` as second arg so user-supplied summarizers with
-      // the `(text, ctx) => Promise<string>` signature can derive a child
-      // telemetry context. Single-arg summarizers still work — JS silently
-      // ignores extra arguments.
-      this.lastSummary = await this.summarizer(text, this._summaryCtx ?? null)
-      const summaryMsg = {
-        role: 'system',
-        content: `[Previous conversation summary]: ${this.lastSummary}`,
-        _isSummary: true,
-      }
-      this.messages = [...system.filter(m => !m._isSummary), summaryMsg, ...toKeep]
+      this.lastSummary = await this.summarizer(plan.text, this._summaryCtx ?? null)
+      this.runtimeHistory.appendSummary({
+        content: this.lastSummary,
+        sourceEventIds: [...new Set([...previousSummaryIds, ...plan.sourceEventIds])],
+      })
+      this._refreshLegacyFromProjection()
     } catch (e) {
       console.warn('[SummarizingMemory] Summarization failed:', e.message)
-      // 回退为滑动窗口行为
-      const fallbackCutIndex = nonSystem.length - this.threshold
-      this.messages = [...system, ...sliceWithoutOrphanTools(nonSystem, fallbackCutIndex)]
+      const fallback = new SlidingWindowPolicy(this.threshold)
+        .apply(this.runtimeHistory.projectMessages('model', { includeSummary: true }))
+      this.messages = fallback
     }
+  }
+
+  _projectedMessages() {
+    return this.getMessagesSync()
   }
 }
 
 // ---- TokenAwareMemory ----
 
-const CHARS_PER_TOKEN = 4
-
 /**
  * Token 感知记忆 — 按 token 预算裁剪，而非消息数量。
  * 对应 Java 框架的 AdaptiveMemory 的 token 感知部分。
  */
-export class TokenAwareMemory {
+export class TokenAwareMemory extends RuntimeBackedMemory {
   /**
    * @param {number} [maxTokens=50000] - 最大 token 预算
    */
   constructor(maxTokens = 50000) {
+    super()
     this.maxTokens = maxTokens
-    this.messages = []
-  }
-
-  add(message) {
-    this.messages.push(message)
-    this._trim()
-  }
-
-  addAll(messages) {
-    this.messages.push(...messages)
-    this._trim()
+    this._policy = new TokenBudgetPolicy(maxTokens)
   }
 
   getMessages() {
-    return [...this.messages]
+    this._syncFromLegacyIfDirty()
+    return this._policy.apply(this.runtimeHistory.projectMessages('model', { includeSummary: true }))
   }
 
   getHistory() {
-    return this.messages.filter(m => m.role !== 'system')
-  }
-
-  clear() {
-    this.messages = []
-  }
-
-  get size() {
-    return this.messages.length
+    return this.getMessages().filter(m => m.role !== 'system')
   }
 
   _estimateTokens(msg) {
-    const text = msg.content ?? ''
-    return Math.ceil(text.length / CHARS_PER_TOKEN)
+    return estimateMessageTokens(msg)
+  }
+
+  _projectedMessages() {
+    return this.getMessages()
   }
 
   _trim() {
-    const system = this.messages.filter(m => m.role === 'system')
-    const nonSystem = this.messages.filter(m => m.role !== 'system')
-
-    let totalTokens = system.reduce((sum, m) => sum + this._estimateTokens(m), 0)
-    const kept = []
-
-    // 从最新消息开始保留
-    for (let i = nonSystem.length - 1; i >= 0; i--) {
-      const tokens = this._estimateTokens(nonSystem[i])
-      if (totalTokens + tokens > this.maxTokens) break
-      kept.unshift(nonSystem[i])
-      totalTokens += tokens
-    }
-
-    const cutIndex = nonSystem.length - kept.length
-    this.messages = [...system, ...sliceWithoutOrphanTools(nonSystem, cutIndex)]
+    this._refreshLegacyFromProjection()
   }
 }
