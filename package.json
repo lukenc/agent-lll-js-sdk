@@ -1,6 +1,6 @@
 {
   "name": "lll-web-agent",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "开箱即用的 LLM Agent SDK — 配个 API Key 就能跑",
   "type": "module",
   "main": "src/index.js",
@@ -21,7 +21,7 @@
     "build": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --platform=browser --external:node:* --outfile=dist/lll-web-agent.js",
     "build:min": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --platform=browser --external:node:* --minify --outfile=dist/lll-web-agent.min.js",
     "prepublishOnly": "npm run build && npm run build:min",
-    "test": "node --test src/**/*.test.js",
+    "test": "node --test \"src/**/*.test.js\"",
     "example": "node examples/basic.js"
   },
   "engines": {
