@@ -24,6 +24,8 @@ import {
   getBaseTools,
   isBaseTool,
   formatMcpToolSummary,
+  describeMcpToolForModel,
+  readMcpToolMetadata,
 } from '../src/index.js'
 
 // 用仓库里的 mock-mcp-server.js 作为演示用的 stdio MCP Server
@@ -54,6 +56,16 @@ async function example1_basics() {
     console.log(`    LLM 描述: ${t.description}`)
     console.log(`    metadata: title=${t.title ?? '-'}, taskSupport=${t.execution?.taskSupport ?? 'forbidden'}`)
   }
+
+  // describeMcpToolForModel —— 把官方 metadata(title/outputSchema/taskSupport/
+  // annotations)拼进给大模型看的描述。把它注入 systemPrompt 能帮助 LLM 选工具。
+  console.log('\ndescribeMcpToolForModel(第一个工具) —— 注入提示词用:')
+  console.log(describeMcpToolForModel(tools[0]).split('\n').map(l => '    ' + l).join('\n'))
+
+  // readMcpToolMetadata —— 统一读出归一化后的 metadata(无论挂在顶层还是 _mcp 上)
+  const meta = readMcpToolMetadata(tools[0])
+  console.log('\nreadMcpToolMetadata(第一个工具):')
+  console.log(`    serverName=${meta.serverName}, rawName=${meta.rawName}, title=${meta.title ?? '-'}`)
 
   // 演示官方 metadata / _mcp 是非可枚举的 —— 不会污染 SDK tool schema
   console.log('\n_mcp 元数据非可枚举:', Object.keys(tools[0]).includes('_mcp') === false)
