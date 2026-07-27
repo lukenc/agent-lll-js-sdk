@@ -1,6 +1,6 @@
 {
   "name": "lll-web-agent",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "开箱即用的 LLM Agent SDK — 配个 API Key 就能跑",
   "type": "module",
   "main": "src/index.js",
