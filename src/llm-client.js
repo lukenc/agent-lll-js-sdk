@@ -145,7 +145,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry, va
 
       if (!resp.ok) {
         const errorBody = await resp.text().catch(() => '')
-        throw new LlmApiError(resp.status, errorBody)
+        throw new LlmApiError(resp.status, errorBody, Object.fromEntries(resp.headers.entries()))
       }
 
       return resp
@@ -355,7 +355,7 @@ export async function syncChat({ url, apiKey, body, signal, telemetry }) {
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')
-        throw new LlmApiError(response.status, errorBody)
+        throw new LlmApiError(response.status, errorBody, Object.fromEntries(response.headers.entries()))
       }
 
       return response.json()
@@ -380,7 +380,7 @@ export async function syncChat({ url, apiKey, body, signal, telemetry }) {
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')
-        throw new LlmApiError(response.status, errorBody)
+        throw new LlmApiError(response.status, errorBody, Object.fromEntries(response.headers.entries()))
       }
 
       return response.json()
@@ -462,10 +462,12 @@ function reconstructResponse(collected) {
 }
 
 export class LlmApiError extends Error {
-  constructor(status, body) {
+  constructor(status, body, headers = null) {
     super(`LLM API error ${status}: ${body.slice(0, 200)}`)
     this.status = status
     this.body = body
+    /** 小写键的响应头普通对象（Headers.entries() 产物），或 null。 */
+    this.headers = headers
   }
 }
 
@@ -486,26 +488,65 @@ export class LlmStreamIncompleteError extends Error {
   }
 }
 
+const RETRY_BACKOFF_CAP_MS = 8_000
+const RETRY_AFTER_CAP_MS = 60_000
+
 /**
- * 指数退避重试 — 对 429 (rate limit) 和 5xx (服务端错误) 自动重试。
+ * 是否可安全重试 — 对齐 openai-node / anthropic-sdk 共同策略：
+ * 408/409/429/5xx 与网络层错误（undici 的 TypeError: fetch failed）重试；
+ * 4xx 其余、Abort、以及流开始后的截断（LlmStreamIncompleteError —
+ * 部分数据已交付消费方，重放不安全）不重试。
+ */
+export function isRetryableError(err) {
+  if (err?.name === 'AbortError') return false
+  if (err instanceof LlmStreamIncompleteError) return false
+  if (err instanceof LlmApiError) {
+    return err.status === 408 || err.status === 409 || err.status === 429 || err.status >= 500
+  }
+  return err instanceof TypeError // fetch 网络层错误（fetch failed / terminated）
+}
+
+/**
+ * 单次重试等待毫秒数。服务端 retry-after-ms（毫秒，优先）/ retry-after
+ * （秒或 HTTP 日期）优先并钳制到 60s；否则 min(base·2^attempt, 8s) 乘
+ * [0.75, 1.0] 的减法抖动（Stainless 公式）。
+ */
+export function computeRetryDelayMs(err, attempt, baseDelayMs = 500) {
+  const hinted = retryAfterMs(err instanceof LlmApiError ? err.headers : null)
+  if (hinted != null) return Math.min(hinted, RETRY_AFTER_CAP_MS)
+  const nominal = Math.min(baseDelayMs * Math.pow(2, attempt), RETRY_BACKOFF_CAP_MS)
+  return nominal * (1 - 0.25 * Math.random())
+}
+
+function retryAfterMs(headers) {
+  if (!headers) return null
+  const ms = parseFloat(headers['retry-after-ms'])
+  if (Number.isFinite(ms) && ms >= 0) return ms
+  const raw = headers['retry-after']
+  if (raw == null) return null
+  const secs = parseFloat(raw)
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000
+  const untilMs = Date.parse(raw) - Date.now()
+  return Number.isFinite(untilMs) && untilMs >= 0 ? untilMs : null
+}
+
+/**
+ * 指数退避重试 — 对齐 openai-node / anthropic-sdk 的可重试错误集合与退避公式。
  * @param {() => Promise<T>} fn - 要重试的异步函数
  * @param {object} [opts]
  * @param {number} [opts.maxRetries=3] - 最大重试次数
- * @param {number} [opts.baseDelayMs=1000] - 基础延迟（毫秒）
+ * @param {number} [opts.baseDelayMs=500] - 基础延迟（毫秒）
  * @param {AbortSignal} [opts.signal] - 取消信号
  * @returns {Promise<T>}
  */
-export async function withRetry(fn, { maxRetries = 3, baseDelayMs = 1000, signal } = {}) {
+export async function withRetry(fn, { maxRetries = 3, baseDelayMs = 500, signal } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn()
     } catch (err) {
-      const retryable = err instanceof LlmApiError &&
-        (err.status === 429 || err.status >= 500)
-      if (!retryable || attempt >= maxRetries) throw err
+      if (!isRetryableError(err) || attempt >= maxRetries) throw err
       signal?.throwIfAborted()
-      const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 500
-      await new Promise(r => setTimeout(r, delay))
+      await new Promise(r => setTimeout(r, computeRetryDelayMs(err, attempt, baseDelayMs)))
     }
   }
 }

@@ -24,7 +24,7 @@ export {
 } from './tool-filter.js'
 export { KnowledgeBase, createKnowledgeEntry } from './knowledge-base.js'
 export { ContextManager, defaultTokenBudget, estimateTokens } from './context-manager.js'
-export { streamChat, syncChat, streamChatIter, LlmApiError, LlmStreamIncompleteError, withRetry } from './llm-client.js'
+export { streamChat, syncChat, streamChatIter, LlmApiError, LlmStreamIncompleteError, withRetry, isRetryableError, computeRetryDelayMs } from './llm-client.js'
 export { PlanAndExecuteStrategy, PlanStep, StepStatus, parsePlan } from './plan-and-execute.js'
 export { TelemetryBus, newTraceId, newSpanId, childContext, extractUsage, utf8ByteLength } from './telemetry.js'
 export {
