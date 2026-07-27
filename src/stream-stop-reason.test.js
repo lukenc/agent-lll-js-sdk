@@ -110,4 +110,86 @@ describe('agent.stream stopReason', () => {
       (err) => err.name === 'LlmStreamIncompleteError',
     )
   })
+
+  // Finding I-1: `validateStreamCompletion: false` used to only reach
+  // `_reactLoopStream`'s `streamChatIter` call — `plan_and_execute`'s
+  // internal `PlanAndExecuteStrategy._callLlm` (planner/replan/synthesizer/
+  // step ReAct) never received it, so the documented escape hatch was a lie
+  // under that strategy. Prove the planning call now tolerates a
+  // finish_reason-less stream instead of silently falling back to ReAct
+  // (or, with validation on, throwing).
+  it("plan_and_execute strategy honors validateStreamCompletion: false in the planning call", async () => {
+    const planNoFinish = [
+      'data: ' + JSON.stringify({
+        choices: [{ index: 0, delta: { content: '[{"step":1,"description":"do the thing"}]' } }],
+      }),
+      // 无 finish_reason、无 [DONE] — 连接被干净关闭，模拟省略 finish_reason 的网关
+    ]
+    const stepComplete = [
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'done-step' } }] }),
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      'data: [DONE]',
+    ]
+    stubFetchStreams([planNoFinish, stepComplete])
+    const agent = new Agent({
+      provider: 'openai', apiKey: 'sk-test', model: 'gpt-4o-mini',
+      memory: new SlidingWindowMemory(50), maxRounds: 3,
+      strategy: 'plan_and_execute',
+      validateStreamCompletion: false,
+    })
+
+    const events = []
+    for await (const ev of agent.stream('hi')) events.push(ev)
+
+    // Planner must have succeeded — proves the truncated stream didn't throw
+    // and get swallowed into the "planning failed → fallback to ReAct" path.
+    assert.ok(
+      events.some(e => e.type === 'plan_generated'),
+      'expected plan_generated; a fallback event would mean the planner call still threw',
+    )
+    assert.ok(!events.some(e => e.type === 'phase' && e.phase === 'fallback'))
+    const done = events.find(e => e.type === 'done')
+    assert.equal(done.content, 'done-step')
+  })
+
+  // Finding M-5: `lastStopReason` used to be reset only inside the
+  // ReAct-loop bodies (`_reactLoop` / `_reactLoopStream`), never by
+  // plan_and_execute. A plan_and_execute run following a ReAct run on the
+  // same Agent instance would therefore keep reporting the *previous* run's
+  // stopReason instead of reflecting that plan_and_execute doesn't set one.
+  // The reset now lives at the session entry points (`_runWithSession` /
+  // `_runWithSessionStream`), which cover all four chat()/stream() ×
+  // react/plan_and_execute paths.
+  it('lastStopReason is reset (not stale) after a plan_and_execute run following a ReAct run', async () => {
+    // 1) A ReAct run sets lastStopReason to 'completed'.
+    stubFetchStreams([TEXT_ROUND])
+    const agent = buildAgent(3)
+    await lastDone(agent, 'hi')
+    assert.equal(agent.lastStopReason, 'completed')
+
+    // 2) Switch the same instance to plan_and_execute and run a plain
+    // (non-streaming) chat() — plan_and_execute never assigns
+    // `lastStopReason`, so it must read back as `null`, not the stale
+    // 'completed' from step 1.
+    agent.strategy = 'plan_and_execute'
+    let call = 0
+    globalThis.fetch = async () => {
+      call++
+      // Single-step plan, no tool calls → step result is returned directly
+      // (synthesis is skipped for a 1-step, 1-completed plan), so only two
+      // non-streaming LLM calls are made: planner, then the step's ReAct turn.
+      const content = call === 1
+        ? JSON.stringify([{ step: 1, description: 'do the thing' }])
+        : 'plan-and-execute done'
+      return {
+        ok: true,
+        status: 200,
+        async json() { return { choices: [{ message: { content } }] } },
+        async text() { return '' },
+      }
+    }
+    const content = await agent.chat('hi again')
+    assert.equal(content, 'plan-and-execute done')
+    assert.equal(agent.lastStopReason, null)
+  })
 })

@@ -123,6 +123,9 @@ const DEFAULTS = {
  * @param {number} [opts.planningTimeoutMs=120000]
  * @param {number} [opts.synthesisTimeoutMs=120000]
  * @param {boolean} [opts.useStreaming=false] - 使用流式 API 调用（浏览器端建议开启）
+ * @param {boolean} [opts.validateStreamCompletion=true] - 透传给内部 streamChat
+ *   调用的流完整性校验开关（仅在 useStreaming 时生效）；对齐 Agent 的同名选项，
+ *   使 plan_and_execute 策略下的 escape hatch 与 react 策略一致生效（Finding I-1）。
  * @param {function} [opts.onPhase] - (phase, message) => void
  * @param {function} [opts.onPlanGenerated] - (steps: PlanStep[]) => void
  * @param {function} [opts.onStepStart] - (index, description, step: PlanStep) => void
@@ -148,6 +151,7 @@ export class PlanAndExecuteStrategy {
     this.planningTimeoutMs = opts.planningTimeoutMs ?? DEFAULTS.planningTimeoutMs
     this.synthesisTimeoutMs = opts.synthesisTimeoutMs ?? DEFAULTS.synthesisTimeoutMs
     this.useStreaming = opts.useStreaming ?? false
+    this.validateStreamCompletion = opts.validateStreamCompletion ?? true
 
     // 回调
     this.onPhase = opts.onPhase ?? (() => {})
@@ -375,7 +379,15 @@ export class PlanAndExecuteStrategy {
     const ctx = childContext(this._rootCtx ?? null, operationName)
     const telemetry = ctx ? { ctx } : undefined
     if (this.useStreaming) {
-      return streamChat({ url: this.url, apiKey: this.apiKey, body, signal, onDelta: () => {}, telemetry })
+      return streamChat({
+        url: this.url,
+        apiKey: this.apiKey,
+        body,
+        signal,
+        onDelta: () => {},
+        telemetry,
+        validateCompletion: this.validateStreamCompletion,
+      })
     }
     return syncChat({ url: this.url, apiKey: this.apiKey, body, signal, telemetry })
   }
