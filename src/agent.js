@@ -189,6 +189,7 @@ export class Agent {
    * @param {(round: number) => void} [opts.hooks.onRoundStart] - 每轮 ReAct 循环开始
    * @param {(error: Error, context: object) => void} [opts.hooks.onError] - 错误回调
    * @param {(question: string) => Promise<string>} [opts.hooks.onAskUser] - 用户交互回调（提供后自动注入 ask_user 工具）
+   * @param {boolean} [opts.validateStreamCompletion=true] - 校验流完整性（finish_reason 缺失时抛 LlmStreamIncompleteError）
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -201,6 +202,10 @@ export class Agent {
     this.tools = opts.tools ?? []
     this.maxRounds = opts.maxRounds ?? 300
     this.temperature = opts.temperature ?? 0.6
+    /** 流完整性校验开关 — false 时容忍无 finish_reason 的流（不守规范的网关）。 */
+    this.validateStreamCompletion = opts.validateStreamCompletion ?? true
+    /** 最近一次 run 的终止原因：null | 'completed' | 'max_rounds'。 */
+    this.lastStopReason = null
 
     // ---- Tool_Registry generation 与动态 MCP 状态 ----
     // `this.tools` 保持为数组（元素顺序 = 加入顺序），既有 `tools` 选项语义不变。
@@ -396,7 +401,7 @@ export class Agent {
    * @param {string} message
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
-   * @yields {{ type: 'delta'|'reasoning'|'tool_start'|'tool_end'|'intent'|'done', ... }}
+   * @yields {{ type: 'delta'|'reasoning'|'tool_start'|'tool_end'|'intent'|'done', content?, stopReason?: 'completed'|'max_rounds', rounds?: number, ... }}
    */
   async *stream(message, opts = {}) {
     yield* this._runWithSessionStream(async function* (_rootCtx) {
@@ -1248,6 +1253,7 @@ export class Agent {
     let toolMap = Object.fromEntries(this.tools.map(t => [t.name, t]))
     let derivedGeneration = -1
 
+    this.lastStopReason = null
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
       this.hooks.onRoundStart?.(round)
@@ -1332,6 +1338,7 @@ export class Agent {
         // finish_reason === 'length' 且无工具调用：文本被截断，直接返回已有内容
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
+          this.lastStopReason = 'completed'
           return textContent
         }
 
@@ -1417,6 +1424,7 @@ export class Agent {
     // 见 todo.md P0-4。
     const maxRoundsMsg = '[max rounds exceeded]'
     this.memory.add({ role: 'assistant', content: maxRoundsMsg })
+    this.lastStopReason = 'max_rounds'
     return maxRoundsMsg
   }
 
@@ -1430,6 +1438,7 @@ export class Agent {
     let toolMap = Object.fromEntries(this.tools.map(t => [t.name, t]))
     let derivedGeneration = -1
 
+    this.lastStopReason = null
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
       this.hooks.onRoundStart?.(round)
@@ -1513,6 +1522,7 @@ export class Agent {
           body,
           signal,
           telemetry,
+          validateCompletion: this.validateStreamCompletion,
         })) {
           if (event.type === 'delta') {
             yield { type: 'delta', content: event.content }
@@ -1532,7 +1542,8 @@ export class Agent {
 
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
-          yield { type: 'done', content: textContent }
+          this.lastStopReason = 'completed'
+          yield { type: 'done', content: textContent, stopReason: 'completed' }
           return
         }
 
@@ -1610,9 +1621,11 @@ export class Agent {
     }
 
     // 超轮：同步写入 memory，保持与 _reactLoop 行为一致。见 todo.md P0-4。
+    // 哨兵字符串保留（老消费方靠它判断）；stopReason 是给新消费方的结构化信号。
     const maxRoundsMsg = '[max rounds exceeded]'
     this.memory.add({ role: 'assistant', content: maxRoundsMsg })
-    yield { type: 'done', content: maxRoundsMsg }
+    this.lastStopReason = 'max_rounds'
+    yield { type: 'done', content: maxRoundsMsg, stopReason: 'max_rounds', rounds: this.maxRounds }
   }
 
   // ---- PlanAndExecute 策略委托 ----
