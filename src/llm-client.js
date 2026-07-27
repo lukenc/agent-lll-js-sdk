@@ -90,6 +90,10 @@ function _buildLlmCallPayload({
  *   - When present, one `llm.call` event is emitted on success/failure, and
  *     `onLlmSpanStart(spanId)` is invoked right before HTTP dispatch so the
  *     caller (Agent) can wire child tool-call spans to this call.
+ * @param {boolean} [opts.validateCompletion=true] - 是否要求流以非空
+ *   finish_reason 收尾（否则抛 LlmStreamIncompleteError）。零 chunk 流恒为
+ *   错误，不受此开关影响。设 false 恢复旧的宽容行为，用于合法不发
+ *   finish_reason 的 provider。
  * @yields {{ type: 'delta'|'reasoning'|'tool_call'|'usage'|'done', ... }}
  *   - { type: 'delta', content: string }
  *   - { type: 'reasoning', content: string }
@@ -97,7 +101,7 @@ function _buildLlmCallPayload({
  *   - { type: 'usage', usage: Usage_Object } — emitted at most once per stream
  *   - { type: 'done', response: object } — 最终重构的非流式等价响应（含 usage）
  */
-export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) {
+export async function* streamChatIter({ url, apiKey, body, signal, telemetry, validateCompletion = true }) {
   const ctx = telemetry?.ctx || null
   // Stopwatch + span id are only meaningful when ctx is present. Keep the
   // zero-telemetry path free of observable side effects.
@@ -117,6 +121,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
     responseModel: null,
   }
   let usageYielded = false
+  let parsedChunkCount = 0
 
   try {
     // 只对初始连接重试，流开始后不重试（已经 yield 了部分数据）
@@ -166,6 +171,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
 
           let json
           try { json = JSON.parse(data) } catch { continue }
+          parsedChunkCount++
 
           // Capture the response model from the first chunk that carries it
           // (some providers include it on every chunk; we only need it once).
@@ -217,6 +223,20 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
       }
     } finally {
       reader.releaseLock()
+    }
+
+    // 语义层完整性校验（对齐 openai-node finalizeChatCompletion / Anthropic
+    // message_stop 检测）：OpenAI 兼容流正常完成时，最后一个内容 chunk 的
+    // finish_reason 必非空。传输层无法区分"干净的提前断开"和正常结束，
+    // 只能在这里判。零 chunk 恒为错误，不受开关控制。
+    if (parsedChunkCount === 0) {
+      throw new LlmStreamIncompleteError({ chunkCount: 0, partialContentLength: 0 })
+    }
+    if (validateCompletion && collected.finishReason == null) {
+      throw new LlmStreamIncompleteError({
+        chunkCount: parsedChunkCount,
+        partialContentLength: collected.content.length,
+      })
     }
 
     // Success path — emit `llm.call` right before the terminal `done` yield
@@ -280,14 +300,15 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
  * @param {object} opts.body - 请求体（含 messages, model, tools 等）
  * @param {AbortSignal} [opts.signal] - 取消信号
  * @param {object} [opts.telemetry] - See `streamChatIter`.
+ * @param {boolean} [opts.validateCompletion=true] - See `streamChatIter`.
  * @param {function} [opts.onDelta] - 文本增量回调 (delta: string) => void
  * @param {function} [opts.onReasoning] - 思考过程增量回调
  * @param {function} [opts.onToolCall] - 工具调用增量回调 (index, toolCall) => void
  * @returns {Promise<object>} 重构后的非流式响应 JSON
  */
-export async function streamChat({ url, apiKey, body, signal, telemetry, onDelta, onReasoning, onToolCall }) {
+export async function streamChat({ url, apiKey, body, signal, telemetry, validateCompletion, onDelta, onReasoning, onToolCall }) {
   let response = null
-  for await (const event of streamChatIter({ url, apiKey, body, signal, telemetry })) {
+  for await (const event of streamChatIter({ url, apiKey, body, signal, telemetry, validateCompletion })) {
     switch (event.type) {
       case 'delta': onDelta?.(event.content); break
       case 'reasoning': onReasoning?.(event.content); break
@@ -445,6 +466,23 @@ export class LlmApiError extends Error {
     super(`LLM API error ${status}: ${body.slice(0, 200)}`)
     this.status = status
     this.body = body
+  }
+}
+
+export class LlmStreamIncompleteError extends Error {
+  constructor({ chunkCount, partialContentLength }) {
+    super(
+      chunkCount === 0
+        ? 'LLM stream ended without sending any chunks'
+        : `LLM stream ended prematurely: no finish_reason received after ${chunkCount} chunk(s), ` +
+          `${partialContentLength} char(s) of partial content. The connection was likely cut by ` +
+          'the server or a proxy — retry the request. If your provider legitimately omits ' +
+          'finish_reason, pass { validateStreamCompletion: false } to the Agent (or ' +
+          'validateCompletion: false to streamChatIter).',
+    )
+    this.name = 'LlmStreamIncompleteError'
+    this.chunkCount = chunkCount
+    this.partialContentLength = partialContentLength
   }
 }
 
