@@ -74,9 +74,20 @@ for await (const event of agent.stream('帮我重构这个函数')) {
     case 'delta':      process.stdout.write(event.content); break
     case 'tool_start': console.log(`\n🔧 ${event.name}(${JSON.stringify(event.arguments)})`); break
     case 'tool_end':   console.log(`✅ ${event.name} → ${event.result}`); break
-    case 'done':       console.log('\n完成'); break
+    case 'done':
+      // done 附带结构化的 stopReason（'completed' | 'max_rounds'）与
+      // rounds（轮次耗尽时），供消费方判断而非解析哨兵字符串。
+      console.log(`\n完成 (stopReason=${event.stopReason}${event.rounds ? `, rounds=${event.rounds}` : ''})`)
+      break
   }
 }
+```
+
+若上游网关在流结束时省略 `finish_reason`（默认会被判定为截断并抛出
+`LlmStreamIncompleteError`），可关闭校验：
+
+```js
+const agent = new Agent({ ..., validateStreamCompletion: false })
 ```
 
 ## 架构
@@ -125,6 +136,7 @@ for await (const event of agent.stream('帮我重构这个函数')) {
 | `memory` | `SlidingWindowMemory(40)` | 自定义记忆实例 |
 | `strategy` | `'react'` | 执行策略: `'react'` 或 `'plan_and_execute'` |
 | `planAndExecuteOpts` | `{}` | PlanAndExecute 策略配置（见下方） |
+| `validateStreamCompletion` | `true` | 校验流式响应以非空 `finish_reason` 收尾；为 `false` 时容忍网关省略 `finish_reason` 的流（不再抛 `LlmStreamIncompleteError`）。`react` 与 `plan_and_execute` 两种策略下均生效 |
 
 ### IntentRecognizer
 
