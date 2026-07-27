@@ -708,6 +708,14 @@ export class Agent {
     const startedAt = Date.now()
     const startedPerfNow = performance.now()
 
+    // Reset here (session entry point) rather than inside `_reactLoop` —
+    // this is the one spot common to all four chat()/stream() ×
+    // react/plan_and_execute paths, so a plan_and_execute run no longer
+    // reports a stale `lastStopReason` left over from a prior ReAct run
+    // (Finding M-5). plan_and_execute itself doesn't set `lastStopReason`,
+    // so it correctly reads back as `null` after such a run.
+    this.lastStopReason = null
+
     const rootCtx = {
       traceId,
       parentSpanId: rootSpanId,
@@ -774,6 +782,9 @@ export class Agent {
     const rootSpanId = newSpanId()
     const startedAt = Date.now()
     const startedPerfNow = performance.now()
+
+    // See `_runWithSession` — same staleness-reset rationale (Finding M-5).
+    this.lastStopReason = null
 
     const rootCtx = {
       traceId,
@@ -1253,7 +1264,8 @@ export class Agent {
     let toolMap = Object.fromEntries(this.tools.map(t => [t.name, t]))
     let derivedGeneration = -1
 
-    this.lastStopReason = null
+    // `lastStopReason` is reset once at the session entry point
+    // (`_runWithSession`), not here — see Finding M-5.
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
       this.hooks.onRoundStart?.(round)
@@ -1438,7 +1450,8 @@ export class Agent {
     let toolMap = Object.fromEntries(this.tools.map(t => [t.name, t]))
     let derivedGeneration = -1
 
-    this.lastStopReason = null
+    // `lastStopReason` is reset once at the session entry point
+    // (`_runWithSessionStream`), not here — see Finding M-5.
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
       this.hooks.onRoundStart?.(round)
@@ -1638,6 +1651,12 @@ export class Agent {
       model: this.model,
       temperature: this.temperature,
       tools: this.tools,
+      // Thread the Agent-level escape hatch through so plan_and_execute's
+      // internal streamChat calls (planner/replan/synthesizer/step ReAct)
+      // honor it too — see Finding I-1: previously only _reactLoopStream
+      // received this, so `validateStreamCompletion: false` was silently
+      // ignored under this strategy.
+      validateStreamCompletion: this.validateStreamCompletion,
       ...this.planAndExecuteOpts,
       ...extraCallbacks,
     })

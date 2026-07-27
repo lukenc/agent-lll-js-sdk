@@ -120,6 +120,28 @@ describe('isRetryableError', () => {
     abort.name = 'AbortError'
     assert.equal(isRetryableError(abort), false)
   })
+
+  // Finding I-2: `err instanceof TypeError` used to retry ANY TypeError,
+  // including deterministic programmer errors thrown inside the retried
+  // closure (e.g. JSON.stringify(BigInt)) — turning an instant failure into
+  // ~7s of pointless backoff. Narrowed to network-shaped TypeErrors: undici
+  // network failures carry a message like 'fetch failed' / 'terminated', or
+  // a `.cause` (the underlying errno/socket error); plain programmer
+  // TypeErrors carry neither.
+  it('plain programmer TypeError (no network signature) is not retryable', () => {
+    const err = new TypeError('Cannot read properties of undefined (reading \'foo\')')
+    assert.equal(isRetryableError(err), false)
+  })
+
+  it('TypeError with a `.cause` (undici network failure shape) is retryable', () => {
+    const err = Object.assign(new TypeError('fetch failed'), { cause: new Error('ECONNRESET') })
+    assert.equal(isRetryableError(err), true)
+  })
+
+  it('TypeError with "terminated" message (no .cause) is retryable', () => {
+    const err = new TypeError('terminated')
+    assert.equal(isRetryableError(err), true)
+  })
 })
 
 describe('computeRetryDelayMs', () => {

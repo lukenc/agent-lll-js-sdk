@@ -482,6 +482,13 @@ export class LlmStreamIncompleteError extends Error {
           'finish_reason, pass { validateStreamCompletion: false } to the Agent (or ' +
           'validateCompletion: false to streamChatIter).',
     )
+    // Finding M-9: `.name` is a cross-package contract — app code
+    // (e.g. edu-desktop-app's agent-handlers.ts) matches on
+    // `err.name === 'LlmStreamIncompleteError'` rather than `instanceof`,
+    // because symlinked/monorepo installs of this package can produce dual
+    // class identities (two copies of this module, so `instanceof` fails
+    // across the package boundary) while `.name` survives. Do not rename
+    // this string without checking downstream consumers.
     this.name = 'LlmStreamIncompleteError'
     this.chunkCount = chunkCount
     this.partialContentLength = partialContentLength
@@ -496,6 +503,13 @@ const RETRY_AFTER_CAP_MS = 60_000
  * 408/409/429/5xx 与网络层错误（undici 的 TypeError: fetch failed）重试；
  * 4xx 其余、Abort、以及流开始后的截断（LlmStreamIncompleteError —
  * 部分数据已交付消费方，重放不安全）不重试。
+ *
+ * TypeError 单独判定时收窄到"网络形状"的 TypeError：undici 在网络层失败
+ * （连接被拒绝/DNS 失败/连接中途终止等）时抛的 TypeError 消息含
+ * 'fetch failed' / 'terminated'，且通常挂有 `.cause`（底层 errno/socket
+ * 错误）。不收窄会把调用方闭包里任意确定性的程序员错误（例如对 BigInt
+ * 调用 JSON.stringify 抛出的 TypeError）也当成"网络抖动"重试三次，把瞬时
+ * 失败拖成 ~7s 的无意义退避。
  */
 export function isRetryableError(err) {
   if (err?.name === 'AbortError') return false
@@ -503,7 +517,10 @@ export function isRetryableError(err) {
   if (err instanceof LlmApiError) {
     return err.status === 408 || err.status === 409 || err.status === 429 || err.status >= 500
   }
-  return err instanceof TypeError // fetch 网络层错误（fetch failed / terminated）
+  return (
+    err instanceof TypeError &&
+    (err.message.includes('fetch failed') || err.message.includes('terminated') || err.cause != null)
+  )
 }
 
 /**
