@@ -175,20 +175,33 @@ new Agent({
 - `agent.refreshSkills()` — triggers `registry.refresh()`.
 - `agent.skills` — direct registry access.
 
+### System prompt injection (Level 1)
+
+After `load()` (and after each `refresh()`), the agent appends a skill listing block to the effective system prompt sent to the LLM. Format matches Claude Code exactly:
+
+```
+The following skills are available for use with the Skill tool:
+
+- aggregate-module-docs
+- skill-creator: Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.
+```
+
+Rules:
+- Skills with no description emit only `- <name>` (no trailing colon).
+- Skills with `disable-model-invocation: true` are omitted from the block.
+- When SkillFilter is active (threshold exceeded), only the filtered Top-K subset is listed for that round.
+- The block is appended after the user-supplied `systemPrompt`; the rest of the prompt is unchanged.
+- Block change (load / refresh / filter result differs) → `_toolsGeneration` incremented → existing round-boundary tool-set re-derivation picks it up automatically.
+
 ### `skill` meta-tool (injected like `ask_user` / `load_mcp_server`)
 
-Injected into `this.tools` when `skills.providers` is configured.
+Injected into `this.tools` when `skills.providers` is configured. Its description is static and minimal:
 
-**description** (dynamic, built after `load()` and after each `refresh()`):
 ```
 Invoke a skill by name to load its full instructions into context.
-Available skills:
-- pdf-processing: Process and extract content from PDF files
-- web-search: Search the web for current information
-...
 ```
 
-Description change → `_toolsGeneration` incremented → existing round-boundary tool-set re-derivation picks it up automatically.
+The listing lives in the system prompt (above), not in the tool description.
 
 **Tool result** (Node):
 ```
