@@ -4,6 +4,7 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { materializeBundle, defaultCacheDir } from './materializer.js'
+import { SkillMaterializeError } from './errors.js'
 
 test('defaultCacheDir points under home/.lll-agent', () => {
   assert.match(defaultCacheDir(), /\.lll-agent[\/\\]skills-cache$/)
@@ -31,5 +32,19 @@ test('materializeBundle overwrites an existing skill dir cleanly', async () => {
     const { baseDir } = await materializeBundle('pdf', { files: [{ path: 'SKILL.md', content: 'new' }] }, { cacheDir })
     await assert.rejects(() => readFile(join(baseDir, 'old.txt'), 'utf8'))
     assert.strictEqual(await readFile(join(baseDir, 'SKILL.md'), 'utf8'), 'new')
+  } finally { await rm(cacheDir, { recursive: true, force: true }) }
+})
+
+test('rejects invalid skill name', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'skills-cache-'))
+  try {
+    await assert.rejects(() => materializeBundle('../evil', { files: [] }, { cacheDir }), /invalid skill name/)
+  } finally { await rm(cacheDir, { recursive: true, force: true }) }
+})
+
+test('rejects path traversal in bundle files', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'skills-cache-'))
+  try {
+    await assert.rejects(() => materializeBundle('pdf', { files: [{ path: '../../x', content: 'c' }] }, { cacheDir }), SkillMaterializeError)
   } finally { await rm(cacheDir, { recursive: true, force: true }) }
 })
