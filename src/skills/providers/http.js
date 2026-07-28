@@ -5,6 +5,7 @@
  * fetchSkill 返回内存包 { files: [{ path, content }] },由注册表在 Node 下物化。
  */
 
+import { NAME_RE } from '../model.js'
 import { _setBuiltinProvider } from '../provider.js'
 import { SkillProviderError } from '../errors.js'
 
@@ -28,14 +29,34 @@ export function createHttpSkillProvider({ baseUrl, headers = {}, fetchImpl } = {
     if (!resp.ok) {
       throw new SkillProviderError(`HTTP ${resp.status} for ${url}`, { providerName: 'http' })
     }
-    return resp.text()
+    let text
+    try {
+      text = await resp.text()
+    } catch (cause) {
+      throw new SkillProviderError(`cannot read response body for ${url}`, { providerName: 'http', cause })
+    }
+    return text
+  }
+
+  function encodePathSegments(relPath) {
+    const rel = String(relPath)
+    if (rel.startsWith('/')) {
+      throw new SkillProviderError('relative path must not start with /', { providerName: 'http' })
+    }
+    const segs = rel.split('/')
+    for (const seg of segs) {
+      if (seg === '' || seg === '..') {
+        throw new SkillProviderError(`invalid path segment: "${seg}"`, { providerName: 'http' })
+      }
+    }
+    return segs.map(encodeURIComponent).join('/')
   }
 
   async function getManifest() {
-    const text = await getText(`${base}/manifest.json`)
+    const bodyText = await getText(`${base}/manifest.json`)
     let obj
     try {
-      obj = JSON.parse(text)
+      obj = JSON.parse(bodyText)
     } catch (cause) {
       throw new SkillProviderError('manifest.json is not valid JSON', { providerName: 'http', cause })
     }
@@ -53,6 +74,9 @@ export function createHttpSkillProvider({ baseUrl, headers = {}, fetchImpl } = {
   }
 
   async function fetchSkill(name) {
+    if (!NAME_RE.test(name)) {
+      throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'http' })
+    }
     const entry = (await getManifest()).find(s => s.name === name)
     if (!entry) {
       throw new SkillProviderError(`skill "${name}" not in manifest`, { providerName: 'http' })
@@ -60,14 +84,21 @@ export function createHttpSkillProvider({ baseUrl, headers = {}, fetchImpl } = {
     const relPaths = Array.isArray(entry.files) ? entry.files : ['SKILL.md']
     const files = []
     for (const rel of relPaths) {
-      const content = await getText(`${base}/skills/${name}/${rel}`)
+      const encodedRel = encodePathSegments(rel)
+      const encodedName = encodeURIComponent(name)
+      const content = await getText(`${base}/skills/${encodedName}/${encodedRel}`)
       files.push({ path: rel, content })
     }
     return { files }
   }
 
   async function readResource(name, relPath) {
-    return getText(`${base}/skills/${name}/${relPath}`)
+    if (!NAME_RE.test(name)) {
+      throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'http' })
+    }
+    const encodedRel = encodePathSegments(relPath)
+    const encodedName = encodeURIComponent(name)
+    return getText(`${base}/skills/${encodedName}/${encodedRel}`)
   }
 
   return { name: 'http', origin: base, listSkills, fetchSkill, readResource }

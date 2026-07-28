@@ -55,3 +55,15 @@ test('trailing slash in baseUrl is normalized', async () => {
   const list = await p.listSkills()
   assert.strictEqual(list[0].name, 'pdf')
 })
+
+test('readResource rejects invalid skill name', async () => {
+  const fetchImpl = mockFetch({ 'https://x/skills/pdf/scripts/run.py': 'print(1)' })
+  const p = createHttpSkillProvider({ baseUrl: 'https://x', fetchImpl })
+  await assert.rejects(() => p.readResource('../evil', 'x'), /invalid|reserved|name/i)
+})
+
+test('readResource rejects path traversal in relPath', async () => {
+  const fetchImpl = mockFetch({ 'https://x/skills/pdf/scripts/run.py': 'print(1)' })
+  const p = createHttpSkillProvider({ baseUrl: 'https://x', fetchImpl })
+  await assert.rejects(() => p.readResource('pdf', '../../etc'), /path/i)
+})
