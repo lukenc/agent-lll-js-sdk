@@ -73,3 +73,10 @@ test('parseSkillMd parses disable-model-invocation true', () => {
   const def = parseSkillMd(text, { dirName: 'pdf', source: {}, files: [], baseDir: null })
   assert.strictEqual(def.disableModelInvocation, true)
 })
+
+test('parseSkillMd preserves commas in description (regression)', () => {
+  const text = '---\nname: pdf\ndescription: Create new skills, modify and improve existing skills\n---\nb'
+  const def = parseSkillMd(text, { dirName: 'pdf', source: {}, files: [], baseDir: null })
+  assert.strictEqual(def.description, 'Create new skills, modify and improve existing skills')
+  assert.strictEqual(typeof def.description, 'string')
+})
