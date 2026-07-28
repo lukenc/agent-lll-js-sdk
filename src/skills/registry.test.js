@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
 import { createSkillRegistry } from './registry.js'
+import { SkillLoadError } from './errors.js'
 
 const SKILL_MD = (name, desc) => `---\nname: ${name}\ndescription: ${desc}\n---\nBody of ${name}`
 
@@ -81,8 +82,8 @@ test('readResource delegates to owning provider and blocks traversal', async () 
   const reg = createSkillRegistry({ providers: [memProvider('p1', { alpha: 'A' })], runtime: 'browser' })
   await reg.load()
   assert.strictEqual(await reg.readResource('alpha', 'references/doc.md'), 'ref')
-  await assert.rejects(() => reg.readResource('alpha', '../escape'))
-  await assert.rejects(() => reg.readResource('nope', 'x'))
+  await assert.rejects(() => reg.readResource('alpha', '../escape'), SkillLoadError)
+  await assert.rejects(() => reg.readResource('nope', 'x'), SkillLoadError)
 })
 
 test('node runtime materializes in-memory bundles to cacheDir', async () => {

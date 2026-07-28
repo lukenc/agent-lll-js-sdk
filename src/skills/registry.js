@@ -6,6 +6,7 @@
 
 import { resolveProvider } from './provider.js'
 import { parseSkillMd } from './model.js'
+import { SkillLoadError } from './errors.js'
 
 function detectRuntime(runtime) {
   if (runtime === 'node' || runtime === 'browser') return runtime
@@ -32,7 +33,7 @@ export function createSkillRegistry({ providers = [], cacheDir, runtime = 'auto'
       // 内存包
       const memFiles = Array.isArray(bundle?.files) ? bundle.files : []
       const skillMd = memFiles.find(f => f.path === 'SKILL.md')
-      if (!skillMd) throw new Error(`bundle for "${name}" has no SKILL.md`)
+      if (!skillMd) throw new SkillLoadError(`bundle for "${name}" has no SKILL.md`, { skillName: name, providerName: provider.name })
       text = typeof skillMd.content === 'string' ? skillMd.content : new TextDecoder().decode(skillMd.content)
       files = memFiles.map(f => f.path)
       if (mode === 'node') {
@@ -108,13 +109,13 @@ export function createSkillRegistry({ providers = [], cacheDir, runtime = 'auto'
 
     async readResource(name, relPath) {
       const entry = entries.get(name)
-      if (!entry) throw new Error(`unknown skill "${name}"`)
+      if (!entry) throw new SkillLoadError(`unknown skill "${name}"`, { skillName: String(name) })
       const rel = String(relPath)
       if (rel.split('/').includes('..') || rel.startsWith('/')) {
-        throw new Error(`invalid resource path "${relPath}"`)
+        throw new SkillLoadError(`invalid resource path "${relPath}"`, { skillName: name })
       }
       if (typeof entry.provider.readResource !== 'function') {
-        throw new Error(`provider "${entry.provider.name}" does not support readResource`)
+        throw new SkillLoadError(`provider "${entry.provider.name}" does not support readResource`, { skillName: name, providerName: entry.provider.name })
       }
       return entry.provider.readResource(name, rel)
     },
