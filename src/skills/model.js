@@ -78,9 +78,9 @@ export function parseFrontmatter(text) {
       frontmatter[key] = ''
       i++
     } else {
-      // 检查是否是 inline 列表(包含逗号)
       const val = parseScalar(rest)
-      if (typeof val === 'string' && val.includes(',')) {
+      // Special-case allowed-tools: parse inline lists (comma-separated)
+      if (key === 'allowed-tools' && typeof val === 'string' && val.includes(',')) {
         frontmatter[key] = parseInlineList(val)
       } else {
         frontmatter[key] = val
