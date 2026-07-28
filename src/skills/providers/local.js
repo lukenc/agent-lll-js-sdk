@@ -3,9 +3,9 @@
  * fetchSkill 返回 { baseDir }(零拷贝,注册表跳过物化)。
  */
 
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join, relative, resolve, sep } from 'node:path'
-import { parseFrontmatter } from '../model.js'
+import { parseFrontmatter, NAME_RE } from '../model.js'
 import { _setBuiltinProvider } from '../provider.js'
 import { SkillProviderError } from '../errors.js'
 
@@ -48,14 +48,19 @@ export function createLocalSkillProvider({ dir }) {
           description: typeof frontmatter.description === 'string' ? frontmatter.description : '',
           version: frontmatter.version ?? null,
         })
-      } catch {
-        // 无 SKILL.md 的目录跳过
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          console.warn('[skills] cannot read', skillMd, err.message)
+        }
       }
     }
     return result
   }
 
   async function fetchSkill(name) {
+    if (!NAME_RE.test(name)) {
+      throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'local' })
+    }
     const baseDir = join(dir, name)
     let files
     try {
@@ -67,6 +72,9 @@ export function createLocalSkillProvider({ dir }) {
   }
 
   async function readResource(name, relPath) {
+    if (!NAME_RE.test(name)) {
+      throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'local' })
+    }
     const baseDir = resolve(dir, name)
     const target = resolve(baseDir, relPath)
     if (target !== baseDir && !target.startsWith(baseDir + sep)) {

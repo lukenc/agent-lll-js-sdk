@@ -53,3 +53,20 @@ test('readResource rejects path traversal', async () => {
     await assert.rejects(() => p.readResource('pdf', '../not-a-skill/x'))
   } finally { await rm(root, { recursive: true, force: true }) }
 })
+
+test('readResource rejects name traversal via ../../etc', async () => {
+  const root = await setup()
+  try {
+    const p = createLocalSkillProvider({ dir: root })
+    await assert.rejects(() => p.readResource('../../etc', 'passwd'))
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('fetchSkill rejects name traversal via ../../secret', async () => {
+  const root = await setup()
+  try {
+    const p = createLocalSkillProvider({ dir: root })
+    await assert.rejects(() => p.fetchSkill('../../secret'))
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
