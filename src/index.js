@@ -43,3 +43,14 @@ export {
   serializeMcpToolForBrowser,
   summarizeMcpOutputSchema,
 } from './mcp/index.js'
+export {
+  createSkillRegistry,
+  registerSkillProvider,
+  createLocalSkillProvider,
+  createHttpSkillProvider,
+  SkillFilter,
+  SkillLoadError,
+  SkillParseError,
+  SkillMaterializeError,
+  SkillProviderError,
+} from './skills/index.js'

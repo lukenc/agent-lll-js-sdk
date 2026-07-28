@@ -3,14 +3,14 @@
  * fetchSkill 返回 { baseDir }(零拷贝,注册表跳过物化)。
  */
 
-import { readdir, readFile } from 'node:fs/promises'
-import { join, relative, resolve, sep } from 'node:path'
 import { parseFrontmatter, NAME_RE } from '../model.js'
 import { _setBuiltinProvider } from '../provider.js'
 import { SkillProviderError } from '../errors.js'
 
 /** 递归列出目录下所有文件的相对路径(POSIX 风格分隔)。 */
 async function listFilesRecursive(baseDir) {
+  const { readdir } = await import('node:fs/promises')
+  const { join, relative, sep } = await import('node:path')
   const out = []
   async function walk(dir) {
     const entries = await readdir(dir, { withFileTypes: true })
@@ -30,6 +30,8 @@ export function createLocalSkillProvider({ dir }) {
   }
 
   async function listSkills() {
+    const { readdir, readFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
     let entries
     try {
       entries = await readdir(dir, { withFileTypes: true })
@@ -61,6 +63,7 @@ export function createLocalSkillProvider({ dir }) {
     if (!NAME_RE.test(name)) {
       throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'local' })
     }
+    const { join } = await import('node:path')
     const baseDir = join(dir, name)
     let files
     try {
@@ -75,6 +78,8 @@ export function createLocalSkillProvider({ dir }) {
     if (!NAME_RE.test(name)) {
       throw new SkillProviderError(`invalid skill name "${name}" (must match ${NAME_RE})`, { providerName: 'local' })
     }
+    const { readFile } = await import('node:fs/promises')
+    const { resolve, sep } = await import('node:path')
     const baseDir = resolve(dir, name)
     const target = resolve(baseDir, relPath)
     if (target !== baseDir && !target.startsWith(baseDir + sep)) {
