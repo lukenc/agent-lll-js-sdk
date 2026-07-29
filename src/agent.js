@@ -681,6 +681,26 @@ export class Agent {
     }
   }
 
+  /**
+   * Internal helper for fire-and-forget application hooks (`onRoundStart` /
+   * `afterToolCall` / `onError`). Wraps the call in `try`/`catch` so a hook
+   * that throws synchronously cannot break the ReAct loop, and attaches a
+   * no-op rejection handler when the hook returns a promise so an async
+   * hook cannot surface as an unhandled rejection either. `beforeToolCall`
+   * is NOT routed through here — it is awaited inside the per-tool
+   * try/catch, where its failure is already contained.
+   * @param {string} name - hook name on `this.hooks`
+   * @param {...*} args
+   */
+  _safeHook(name, ...args) {
+    try {
+      const ret = this.hooks[name]?.(...args)
+      if (ret && typeof ret.catch === 'function') ret.catch(() => {})
+    } catch (err) {
+      console.warn(`[agent] hook "${name}" threw:`, err?.message || err)
+    }
+  }
+
   // ---- Session lifecycle wrapper ----
 
   /**
@@ -1268,7 +1288,7 @@ export class Agent {
     // (`_runWithSession`), not here — see Finding M-5.
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
-      this.hooks.onRoundStart?.(round)
+      this._safeHook('onRoundStart', round)
 
       // Round lifecycle: emit round.start / round.end around the iteration
       // body. The per-round span becomes the parentSpanId for any llm.call
@@ -1399,11 +1419,14 @@ export class Agent {
               errorKind = (err?.name === 'AbortError' || signal?.aborted)
                 ? 'aborted'
                 : 'exception'
-              result = `Error executing ${call.name}: ${err.message}`
-              this.hooks.onError?.(err, { round, toolName: call.name })
+              // `err?.message ?? String(err)`：工具可能 `throw null` / 抛
+              // 原始值，裸访问 .message 会让 catch 块自身抛 TypeError，
+              // 反而终止整个 run。对正常 Error 输出逐字节不变（Req 9.3）。
+              result = `Error executing ${call.name}: ${err?.message ?? String(err)}`
+              this._safeHook('onError', err, { round, toolName: call.name })
             }
           }
-          this.hooks.afterToolCall?.(call.name, call.arguments, result)
+          this._safeHook('afterToolCall', call.name, call.arguments, result)
           this.memory.add(formatToolResult(call.id, call.name, result))
 
           // Emit tool.call after the exact-same memory string is appended
@@ -1454,7 +1477,7 @@ export class Agent {
     // (`_runWithSessionStream`), not here — see Finding M-5.
     for (let round = 0; round < this.maxRounds; round++) {
       signal?.throwIfAborted()
-      this.hooks.onRoundStart?.(round)
+      this._safeHook('onRoundStart', round)
 
       // Round lifecycle — see `_reactLoop` for the rationale behind the
       // try/finally around the iteration body. The streaming version
@@ -1603,12 +1626,13 @@ export class Agent {
               errorKind = (err?.name === 'AbortError' || signal?.aborted)
                 ? 'aborted'
                 : 'exception'
-              result = `Error: ${err.message}`
-              this.hooks.onError?.(err, { round, toolName: call.name })
+              // 同 `_reactLoop`：防 `throw null` 打穿 catch 块。
+              result = `Error: ${err?.message ?? String(err)}`
+              this._safeHook('onError', err, { round, toolName: call.name })
             }
           }
 
-          this.hooks.afterToolCall?.(call.name, call.arguments, result)
+          this._safeHook('afterToolCall', call.name, call.arguments, result)
           this.memory.add(formatToolResult(call.id, call.name, result))
 
           const ok = errorKind === undefined
