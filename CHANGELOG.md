@@ -2,6 +2,17 @@
 
 本文件记录 `lll-web-agent` 的显著变更。格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 0.9.0（未发布）
+
+### 新增
+
+- **Skill 系统**（`src/skills/`）：兼容 Claude Code 格式的 skill 包（`SKILL.md` +
+  `scripts/` / `references/` 等捆绑文件），可从本地目录或 HTTP manifest 加载。
+  Level 1 清单自动注入 system prompt，内置 `skill` 元工具按需注入正文（Level 2），
+  浏览器运行时新增 `skill_resource` 工具读取捆绑资源（Level 3），并提供基于 LLM
+  的 Top-K `SkillFilter`（fail-open）应对超阈值的大规模 skill 集合。零新增
+  runtime 依赖。
+
 ## 0.8.0
 
 ### 新增
