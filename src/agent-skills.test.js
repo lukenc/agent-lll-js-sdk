@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
 import { Agent } from './agent.js'
+import { isBaseTool } from './tool-filter.js'
 
 const SKILL_MD = (name, desc) => `---\nname: ${name}\ndescription: ${desc}\n---\nInstructions for ${name}`
 
@@ -124,4 +125,48 @@ test('refreshSkills bumps _toolsGeneration', async () => {
   const gen = agent._toolsGeneration
   await agent.refreshSkills()
   assert.ok(agent._toolsGeneration > gen)
+})
+
+test('loadSkills heals memoized rejection: first call rejects, second call succeeds and loads skills', async () => {
+  // registry.load() itself isolates provider-level failures (warn + skip), so it
+  // never rejects from a bad provider. The memo-healing guarantee in loadSkills()
+  // covers unexpected failures from the registry's load() itself (e.g. a future
+  // registry bug, or any thrown error that escapes provider isolation). Simulate
+  // that directly by stubbing skills.load() to fail once then succeed.
+  const agent = makeAgent({ providers: [memProvider({ a: 'A' })], runtime: 'browser' })
+  const realLoad = agent.skills.load.bind(agent.skills)
+  let attempt = 0
+  agent.skills.load = async () => {
+    attempt++
+    if (attempt === 1) throw new Error('registry blew up')
+    return realLoad()
+  }
+  await assert.rejects(() => agent.loadSkills(), /registry blew up/)
+  await agent.loadSkills()
+  assert.ok(agent.skills.get('a'))
+})
+
+test('refreshSkills sets the load memo so a pre-chat refresh is not followed by a redundant load', async () => {
+  let listCalls = 0
+  const p = {
+    name: 'mem', origin: 'x',
+    async listSkills() { listCalls++; return [{ name: 'a', description: 'A' }] },
+    async fetchSkill() { return { files: [{ path: 'SKILL.md', content: SKILL_MD('a', 'A') }] } },
+  }
+  const agent = makeAgent({ providers: [p], runtime: 'browser' })
+  await agent.refreshSkills()
+  assert.strictEqual(listCalls, 1)
+  await agent.loadSkills()
+  assert.strictEqual(listCalls, 1) // loadSkills reuses the promise refreshSkills already set
+})
+
+test('skill and skill_resource tools are registered as base tools (immune to ToolFilter)', () => {
+  const browser = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'browser' })
+  assert.ok(browser.tools.find(t => t.name === 'skill'))
+  assert.strictEqual(isBaseTool('skill'), true)
+  assert.strictEqual(isBaseTool('skill_resource'), true)
+
+  const node = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'node' })
+  assert.ok(node.tools.find(t => t.name === 'skill'))
+  assert.strictEqual(isBaseTool('skill'), true)
 })

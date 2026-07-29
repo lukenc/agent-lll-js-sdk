@@ -62,6 +62,10 @@ export function createSkillRegistry({ providers = [], cacheDir, runtime = 'auto'
         console.warn(`[skills] provider "${provider.name}" listSkills failed, skipping:`, e.message)
         continue
       }
+      if (!Array.isArray(listed)) {
+        console.warn(`[skills] provider "${provider.name}" listSkills returned non-array, skipping`)
+        continue
+      }
       for (const item of listed) {
         const name = item?.name
         if (typeof name !== 'string' || name.length === 0) continue
