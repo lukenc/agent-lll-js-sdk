@@ -434,6 +434,10 @@ export class Agent {
           execute: async ({ name }) => this._invokeSkill(name),
         },
       ]
+      // Skill 是元工具(与 ask_user 同一先例,亦在 INITIAL_BASE_TOOLS 中):
+      // 注册为 base tool,防止 ToolFilter 在 enableIntentRecognition 下将其过滤掉,
+      // 同时 system prompt 的 skill 清单说明才始终对得上模型可用的工具。
+      registerBaseTool('skill')
 
       // 浏览器运行时:注入 skill_resource 工具(Level 3 资源读取)。
       if (this._skillsRuntime === 'browser') {
@@ -459,6 +463,7 @@ export class Agent {
             },
           },
         ]
+        registerBaseTool('skill_resource')
       }
     }
   }
@@ -1923,17 +1928,32 @@ export class Agent {
     return out
   }
 
-  /** 首次调用触发急切全量加载;后续复用同一 promise。 */
+  /**
+   * 首次调用触发急切全量加载;后续复用同一 promise。
+   * 若该 promise 被拒绝,清空 memo,使下一次调用重试(而非永久性地卡在失败态)。
+   */
   async loadSkills() {
     if (!this.skills) return
-    this._skillsLoadPromise ??= this.skills.load()
+    this._skillsLoadPromise ??= this.skills.load().catch((e) => {
+      this._skillsLoadPromise = null
+      throw e
+    })
     return this._skillsLoadPromise
   }
 
-  /** 重新全量加载 skill(按 hash 跳过未变更项),并促使下一轮重建清单。 */
+  /**
+   * 重新全量加载 skill(按 hash 跳过未变更项),并促使下一轮重建清单。
+   * 将 refresh 的 promise 写入 `_skillsLoadPromise`,使其同时充当 loadSkills 的
+   * memo——成功的 refresh 会“治愈”此前失败的 load,首次 chat 前的 refresh 也不会
+   * 再触发一次多余的全量 load。
+   */
   async refreshSkills() {
     if (!this.skills) return
-    await this.skills.refresh()
+    this._skillsLoadPromise = this.skills.refresh().catch((e) => {
+      this._skillsLoadPromise = null
+      throw e
+    })
+    await this._skillsLoadPromise
     this._toolsGeneration++
   }
 

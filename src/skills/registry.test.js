@@ -67,6 +67,14 @@ test('provider listSkills failure skips that provider only', async () => {
   assert.ok(reg.get('ok'))
 })
 
+test('provider listSkills returning non-array is skipped, other providers still load', async () => {
+  const malformed = { name: 'malformed', origin: 'x', async listSkills() { return { skills: [{ name: 'ghost', description: 'G' }] } }, async fetchSkill() {} }
+  const reg = createSkillRegistry({ providers: [malformed, memProvider('p1', { ok: 'O' })], runtime: 'browser' })
+  await reg.load()
+  assert.ok(reg.get('ok'))
+  assert.strictEqual(reg.get('ghost'), null)
+})
+
 test('refresh skips unchanged hashes, refetches changed', async () => {
   const p = memProvider('p1', { alpha: 'A' }, { hash: 'h1' })
   const reg = createSkillRegistry({ providers: [p], runtime: 'browser' })
