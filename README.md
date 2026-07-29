@@ -759,6 +759,87 @@ Browser Agent 继续 ReAct 循环
 想在自己的 Web 应用里复用：把 `demo/server.js` 里 `/mcp-tools` + `/mcp-call` 两段代码
 （约 40 行）抄过去即可；前端包装逻辑见 `demo/browser.html` 里的 `loadMcpTools()`。
 
+## Skill 系统
+
+一个 skill 是一个目录：`SKILL.md`（YAML frontmatter + Markdown 正文）加上可选的
+`scripts/` / `references/` 等捆绑文件，目录结构与 [Claude Code 的 skill 格式](https://docs.claude.com/en/docs/claude-code/skills)
+兼容，可直接复用已有的 Claude Code skill 包。
+
+```js
+import { Agent } from 'lll-web-agent'
+
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  model: 'gpt-4',
+  skills: {
+    providers: [
+      { type: 'local', dir: './skills' },              // 本地目录，每个子目录一个 skill
+      { type: 'http', baseUrl: 'https://example.com/skills' }, // 远程 manifest（见下）
+    ],
+    filter: { threshold: 50, topK: 20 },  // 可选，均为默认值
+  },
+})
+
+await agent.chat('帮我审查这个 PR')
+```
+
+`skills.providers` 为空或未配置时，Skill 系统完全不启用（零开销）。多个 provider 同时
+配置时按数组顺序聚合，重名 skill first-wins（后面的 provider 会被 warn 并跳过）。
+
+### 三级渐进披露（Progressive Disclosure）
+
+与 Claude Code 一致，skill 内容按需分三级注入上下文，避免一次性把所有 skill 正文塞进
+system prompt：
+
+| 级别 | 内容 | 注入方式 |
+|------|------|---------|
+| Level 1 | 清单：`name` + `description` | 每轮自动合并进 system 消息（`_withSkillListingNote`） |
+| Level 2 | `SKILL.md` 正文 | 模型调用内置 `skill` 元工具按需加载 |
+| Level 3 | 捆绑资源（`scripts/` / `references/` 等文件） | Node 下用现有 `read_file` / `shell_exec` 读取 `baseDir`；浏览器下用专用 `skill_resource` 工具 |
+
+`disable-model-invocation: true` 的 skill 不出现在 Level 1 清单里，但仍可通过
+`agent.skills.get(name)` 访问。
+
+Skill 数量超过 `filter.threshold`（默认 50）时，才会触发一次 sidecar LLM 调用
+（`SkillFilter`，复用 `simpleModel` 配置）按用户消息做 Top-K 相关性排序；该调用在
+`_runPipeline` 里每条用户消息只跑一次（同一轮对话的多个 ReAct round 复用结果），
+失败时 fail-open —— 直接返回全量 skill 列表，与 `IntentRecognizer` 的失败策略一致。
+
+**已知限制**：Level 1 清单注入目前只在 ReAct 策略下生效；`strategy: 'plan_and_execute'`
+下 `PlanAndExecuteStrategy` 会为每个 step 构建独立的 system prompt，不会收到 skill 清单
+（`skill` 工具仍可调用，只是模型看不到清单）。
+
+### Node vs 浏览器运行时
+
+`skills.runtime` 默认 `'auto'`（根据是否存在 `process.versions.node` 判断）。Node
+运行时下，远程（HTTP provider）skill 会物化到本地磁盘缓存（默认
+`~/.lll-agent/skills-cache/<name>/`，可用 `skills.cacheDir` 覆盖），随后与本地
+provider 一样通过 `read_file` / `shell_exec` 访问 Level 3 资源。浏览器运行时不做任何
+磁盘物化，改为注入 `skill_resource` 工具，参数为 `{ skill, path }`。
+
+### HTTP provider 协议（自建 skill server）
+
+```
+GET {baseUrl}/manifest.json
+→ { "skills": [{ "name": "pdf-fill", "description": "...", "version": "1.0.0", "hash": "...", "files": ["SKILL.md", "scripts/fill.py"] }] }
+
+GET {baseUrl}/skills/{name}/{relPath}
+→ 文件原始内容
+```
+
+`hash` 字段可选，用于 `agent.refreshSkills()` 增量刷新（未变化的 skill 直接复用缓存的
+`Skill_Def`，跳过重新拉取 + 解析）。
+
+### 安全
+
+- HTTP provider 对 `name` 做 `^[a-z0-9-]{1,64}$` 校验，并对拼接进 URL 的每个路径分段做
+  编码 / 拒绝（空分段、`..` 一律拒绝），防止路径穿越。
+- `SkillRegistry.readResource` / 本地 provider 同样拒绝包含 `..` 的资源路径。
+- 网络来源（HTTP provider）的 skill 脚本最终通过宿主提供的 `shell_exec` 工具执行 ——
+  v1 没有沙箱。接入不受信任的 skill server 时，请通过工具授权 + `hooks.beforeToolCall`
+  自行把关。
+
 ## License
 
 MIT

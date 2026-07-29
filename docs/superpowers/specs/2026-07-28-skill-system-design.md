@@ -238,7 +238,7 @@ Only when `registry.skills.length > filter.threshold` (default 50). Below thresh
 
 ### Sidecar LLM call
 
-Uses `simpleModel` config (falls back to main model if not configured). Called at the start of each ReAct round, before building the `skill` tool description for that round.
+Uses `simpleModel` config (falls back to main model if not configured). Runs once per user message in `_runPipeline` (the user message doesn't change between rounds), with the result cached and reused for all ReAct rounds of that turn.
 
 ```
 System: You are a skill selector. Given a user message and a list of skills,
@@ -311,7 +311,7 @@ src/skills/
 - `loadSkills()` / `refreshSkills()` public methods
 - `skill` meta-tool injection
 - `skill_resource` tool injection (browser)
-- SkillFilter call at ReAct round start (when threshold exceeded)
+- SkillFilter call once per user message in `_runPipeline` (when threshold exceeded), cached for all ReAct rounds of that turn
 
 Zero new runtime dependencies.
 

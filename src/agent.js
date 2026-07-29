@@ -37,6 +37,8 @@ import { PlanAndExecuteStrategy } from './plan-and-execute.js'
 import { TelemetryBus, newTraceId, newSpanId, utf8ByteLength, childContext } from './telemetry.js'
 import { createMCPClient } from './mcp/index.js'
 import { formatMcpToolSummary } from './mcp/metadata.js'
+import { createSkillRegistry } from './skills/registry.js'
+import { SkillFilter } from './skills/filter.js'
 
 /**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
@@ -190,6 +192,13 @@ export class Agent {
    * @param {(error: Error, context: object) => void} [opts.hooks.onError] - 错误回调
    * @param {(question: string) => Promise<string>} [opts.hooks.onAskUser] - 用户交互回调（提供后自动注入 ask_user 工具）
    * @param {boolean} [opts.validateStreamCompletion=true] - 校验流完整性（finish_reason 缺失时抛 LlmStreamIncompleteError）
+   * @param {object} [opts.skills] - Skill 系统配置。提供后创建 SkillRegistry 并注入 `skill` 元工具
+   * @param {import('./skills/provider.js').SkillProvider[]} opts.skills.providers - skill 来源列表（本地目录 / HTTP 等）
+   * @param {'node'|'browser'|'auto'} [opts.skills.runtime='auto'] - 运行时环境；决定是否注入 `skill_resource` 工具（浏览器）
+   * @param {string} [opts.skills.cacheDir] - 远程 skill 本地缓存目录
+   * @param {object} [opts.skills.filter] - sidecar 过滤配置
+   * @param {number} [opts.skills.filter.threshold=50] - skill 数量超过该阈值才触发过滤
+   * @param {number} [opts.skills.filter.topK=20] - 过滤后保留的 skill 数量上限
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -377,6 +386,86 @@ export class Agent {
         },
       ]
     }
+
+    // ---- Skill 系统 ----
+    // `opts.skills` 配置后创建 SkillRegistry(急切全量加载,首次 chat/stream 前
+    // 自动 loadSkills)。Level 1 清单每轮合并进 system 消息(_withSkillListingNote),
+    // Level 2 正文经 `skill` 元工具注入,Level 3 资源经 read_file/shell_exec(Node)
+    // 或 skill_resource(浏览器)访问。
+    this.skills = null
+    this._skillsLoadPromise = null
+    this._filteredSkills = null
+    this._skillFilterOpts = { threshold: 50, topK: 20 }
+    this._skillsRuntime = 'node'
+    if (opts.skills && Array.isArray(opts.skills.providers) && opts.skills.providers.length > 0) {
+      const runtime = opts.skills.runtime ?? 'auto'
+      this._skillsRuntime = runtime === 'auto'
+        ? ((typeof process !== 'undefined' && process.versions?.node) ? 'node' : 'browser')
+        : runtime
+      this.skills = createSkillRegistry({
+        providers: opts.skills.providers,
+        cacheDir: opts.skills.cacheDir,
+        runtime: this._skillsRuntime,
+      })
+      this._skillFilterOpts = {
+        threshold: opts.skills.filter?.threshold ?? 50,
+        topK: opts.skills.filter?.topK ?? 20,
+      }
+      this._skillFilter = new SkillFilter({
+        url: this.simpleUrl,
+        apiKey: this.simpleApiKey,
+        model: this.simpleModel,
+      })
+
+      // `skill` 元工具(与 ask_user / load_mcp_server 同一注入手法)。
+      // description 保持静态最小;清单在 system prompt 里(Claude Code 形态)。
+      this.tools = [
+        ...this.tools,
+        {
+          name: 'skill',
+          description: 'Invoke a skill by name to load its full instructions into context. Available skills are listed in the system prompt.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'The skill name, exactly as listed in the system prompt' },
+            },
+            required: ['name'],
+          },
+          execute: async ({ name }) => this._invokeSkill(name),
+        },
+      ]
+      // Skill 是元工具(与 ask_user 同一先例,亦在 INITIAL_BASE_TOOLS 中):
+      // 注册为 base tool,防止 ToolFilter 在 enableIntentRecognition 下将其过滤掉,
+      // 同时 system prompt 的 skill 清单说明才始终对得上模型可用的工具。
+      registerBaseTool('skill')
+
+      // 浏览器运行时:注入 skill_resource 工具(Level 3 资源读取)。
+      if (this._skillsRuntime === 'browser') {
+        this.tools = [
+          ...this.tools,
+          {
+            name: 'skill_resource',
+            description: 'Read a bundled file from a previously invoked skill (browser runtime).',
+            parameters: {
+              type: 'object',
+              properties: {
+                skill: { type: 'string', description: 'The skill name' },
+                path: { type: 'string', description: 'Relative path of the bundled file, e.g. references/api.md' },
+              },
+              required: ['skill', 'path'],
+            },
+            execute: async ({ skill, path }) => {
+              try {
+                return String(await this.skills.readResource(skill, path))
+              } catch (e) {
+                return `Error reading skill resource: ${e.message}`
+              }
+            },
+          },
+        ]
+        registerBaseTool('skill_resource')
+      }
+    }
   }
 
   /**
@@ -387,6 +476,8 @@ export class Agent {
    * @returns {Promise<string>}
    */
   async chat(message, opts = {}) {
+    this._filteredSkills = null
+    await this.loadSkills()
     return this._runWithSession(async (_rootCtx) => {
       if (this.strategy === 'plan_and_execute') {
         return this._planAndExecuteChat(message, opts)
@@ -404,6 +495,8 @@ export class Agent {
    * @yields {{ type: 'delta'|'reasoning'|'tool_start'|'tool_end'|'intent'|'done', content?, stopReason?: 'completed'|'max_rounds', rounds?: number, ... }}
    */
   async *stream(message, opts = {}) {
+    this._filteredSkills = null
+    await this.loadSkills()
     yield* this._runWithSessionStream(async function* (_rootCtx) {
       if (this.strategy === 'plan_and_execute') {
         yield* this._planAndExecuteStream(message, opts)
@@ -929,6 +1022,18 @@ export class Agent {
       })
     }
 
+    // 1.5 Skill 过滤(超阈值才触发 sidecar;fail-open)
+    if (this.skills) {
+      const allSkills = this.skills.list().filter(s => !s.disableModelInvocation)
+      if (allSkills.length > this._skillFilterOpts.threshold) {
+        this._filteredSkills = await this._skillFilter.filter(userMessage, allSkills, {
+          topK: this._skillFilterOpts.topK,
+          signal,
+          telemetry: this._currentRun?.rootCtx ?? null,
+        })
+      }
+    }
+
     // 2. 工具过滤
     const filteredTools = this.toolFilter.filter(intent, this.tools)
 
@@ -947,7 +1052,7 @@ export class Agent {
       return {
         body: {
           model: this.model,
-          messages: this._withUnavailableToolsNote(assembled.messages),
+          messages: this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages)),
           temperature: this.temperature,
           ...(assembled.tools ? { tools: assembled.tools } : {}),
         },
@@ -957,7 +1062,7 @@ export class Agent {
     }
 
     // 简单模式：直接使用 memory 中的消息
-    const messages = this._withUnavailableToolsNote(await this._getMessages())
+    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
 
     const openaiTools = filteredTools.length > 0 ? formatToolsForOpenAI(filteredTools) : undefined
     return {
@@ -1847,8 +1952,89 @@ export class Agent {
     return out
   }
 
+  /**
+   * 首次调用触发急切全量加载;后续复用同一 promise。
+   * 若该 promise 被拒绝,清空 memo,使下一次调用重试(而非永久性地卡在失败态)。
+   */
+  async loadSkills() {
+    if (!this.skills) return
+    this._skillsLoadPromise ??= this.skills.load().catch((e) => {
+      this._skillsLoadPromise = null
+      throw e
+    })
+    return this._skillsLoadPromise
+  }
+
+  /**
+   * 重新全量加载 skill(按 hash 跳过未变更项),并促使下一轮重建清单。
+   * 将 refresh 的 promise 写入 `_skillsLoadPromise`,使其同时充当 loadSkills 的
+   * memo——成功的 refresh 会“治愈”此前失败的 load,首次 chat 前的 refresh 也不会
+   * 再触发一次多余的全量 load。
+   */
+  async refreshSkills() {
+    if (!this.skills) return
+    this._skillsLoadPromise = this.skills.refresh().catch((e) => {
+      this._skillsLoadPromise = null
+      throw e
+    })
+    await this._skillsLoadPromise
+    this._toolsGeneration++
+  }
+
+  /** 当前轮参与清单的 skill 子集:过滤结果(若有)∩ 非 disable-model-invocation。 */
+  _activeSkills() {
+    if (!this.skills) return []
+    const all = (this._filteredSkills ?? this.skills.list())
+    return all.filter(s => !s.disableModelInvocation)
+  }
+
+  /**
+   * 把 Level 1 skill 清单块合并进本轮 system 消息(不持久化,与
+   * _withUnavailableToolsNote 同款每轮重算)。格式对齐 Claude Code:
+   *   The following skills are available for use with the Skill tool:
+   *   - name
+   *   - name: description
+   */
+  _withSkillListingNote(messages) {
+    const active = this._activeSkills()
+    if (active.length === 0) return messages
+    const lines = active.map(s => s.description ? `- ${s.name}: ${s.description}` : `- ${s.name}`)
+    const block = `The following skills are available for use with the Skill tool:\n\n${lines.join('\n')}`
+    const out = messages.slice()
+    const sysIdx = out.findIndex((m) => m && m.role === 'system')
+    if (sysIdx === -1) {
+      out.unshift({ role: 'system', content: block })
+    } else {
+      const sys = out[sysIdx]
+      const base = typeof sys.content === 'string' ? sys.content : ''
+      out[sysIdx] = { ...sys, content: base ? `${base}\n\n${block}` : block }
+    }
+    return out
+  }
+
+  /** `skill` 元工具的 execute:返回正文 + Level 3 资源访问说明;未知名软失败。 */
+  _invokeSkill(name) {
+    const def = this.skills?.get(name)
+    if (!def || def.disableModelInvocation) {
+      const valid = this._activeSkills().map(s => s.name).join(', ') || '(none)'
+      return `Error: unknown skill "${name}". Valid skills: ${valid}`
+    }
+    let out = def.body
+    const fileList = def.files.filter(f => f !== 'SKILL.md')
+    out += '\n---\n'
+    if (def.baseDir) {
+      out += `Skill base directory: ${def.baseDir}\n`
+      if (fileList.length > 0) out += `Bundled files: ${fileList.join(', ')}\n`
+      out += 'Access files with read_file / shell_exec using paths under the base directory.'
+    } else {
+      if (fileList.length > 0) out += `Bundled files: ${fileList.join(', ')}\n`
+      out += 'Use the skill_resource tool to read bundled files.'
+    }
+    return out
+  }
+
   async _buildSimpleBody(tools = this.tools) {
-    const messages = this._withUnavailableToolsNote(await this._getMessages())
+    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
     const openaiTools = tools.length > 0 ? formatToolsForOpenAI(tools) : undefined
     return {
       body: {
