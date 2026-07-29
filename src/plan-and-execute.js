@@ -153,12 +153,13 @@ export class PlanAndExecuteStrategy {
     this.useStreaming = opts.useStreaming ?? false
     this.validateStreamCompletion = opts.validateStreamCompletion ?? true
 
-    // 回调
-    this.onPhase = opts.onPhase ?? (() => {})
-    this.onPlanGenerated = opts.onPlanGenerated ?? (() => {})
-    this.onStepStart = opts.onStepStart ?? (() => {})
-    this.onStepComplete = opts.onStepComplete ?? (() => {})
-    this.onPlanRevised = opts.onPlanRevised ?? (() => {})
+    // 回调 —— 统一经 safeCallback 包裹：应用侧回调抛异常（或异步 reject）
+    // 不得打断 plan/step 主流程（与 Agent._safeHook 同一约定）。
+    this.onPhase = safeCallback(opts.onPhase ?? (() => {}), 'onPhase')
+    this.onPlanGenerated = safeCallback(opts.onPlanGenerated ?? (() => {}), 'onPlanGenerated')
+    this.onStepStart = safeCallback(opts.onStepStart ?? (() => {}), 'onStepStart')
+    this.onStepComplete = safeCallback(opts.onStepComplete ?? (() => {}), 'onStepComplete')
+    this.onPlanRevised = safeCallback(opts.onPlanRevised ?? (() => {}), 'onPlanRevised')
   }
 
   /**
@@ -232,7 +233,7 @@ export class PlanAndExecuteStrategy {
         this.onStepComplete(step.index, true, stepResult, step)
       } catch (err) {
         const duration = Date.now() - stepStart
-        const errorMsg = err.message || 'Step execution failed'
+        const errorMsg = (err?.message ?? String(err)) || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
         this.onStepComplete(step.index, false, errorMsg, step)
@@ -329,7 +330,7 @@ export class PlanAndExecuteStrategy {
         }
       } catch (err) {
         const duration = Date.now() - stepStart
-        const errorMsg = err.message || 'Step execution failed'
+        const errorMsg = (err?.message ?? String(err)) || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
         yield {
@@ -545,7 +546,8 @@ export class PlanAndExecuteStrategy {
             errorKind = (err?.name === 'AbortError' || signal?.aborted)
               ? 'aborted'
               : 'exception'
-            result = `Error executing ${call.name}: ${err.message}`
+            // 防 `throw null` / 原始值打穿 catch 块（与 agent.js 同一约定）。
+            result = `Error executing ${call.name}: ${err?.message ?? String(err)}`
           }
         }
         messages.push(formatToolResult(call.id, call.name, result))
@@ -673,6 +675,25 @@ export class PlanAndExecuteStrategy {
 }
 
 // ==================== Utility Functions ====================
+
+/**
+ * 把应用侧回调包一层保护：同步 throw 被吞（console.warn），返回 Promise
+ * 时挂一个 no-op rejection handler，避免异步回调以 unhandled rejection
+ * 的形式炸掉进程。函数声明（可提升）—— 构造函数在模块顶部即可引用。
+ * @param {Function} fn
+ * @param {string} name - 仅用于 warn 日志
+ * @returns {Function}
+ */
+function safeCallback(fn, name) {
+  return (...args) => {
+    try {
+      const ret = fn(...args)
+      if (ret && typeof ret.catch === 'function') ret.catch(() => {})
+    } catch (err) {
+      console.warn(`[plan-and-execute] callback "${name}" threw:`, err?.message || err)
+    }
+  }
+}
 
 /**
  * High-resolution monotonic clock helper. `performance.now()` exists in
