@@ -39,6 +39,8 @@ import { createMCPClient } from './mcp/index.js'
 import { formatMcpToolSummary } from './mcp/metadata.js'
 import { createSkillRegistry } from './skills/registry.js'
 import { SkillFilter } from './skills/filter.js'
+import { createSubagentRuntime } from './agents/runtime.js'
+import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
 
 /**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
@@ -199,6 +201,15 @@ export class Agent {
    * @param {object} [opts.skills.filter] - sidecar 过滤配置
    * @param {number} [opts.skills.filter.threshold=50] - skill 数量超过该阈值才触发过滤
    * @param {number} [opts.skills.filter.topK=20] - 过滤后保留的 skill 数量上限
+   * @param {object} [opts.subagents] - Subagent 系统配置。提供后创建 SubagentRuntime 并注入 7 个元工具
+   * @param {object[]} [opts.subagents.types] - 额外注册的 Agent_Type（内置 general-purpose 始终可用）
+   * @param {string} [opts.subagents.defaultType='general-purpose'] - 未指定 subagent_type 时用的类型
+   * @param {number} [opts.subagents.maxConcurrent=4] - 每个 depth 层的并发上限
+   * @param {number} [opts.subagents.maxDepth=2] - 允许的最大派生深度
+   * @param {Record<string, { model?: string, apiKey?: string, url?: string }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）
+   * @param {object} [opts.subagents.retry] - 重试配置（maxAttempts 默认 3，attemptTimeoutMs 默认 600000）
+   * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
+   * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -208,6 +219,8 @@ export class Agent {
     this.model = opts.model ?? 'gpt-4'
     this.systemPrompt = opts.systemPrompt ?? 'You are a helpful assistant.'
     this.url = resolveProviderUrl(opts.provider, opts.url)
+    /** 记住 provider 名 —— SubagentRunner 构造子 Agent 时要原样传下去。 */
+    this._providerName = opts.provider
     this.tools = opts.tools ?? []
     this.maxRounds = opts.maxRounds ?? 300
     this.temperature = opts.temperature ?? 0.6
@@ -466,6 +479,20 @@ export class Agent {
         registerBaseTool('skill_resource')
       }
     }
+
+    // ---- Subagent 系统 ----
+    // `opts.subagents` 配置后创建 SubagentRuntime 并注入元工具。未配置时
+    // `this.subagents` 恒为 null，全部相关行为与旧版本逐字节一致。
+    this.subagents = null
+    /** 合并进 `tool.execute(args, ctx)` 第二参的归属字段。 */
+    this._toolContextExtra = { agentId: 'main', agentName: 'main', depth: 0, cwd: null }
+    if (opts.subagents) {
+      this.subagents = createSubagentRuntime({ parent: this, ...opts.subagents })
+      this.tools = [...this.tools, ...this.subagents.tools]
+      // 与 `skill` 同一理由：开启意图识别后 ToolFilter 会裁剪工具集，元工具被
+      // 裁掉时 system prompt 里的类型清单就指向了模型调不到的工具。
+      for (const name of SUBAGENT_TOOL_NAMES) registerBaseTool(name)
+    }
   }
 
   /**
@@ -523,6 +550,18 @@ export class Agent {
         })
     }
     this._lastIntent = null
+    // Subagent 生命周期拆除：与上面的 MCP 拆除同一手法 —— `reset()` 必须保持
+    // 同步返回 undefined，所以只触发取消而不 await。`closeSubagents()` 内部先
+    // abort 各自的 AbortController 再 drain，因此在跑的 subagent 会真的停下来。
+    // 挂 `.catch` 而不是裸 `void`：`close()` 里的 `transition()` 若抛异常，裸
+    // fire-and-forget 会变成未处理的 rejection（Node 默认直接结束进程）。
+    if (this.subagents) {
+      Promise.resolve()
+        .then(() => this.closeSubagents())
+        .catch(() => {
+          // 取消是尽力而为；reset() 不因它失败而失败。
+        })
+    }
     // Clear telemetry aggregates so a reset agent reports zero history.
     // Listeners registered via `on(...)` are NOT cleared — that would silently
     // break application-level subscriptions across a reset.
@@ -670,12 +709,15 @@ export class Agent {
 
   /**
    * Return model/tool artifacts captured by RuntimeHistory-backed memories.
+   * @param {object} [opts]
+   * @param {string} [opts.agentId] 只返回该 agent 登记的产物（subagent 系统用）
    * @returns {Promise<object[]>}
    */
-  async getArtifacts() {
+  async getArtifacts({ agentId } = {}) {
     const rh = this.memory?.runtimeHistory
-    if (rh && typeof rh.project === 'function') return rh.project('artifacts')
-    return []
+    if (!rh || typeof rh.project !== 'function') return []
+    const rows = rh.project('artifacts')
+    return agentId == null ? rows : rows.filter(r => r.agentId === agentId)
   }
 
   // ---- Telemetry public API ----
@@ -1052,7 +1094,7 @@ export class Agent {
       return {
         body: {
           model: this.model,
-          messages: this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages)),
+          messages: this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages))),
           temperature: this.temperature,
           ...(assembled.tools ? { tools: assembled.tools } : {}),
         },
@@ -1062,7 +1104,7 @@ export class Agent {
     }
 
     // 简单模式：直接使用 memory 中的消息
-    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
+    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
 
     const openaiTools = filteredTools.length > 0 ? formatToolsForOpenAI(filteredTools) : undefined
     return {
@@ -1192,6 +1234,17 @@ export class Agent {
   async closeMCPClients() {
     if (this._managedClients.size === 0) return
     await this._teardownManagedClients()
+  }
+
+  /**
+   * 取消全部在跑的 subagent（abort 各自的 AbortController）并等它们 settle。
+   * 未配置 subagents 时为安全空操作；可重复调用（终态 handle 会被跳过）。
+   *
+   * @returns {Promise<void>}
+   */
+  async closeSubagents() {
+    if (!this.subagents) return
+    await this.subagents.close()
   }
 
   /**
@@ -1515,7 +1568,7 @@ export class Agent {
                 errorKind = 'rejected'
                 result = `Tool call "${call.name}" was rejected by the application.`
               } else {
-                result = await tool.execute(call.arguments, { signal })
+                result = await tool.execute(call.arguments, { ...this._toolContextExtra, signal })
               }
             } catch (err) {
               // Classify per Requirement 3.7: abort wins over generic
@@ -1725,7 +1778,7 @@ export class Agent {
                 errorKind = 'rejected'
                 result = `Tool call "${call.name}" was rejected by the application.`
               } else {
-                result = await tool.execute(call.arguments, { signal })
+                result = await tool.execute(call.arguments, { ...this._toolContextExtra, signal })
               }
             } catch (err) {
               errorKind = (err?.name === 'AbortError' || signal?.aborted)
@@ -2012,6 +2065,27 @@ export class Agent {
     return out
   }
 
+  /**
+   * 把 agent 类型清单合并进 system 消息（Level 1，与 skill 清单同一手法）。
+   * 未配置 subagents 时原样返回入参（含引用身份）。
+   * @param {object[]} messages
+   * @returns {object[]}
+   */
+  _withSubagentTypesNote(messages) {
+    if (!this.subagents) return messages
+    const note = this.subagents.typesNote()
+    const out = messages.slice()
+    const sysIdx = out.findIndex((m) => m && m.role === 'system')
+    if (sysIdx === -1) {
+      out.unshift({ role: 'system', content: note })
+    } else {
+      const sys = out[sysIdx]
+      const base = typeof sys.content === 'string' ? sys.content : ''
+      out[sysIdx] = { ...sys, content: base ? `${base}\n\n${note}` : note }
+    }
+    return out
+  }
+
   /** `skill` 元工具的 execute:返回正文 + Level 3 资源访问说明;未知名软失败。 */
   _invokeSkill(name) {
     const def = this.skills?.get(name)
@@ -2034,7 +2108,7 @@ export class Agent {
   }
 
   async _buildSimpleBody(tools = this.tools) {
-    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
+    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
     const openaiTools = tools.length > 0 ? formatToolsForOpenAI(tools) : undefined
     return {
       body: {
