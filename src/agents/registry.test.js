@@ -14,6 +14,23 @@ test('agentId 唯一，name 按类型递增', () => {
   assert.match(a.agentId, /^agt_[0-9a-f]{8}$/)
 })
 
+test('突发创建不产生 agentId 碰撞（时钟静止也不行）', () => {
+  // 回归测试：曾用 (now() & 0xffffff) * 256 + (SEQ & 0xff) 生成 id，只给计数器
+  // 留 8 位 —— 同一毫秒内第 257 个 agent 静默覆盖第 1 个，`_byId` 里早先那个
+  // handle 再也查不到且不报错。图调度器一次物化多个节点就能触发。
+  const r = new AgentRegistry({ now: () => 1700000000000 })
+  const ids = new Set()
+  const handles = []
+  for (let i = 0; i < 1000; i++) {
+    const h = r.create(base)
+    ids.add(h.agentId)
+    handles.push(h)
+  }
+  assert.strictEqual(ids.size, 1000, 'agentId 必须互不相同')
+  assert.strictEqual(r.list({ includeFinished: true }).length, 1000, '不能有 handle 被静默覆盖')
+  for (const h of handles) assert.strictEqual(r.get(h.agentId), h)
+})
+
 test('不同类型各自计数', () => {
   const r = new AgentRegistry()
   assert.strictEqual(r.create({ ...base, type: 'explorer' }).name, 'explorer-1')
