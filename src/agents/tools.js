@@ -99,7 +99,7 @@ export function createSubagentTools(runtime) {
       name: 'agent_cancel',
       description: 'Cancel a running agent, or give up on a graph node. The agent stops at its next '
         + 'checkpoint and reports as cancelled. Cancelling a node also cancels whatever agent is running '
-        + 'for it, and leaves everything downstream of it blocked.',
+        + 'for it, and everything downstream of it then blocks (or is skipped, per its on_upstream_failure).',
       parameters: {
         type: 'object',
         properties: {
@@ -120,7 +120,6 @@ export function createSubagentTools(runtime) {
         const handle = runtime.registry.get(agentId)
         if (!handle) return `Error: agent "${agentId}" not found.`
         if (handle.isTerminal()) return `agent ${handle.name} already finished (${handle.state}); nothing to cancel.`
-
         // 立刻把 handle 转到 cancelled，而不是只 abort 底层 controller：否则 abort
         // 传导进子 agent 变成一次异常，被 runner 的重试循环当成普通失败分类，
         // 这个工具自己的 description 说"reports as cancelled"就成了假话
@@ -212,6 +211,11 @@ export function createSubagentTools(runtime) {
       } = {}, ctx = {}) => {
         if (typeof nodeId !== 'string' || nodeId.trim() === '') {
           return 'Error: `node_id` is required — the id of the node you declared with agent_graph.'
+        }
+        // prompt 可以省（省了就用声明时带的那份），但给了就必须是一段真话 ——
+        // 放行一个非字符串会让它被 String() 塞进契约正文。
+        if (prompt != null && (typeof prompt !== 'string' || prompt.trim() === '')) {
+          return 'Error: `prompt` must be this node\'s full task contract in natural language.'
         }
         const started = runtime.graph.start(nodeId, { prompt, subagent_type: subagentType, model })
         if (!started.ok) return `Error: ${started.reason}`
