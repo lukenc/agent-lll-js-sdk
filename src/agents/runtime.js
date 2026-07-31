@@ -4,7 +4,7 @@
  */
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
-import { SubagentRunner } from './runner.js'
+import { SubagentRunner, cancelHandle } from './runner.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
 import { createSubagentTools } from './tools.js'
@@ -129,19 +129,15 @@ export function createSubagentRuntime({
     async close() {
       for (const handle of registry.list()) {
         if (!handle.isTerminal()) {
-          // 先 abort 再打标记：只 transition('cancelled') 不 abort 的话，在跑的
-          // 后台 subagent 会继续跑到自然结束（drain 也就一直等着），而它结束时
-          // 的 transition('succeeded') 从终态出发是非法迁移，被重试循环捕获后
-          // 又被翻译成一次失败 —— handle 最终 state=cancelled 而
-          // result.status=failed，自相矛盾。abort 不带 reason，好让子 agent 侧
-          // 抛出的是标准 AbortError（failureKind 因此归类为 aborted）；取消原因
-          // 走下面的事件 payload。
-          handle._abort?.abort()
-          handle.transition('cancelled')
-          emit('agent.cancelled', {
-            agentId: handle.agentId, agentName: handle.name,
-            parentAgentId: handle.parentAgentId, reason: 'runtime closed',
-          })
+          // 统一走 cancelHandle：跟 agent_cancel 工具用同一条路径转态 + abort，
+          // 不再各写各的 abort() 用法（历史上这里是裸 abort() 无 reason，
+          // agent_cancel 是 abort(reason) 这个原始字符串——两者传导进子 agent
+          // 后 classifyFailure 看到的东西不一样，一个能归类成 aborted，另一个
+          // 因为字符串没有 .name 会误判成 tool_error）。cancelHandle 内部构造
+          // 一个 name=AbortError 的 Error 当 reason，两条路径此后行为一致，
+          // 'runtime closed' 这个人类可读理由还能顺着 lastError 一路带到
+          // 渲染出的 Agent_Result 里，而不只是留在下面这个事件 payload 里。
+          cancelHandle(handle, { reason: 'runtime closed', emit })
         }
       }
       await runtime.drain()

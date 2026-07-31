@@ -7,6 +7,12 @@
  *
  * `run()` **永不 throw** —— 任何异常都被分类成 failureKind 并渲染成结构化失败
  * 结果回给主 agent，由主 agent 决定换模型 / 缩范围 / 放弃（§2）。
+ *
+ * **取消是一等结果，不是失败的一种。** `cancelHandle`（本模块导出，`agent_cancel`
+ * 工具与 `runtime.close()` 共用）先把 handle 转到终态 `cancelled` 再 abort；
+ * `_finishFailed` / `_finishSucceeded` 发现 handle 已经是 `cancelled` 时一律
+ * 让位给 `_finishCancelled`——不管重试循环里兜到的异常长什么样，都不会把一次
+ * 主动取消误渲染成 `status: 'failed'`。
  */
 import { getAgentType } from './types.js'
 import { renderContract } from './contract.js'
@@ -37,6 +43,46 @@ export function classifyFailure(err) {
   if (/timed out/i.test(message)) return 'timeout'
   if (/fetch failed|ECONNRESET|ENOTFOUND|ECONNREFUSED|network/i.test(message)) return 'network'
   return 'tool_error'
+}
+
+/**
+ * 取消一个 handle 的**唯一**入口 —— `agent_cancel` 工具与 `runtime.close()` 都
+ * 必须走这里，不能各自转态 + abort。
+ *
+ * 原因：两处若各写各的 `abort()` 用法就会分叉——裸 `controller.abort()` 让
+ * `signal.reason` 落成一个标准 `DOMException`（name 为 `AbortError`），而
+ * `controller.abort(someString)` 会让 fetch 之类的调用点把那个字符串原样
+ * reject 出去，字符串没有 `.name`，`classifyFailure` 就误判成 `tool_error`——
+ * 一次刻意的取消于是被下游读成了"这个子 agent 出故障了"。这里统一构造一个
+ * `name: 'AbortError'` 的 `Error` 当 abort reason，两条路径此后行为一致；人类
+ * 可读的取消理由挂在 `.message` 上，因此还能顺着 `classifyFailure` 之后的
+ * `lastError` 一路带到 `agent.cancelled` 事件与渲染出的 Agent_Result 里。
+ *
+ * 同时把 handle 转到终态 `cancelled`——这是让 `_finishFailed` 不再把已取消的
+ * handle 误判成失败的前提：转态发生在 `abort()` 调用之前，因此无论 abort 传导
+ * 进子 agent 要花多久，`handle.state` 在那之前就已经是 `cancelled` 了。
+ *
+ * @param {import('./handle.js').AgentHandle} handle
+ * @param {{ reason?: string|null, emit?: (type: string, payload: object) => void }} [opts]
+ * @returns {boolean} 是否真的执行了取消（handle 已经是终态时为 false，不做任何事）
+ */
+export function cancelHandle(handle, { reason = null, emit = () => {} } = {}) {
+  if (handle.isTerminal()) return false
+  const humanReason = reason ?? 'cancelled'
+  handle._cancelReason = humanReason
+  handle.transition('cancelled')
+  handle._abort?.abort(makeAbortError(humanReason))
+  emit('agent.cancelled', {
+    agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
+    reason: humanReason,
+  })
+  return true
+}
+
+function makeAbortError(reason) {
+  const err = new Error(reason)
+  err.name = 'AbortError'
+  return err
 }
 
 export class SubagentRunner {
@@ -144,6 +190,12 @@ export class SubagentRunner {
    * @returns {Promise<string>} Agent_Result 字符串。永不 reject。
    */
   async run(handle, { prompt, inputs = [], signal } = {}) {
+    // 罕见竞态：`spawn()` 里 `await registry.acquireSlot(...)` 让出过一次微任务，
+    // `agent_cancel`/`close()` 可能正好在这个缺口里把 handle 转成了 cancelled——
+    // 这里若继续往下走 `transition('running')`，会因终态无出边而抛错，违反
+    // "run() 永不 throw"。已经是终态（此刻只可能是 cancelled）就直接按取消收尾。
+    if (handle.isTerminal()) return this._finishCancelled(handle, 'aborted', handle._cancelReason)
+
     const type = getAgentType(handle.type)
     const maxDepth = this.opts.maxDepth ?? 2
     const maxAttempts = this.opts.retry?.maxAttempts ?? type.maxAttempts ?? 3
@@ -275,6 +327,12 @@ export class SubagentRunner {
   }
 
   _finishSucceeded(handle, text) {
+    // 子 agent 在被取消的同一时刻碰巧跑完并返回了结果：`handle.state` 早已被
+    // `cancelHandle` 转成终态 `cancelled`，这里再 `transition('succeeded')` 只会
+    // 抛出非法迁移错误（终态无出边）。取消发生在先就该按取消收尾，不管子 agent
+    // 事后是不是"来得及"返回一个看似成功的文本——那份文本对已经放弃这个任务
+    // 的主 agent 而言没有意义。
+    if (handle.state === 'cancelled') return this._finishCancelled(handle, 'aborted', handle._cancelReason)
     const records = this._collectArtifacts(handle)
     handle.result = { status: 'succeeded', text }
     handle.transition('succeeded')
@@ -289,6 +347,12 @@ export class SubagentRunner {
   }
 
   _finishFailed(handle, failureKind, lastError) {
+    // 同一个竞态的另一半：重试循环里捕获到的异常可能只是"取消导致的连锁反应"
+    // （比如上面 `_finishSucceeded` 里那次非法迁移被这层 catch 兜住，重新分类成
+    // 了看似无关的 `tool_error`）。只要 handle 已经被标记为 cancelled，就不再
+    // 采信这里传入的 failureKind/lastError，一律按取消渲染——这正是这次要修的
+    // 缺陷：cancelled 状态 + failed 结果自相矛盾。
+    if (handle.state === 'cancelled') return this._finishCancelled(handle, 'aborted', handle._cancelReason ?? lastError)
     const records = this._collectArtifacts(handle)
     handle.result = { status: 'failed', failureKind, lastError }
     if (!handle.isTerminal()) handle.transition('failed')
@@ -298,6 +362,21 @@ export class SubagentRunner {
       agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
       failureKind, attempts: handle.attempt, lastError,
     })
+    return this.formatResult(handle, { records })
+  }
+
+  /**
+   * 取消收尾。**不**在这里 transition 或 emit `agent.cancelled`——`cancelHandle`
+   * 早在 abort 传导进来之前就已经做过这两件事了；这里只负责把 handle.result
+   * 定成 `{ status: 'cancelled', ... }`（而不是 'failed'）、结算并发槽/保留窗口、
+   * 渲染结果。三个调用点（`run()` 顶部的终态短路、`_finishSucceeded` 的竞态
+   * 兜底、`_finishFailed` 的竞态兜底）进来时 `handle.state` 都已经是
+   * `cancelled`，所以这里不需要再判断。
+   */
+  _finishCancelled(handle, failureKind = 'aborted', lastError = null) {
+    const records = this._collectArtifacts(handle)
+    handle.result = { status: 'cancelled', failureKind, lastError: lastError ?? handle._cancelReason ?? 'cancelled' }
+    this.registry.settle(handle)
     return this.formatResult(handle, { records })
   }
 
@@ -333,6 +412,19 @@ export class SubagentRunner {
       return lines.join('\n')
     }
 
+    // 取消是一等结果，不是失败的一种：不重试、不建议重试，头部与
+    // succeeded/failed 同风格（机器可读），供主 agent 直接分支判断。
+    if (handle.result?.status === 'cancelled' || (!handle.result && handle.state === 'cancelled')) {
+      const failureKind = handle.result?.failureKind ?? 'aborted'
+      const lastError = handle.result?.lastError ?? handle._cancelReason ?? 'cancelled'
+      const lines = [
+        `[agent:${handle.name} cancelled] failureKind=${failureKind} attempts=${handle.attempt}`,
+        `reason: ${lastError}`,
+      ]
+      if (artifactLine) lines.push(`--- partial artifacts (${rows.length}) ---`, artifactLine)
+      return lines.join('\n')
+    }
+
     const { failureKind, lastError } = handle.result ?? {}
     const retried = handle.attempt > 1 ? ` (retried ${handle.attempt - 1}x)` : ''
     const lines = [
@@ -350,7 +442,12 @@ async function sleep(ms, signal) {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, ms)
     if (signal) {
-      signal.addEventListener('abort', () => { clearTimeout(timer); reject(abortError()) }, { once: true })
+      // `signal.reason` 优先：`cancelHandle` 把人类可读的取消理由挂在这里
+      // （§ classifyFailure 仍然认得出来，因为那也是一个 name=AbortError 的
+      // Error）。裸 `AbortController.abort()`（没人传 reason）时 `signal.reason`
+      // 是运行时自动生成的标准 DOMException，也照样有 name=AbortError，兜底的
+      // `abortError()` 只在 `signal.reason` 意外为空时才用得上。
+      signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason ?? abortError()) }, { once: true })
     }
   })
 }

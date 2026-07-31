@@ -123,6 +123,65 @@ test('agent_cancel 未知 id 软失败', async () => {
   assert.ok(/not found|unknown/i.test(out))
 })
 
+/** 一个只在 signal abort 时才会 reject 的假子 agent —— 模拟真实 fetch 的行为：
+ * abort 时以 `signal.reason` 原样 reject（而不是自己另造一个 AbortError）。 */
+function makeAbortAwareRuntime(parent, extra = {}) {
+  return createSubagentRuntime({
+    parent,
+    createAgent: () => ({
+      lastStopReason: null,
+      on() { return this }, off() { return this },
+      getLastRunMetrics: () => ({ totalRounds: 1, totalLlmCalls: 1, totalToolCalls: 0, usage: null, wallClockMs: 1 }),
+      async chat(_contract, { signal } = {}) {
+        return new Promise((_resolve, reject) => {
+          if (signal?.aborted) { reject(signal.reason); return }
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      },
+    }),
+    ...extra,
+  })
+}
+
+test('agent_cancel 让运行中的 agent 落在 cancelled（不是 failed），failureKind=aborted', async () => {
+  const parent = fakeParent()
+  const rt = makeAbortAwareRuntime(parent)
+  const started = await byName(rt.tools, 'agent').execute({ description: 'd', prompt: 'p' })
+  const name = started.match(/\[agent:(\S+) started\]/)[1]
+  const handle = rt.registry.get(name)
+
+  const cancelOut = await byName(rt.tools, 'agent_cancel').execute({ agent_id: name, reason: '人工取消' })
+  assert.ok(/cancel/i.test(cancelOut))
+  // agent_cancel 的 description 承诺 "reports as cancelled" —— 必须立刻兑现，
+  // 不能等子 agent 那头的 abort 传导完才转态。
+  assert.strictEqual(handle.state, 'cancelled')
+
+  await rt.drain()
+  assert.strictEqual(handle.result.status, 'cancelled')
+  assert.notStrictEqual(handle.result.status, 'failed')
+  assert.strictEqual(handle.result.failureKind, 'aborted')
+
+  const status = JSON.parse(await byName(rt.tools, 'agent_status').execute({ agent_id: name }))
+  assert.strictEqual(status.state, 'cancelled')
+  assert.ok(parent._events.some(e => e.type === 'agent.cancelled' && e.payload.reason === '人工取消'))
+  assert.ok(!parent._events.some(e => e.type === 'agent.failed'), '取消不应该也 emit agent.failed')
+})
+
+test('runtime.close() 取消在跑的 agent：同样落在 cancelled / aborted，不是 failed', async () => {
+  const parent = fakeParent()
+  const rt = makeAbortAwareRuntime(parent)
+  const started = await byName(rt.tools, 'agent').execute({ description: 'd', prompt: 'p' })
+  const name = started.match(/\[agent:(\S+) started\]/)[1]
+  const handle = rt.registry.get(name)
+
+  await rt.close()
+
+  assert.strictEqual(handle.state, 'cancelled')
+  assert.strictEqual(handle.result.status, 'cancelled')
+  assert.strictEqual(handle.result.failureKind, 'aborted')
+  assert.ok(parent._events.some(e => e.type === 'agent.cancelled' && e.payload.reason === 'runtime closed'))
+})
+
 test('artifact_write 记账并在冲突时告警', async () => {
   const rt = makeRuntime(fakeParent())
   const write = byName(rt.tools, 'artifact_write')

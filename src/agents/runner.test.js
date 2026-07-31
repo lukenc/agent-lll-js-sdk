@@ -3,7 +3,7 @@ import assert from 'node:assert'
 import { RuntimeHistory } from '../runtime-history.js'
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
-import { SubagentRunner, classifyFailure, RETRYABLE_KINDS } from './runner.js'
+import { SubagentRunner, classifyFailure, RETRYABLE_KINDS, cancelHandle } from './runner.js'
 import { resolveModelAliases } from './models.js'
 import { getAgentType } from './types.js'
 
@@ -246,4 +246,80 @@ test('子 agent 首条消息是渲染后的契约（含标题行与 prompt 原�
   assert.ok(received.includes('# Task: Audit auth flow'))
   assert.ok(received.includes('检查 src/auth 的越权风险'))
   assert.strictEqual(runner.lastRenderedContract, received)
+})
+
+// --- 取消是一等结果，不是失败的一种（followup 回归） -----------------------
+
+test('cancelHandle：带 reason 与裸 abort 两条路径都归类为 aborted，不再有一个滑落成 tool_error', () => {
+  const { registry } = makeRunner(['ok'])
+  const withReason = makeHandle(registry)
+  withReason._abort = new AbortController()
+  let caughtWithReason
+  withReason._abort.signal.addEventListener('abort', () => { caughtWithReason = withReason._abort.signal.reason })
+  cancelHandle(withReason, { reason: '人工取消，缩小范围重新分派' })
+  assert.strictEqual(classifyFailure(caughtWithReason), 'aborted')
+
+  const bare = makeHandle(registry)
+  bare._abort = new AbortController()
+  let caughtBare
+  bare._abort.signal.addEventListener('abort', () => { caughtBare = bare._abort.signal.reason })
+  cancelHandle(bare, {})
+  assert.strictEqual(classifyFailure(caughtBare), 'aborted')
+})
+
+test('cancelHandle 让 handle 立刻落在 cancelled，且已经是终态的 handle 上再调用是无操作', () => {
+  const { registry, events } = makeRunner(['ok'])
+  const handle = makeHandle(registry)
+  handle.transition('queued'); handle.transition('running')
+  const ok = cancelHandle(handle, { reason: 'r', emit: (t, p) => events.push({ type: t, payload: p }) })
+  assert.strictEqual(ok, true)
+  assert.strictEqual(handle.state, 'cancelled')
+  assert.ok(events.some(e => e.type === 'agent.cancelled' && e.payload.reason === 'r'))
+
+  const again = cancelHandle(handle, { reason: 'late', emit: () => { throw new Error('不该再 emit') } })
+  assert.strictEqual(again, false, '已经终态的 handle 上再取消必须是无操作')
+})
+
+test('取消发生在子 agent 跑的过程中：落在 cancelled，result.status 不是 failed', async () => {
+  let handle
+  const events2 = []
+  const { runner, registry, events } = makeRunner([
+    function () {
+      // 模拟 agent_cancel 在子 agent 跑的中途介入：先转态，abort 传导进子 agent
+      // 内部变成一次标准 AbortError（真实场景里这是 fetch 看到 signal.reason 后
+      // 抛出来的那个值——cancelHandle 保证它 name=AbortError）。
+      const reason = cancelHandle(handle, { reason: '人工取消', emit: (t, p) => events2.push({ type: t, payload: p }) })
+      assert.ok(reason)
+      const err = new Error('人工取消')
+      err.name = 'AbortError'
+      throw err
+    },
+  ])
+  handle = makeHandle(registry)
+  const out = await runner.run(handle, { prompt: 'p' })
+
+  assert.match(out, /^\[agent:general-purpose-1 cancelled\]/m)
+  assert.ok(!/\bfailed\b/.test(out), '取消不该被渲染成 failed')
+  assert.ok(out.includes('failureKind=aborted'))
+  assert.strictEqual(handle.state, 'cancelled')
+  assert.strictEqual(handle.result.status, 'cancelled')
+  assert.notStrictEqual(handle.result.status, 'failed')
+  assert.ok(!events.some(e => e.type === 'agent.failed'), '取消不应该也 emit agent.failed')
+})
+
+test('formatResult：cancelled 渲染独立于 failed，机器可读头部一致，且不建议重试', () => {
+  const { runner, registry } = makeRunner(['ok'])
+  const handle = makeHandle(registry)
+  handle.transition('queued'); handle.transition('running')
+  handle.beginAttempt()
+  handle.endAttempt({ failureKind: 'aborted', error: '人工取消' })
+  handle.transition('cancelled')
+  handle.result = { status: 'cancelled', failureKind: 'aborted', lastError: '人工取消' }
+
+  const out = runner.formatResult(handle)
+  assert.match(out, /^\[agent:general-purpose-1 cancelled\]/m)
+  assert.ok(out.includes('failureKind=aborted'))
+  assert.ok(out.includes('人工取消'))
+  assert.ok(!/\bfailed\b/.test(out))
+  assert.ok(!out.includes('重试') && !out.includes('重发'), 'cancelled 结果不该包含失败分支那句重试建议')
 })

@@ -5,6 +5,7 @@
 import { AGENT_TOOL_DESCRIPTION } from './contract.js'
 import { modelEnum } from './models.js'
 import { searchHistory, getHistoryEvent } from './history-search.js'
+import { cancelHandle } from './runner.js'
 
 export const SUBAGENT_TOOL_NAMES = [
   'agent', 'agent_status', 'agent_cancel',
@@ -109,7 +110,12 @@ export function createSubagentTools(runtime) {
         const handle = runtime.registry.get(agentId)
         if (!handle) return `Error: agent "${agentId}" not found.`
         if (handle.isTerminal()) return `agent ${handle.name} already finished (${handle.state}); nothing to cancel.`
-        handle._abort?.abort(reason)
+        // 立刻把 handle 转到 cancelled，而不是只 abort 底层 controller：否则 abort
+        // 传导进子 agent 变成一次异常，被 runner 的重试循环当成普通失败分类，
+        // 这个工具自己的 description 说"reports as cancelled"就成了假话
+        // （state 最终落在 failed）。cancelHandle 同时也是 runtime.close() 用的
+        // 同一条路径，两者对 abort() 的用法不再分叉。
+        cancelHandle(handle, { reason, emit: (type, payload) => runtime.parent.emit(type, payload) })
         return `agent ${handle.name} cancellation requested (${reason}).`
       },
     },
