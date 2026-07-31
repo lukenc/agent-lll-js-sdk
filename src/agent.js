@@ -43,6 +43,12 @@ import { createSubagentRuntime } from './agents/runtime.js'
 import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
 
 /**
+ * 一次轮边界排空时，超过这个条数的待注入消息会被合并为一条 —— 连续多条
+ * user 消息会被部分供应商拒绝。
+ */
+const INJECTION_MERGE_THRESHOLD = 5
+
+/**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
  * that the per-run aggregation can add to them unconditionally (null-valued
  * provider usage contributes 0 per Requirement 8.6 / 8.7).
@@ -486,6 +492,12 @@ export class Agent {
     this.subagents = null
     /** 合并进 `tool.execute(args, ctx)` 第二参的归属字段。 */
     this._toolContextExtra = { agentId: 'main', agentName: 'main', depth: 0, cwd: null }
+    /**
+     * 待注入消息队列。后台 subagent 完成通知、图节点就绪通知、A2A 投递三者
+     * 共用这一个机制 —— 都不打断正在执行的工具，只在轮边界汇入。
+     * @type {object[]}
+     */
+    this._pendingInjections = []
     if (opts.subagents) {
       this.subagents = createSubagentRuntime({ parent: this, ...opts.subagents })
       this.tools = [...this.tools, ...this.subagents.tools]
@@ -1247,6 +1259,44 @@ export class Agent {
     await this.subagents.close()
   }
 
+  // ---- 轮边界消息注入 ----
+
+  /**
+   * 把一条消息排入待注入队列。它会在**下一个 ReAct 轮边界**写进 memory，
+   * 而不是立刻写 —— 轮中间插消息会切断 `assistant(tool_calls)` 与其 `tool`
+   * 结果的配对，`memory-policy.js` 的裁剪逻辑依赖这个不变量。
+   *
+   * 非法入参（非对象 / 无 content）被静默忽略：调用方多为后台通知发送者，
+   * 抛异常会打穿它们的 fire-and-forget 路径。
+   *
+   * @param {{ role?: string, content: string }} message
+   * @returns {this}
+   */
+  enqueueMessage(message) {
+    if (!message || typeof message !== 'object') return this
+    if (typeof message.content !== 'string' || message.content.length === 0) return this
+    this._pendingInjections.push({ role: message.role ?? 'user', content: message.content })
+    return this
+  }
+
+  /**
+   * 排空待注入队列写进 memory。返回实际写入的消息条数。
+   * 超过 `INJECTION_MERGE_THRESHOLD` 条时合并为一条 —— 连续多条 user 消息会
+   * 被部分供应商拒绝。
+   * @returns {number}
+   */
+  _drainPendingInjections() {
+    const pending = this._pendingInjections
+    if (pending.length === 0) return 0
+    this._pendingInjections = []
+    if (pending.length <= INJECTION_MERGE_THRESHOLD) {
+      for (const message of pending) this.memory.add(message)
+      return pending.length
+    }
+    this.memory.add({ role: 'user', content: pending.map(m => m.content).join('\n\n') })
+    return 1
+  }
+
   /**
    * `load_mcp_server` 元工具主体：在对话进行中加载一个 MCP 服务器，把它的工具
    * 加入 Tool_Registry。所有失败路径均返回**描述性字符串**（不抛异常给 LLM，
@@ -1496,6 +1546,10 @@ export class Agent {
       }
 
       try {
+        // 轮边界：先排空待注入消息，再构建本轮请求体。此刻上一轮的
+        // assistant(tool_calls) 与全部 tool 结果都已成对落盘。
+        if (round > 0) this._drainPendingInjections()
+
         let body
         if (round === 0) {
           const first = await this._runPipeline(userMessage, signal)
@@ -1682,6 +1736,9 @@ export class Agent {
       }
 
       try {
+        // 轮边界：同 `_reactLoop`，先排空待注入消息再构建本轮请求体。
+        if (round > 0) this._drainPendingInjections()
+
         let body
         let intent
         if (round === 0) {
