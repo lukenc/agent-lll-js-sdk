@@ -32,7 +32,13 @@ test('pending 快照不含函数，可安全序列化', () => {
   const [record] = reg.pending()
   assert.doesNotThrow(() => JSON.stringify(record))
   assert.strictEqual(record.resolve, undefined)
+  assert.strictEqual(record.settle, undefined)
   assert.strictEqual(record.state, 'pending')
+  assert.ok(Object.values(record).every(v => typeof v !== 'function'))
+  // 快照是副本：主机改它不该改到登记表里的记录
+  record.question = 'hacked'
+  assert.strictEqual(reg.pending()[0].question, 'q')
+  reg.cancelAll('cleanup')
 })
 
 test('重复回答同一 askId 是 no-op，不抛错', async () => {
