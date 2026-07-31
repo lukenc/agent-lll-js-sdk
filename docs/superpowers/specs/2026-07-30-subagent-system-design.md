@@ -204,6 +204,7 @@ path=.worktrees/agent-agt_7f3a9c21 branch=subagent/agt_7f3a9c21 changed=3 files 
 | `agents/errors.js` | `SubagentError` / `AgentTypeError` / `AgentGraphError` / `A2AError` / `WorktreeIsolationError`；构造函数只接受白名单标量字段（照 `mcp/errors.js`，防 apiKey 泄进 `err.message`） |
 | `agents/types.js` | Agent_Type 注册表：`registerAgentType` / `getAgentType` / `listAgentTypes` / `unregisterAgentType` / `resetAgentTypes`；内置 `general-purpose` 保留 |
 | `agents/contract.js` | `agent` 工具的 `Tool_Def.description` 常量（引导模型把完整契约写进入参 `prompt`）+ 把 `{ description, prompt, inputs }` 渲染成子 agent 首条 user 消息 |
+| `agents/models.js` | 模型别名表解析（alias → `{ model, apiKey, url }`）与 `agent` 工具 `model` enum 的生成（§10） |
 | `agents/handle.js` | `AgentHandle` 与状态机迁移校验 |
 | `agents/registry.js` | agentId / name 分配（重名 `_2` 后缀，复用 `mcp/namespace.js` 的去重思路）、按 id/name 查（重名时最新者胜）、并发槽位记账、完成态 LRU 保留 |
 | `agents/runner.js` | 造子 `Agent`、跑、按 failureKind 重试、产出 `Agent_Result`、转发遥测 |
