@@ -3677,6 +3677,7 @@ agentId/agentName/depth/cwd; existing tools ignore the extra fields."
   - `Agent#_pendingInjections: object[]`
   - `Agent#_drainPendingInjections() -> number` —— 排空并写入 memory，返回写入条数；>5 条时合并为一条
   - `INJECTION_MERGE_THRESHOLD = 5`（`src/agents/mailbox.js` 导出，本任务先在 `agent.js` 里用常量，Task 11 移过去）
+  - `INJECTABLE_ROLES = new Set(['user', 'system'])` —— `enqueueMessage` 的 role 白名单。`'tool'` 必须被拒：一条没有 `tool_call_id` 的孤儿 tool 消息正是本机制要防的破坏。`'assistant'` 也拒 —— 伪造一轮助手发言会让模型误以为自己说过那句话。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -3747,6 +3748,40 @@ test('非法入参被忽略而不是抛异常', () => {
   agent.enqueueMessage({ role: 'user' })
   assert.strictEqual(agent._pendingInjections.length, 0)
 })
+
+test('role 白名单：tool / assistant 被拒，不会写出孤儿 tool 消息', () => {
+  // 回归测试：`role: message.role ?? 'user'` 只挡 null/undefined。显式传 'tool'
+  // 会被原样入队，drain 时直接 memory.add，产生一条没有 tool_call_id 的孤儿
+  // tool 消息 —— 正是本机制存在的理由所要防的那类破坏。
+  const agent = new Agent({ ...baseOpts })
+  agent.enqueueMessage({ role: 'tool', content: 'orphan' })
+  agent.enqueueMessage({ role: 'assistant', content: 'fake turn' })
+  assert.strictEqual(agent._pendingInjections.length, 0, 'tool / assistant 必须被拒')
+
+  agent.enqueueMessage({ role: 'user', content: 'ok' })
+  agent.enqueueMessage({ role: 'system', content: 'also ok' })
+  assert.deepStrictEqual(agent._pendingInjections.map(m => m.role), ['user', 'system'])
+})
+
+test('合并阈值边界：恰好 5 条不合并，6 条合并', async () => {
+  const five = new Agent({ ...baseOpts })
+  for (let i = 0; i < 5; i++) five.enqueueMessage({ role: 'user', content: `m${i}` })
+  assert.strictEqual(five._drainPendingInjections(), 5, '恰好 5 条应逐条写入')
+
+  const six = new Agent({ ...baseOpts })
+  for (let i = 0; i < 6; i++) six.enqueueMessage({ role: 'user', content: `m${i}` })
+  assert.strictEqual(six._drainPendingInjections(), 1, '6 条应合并为 1 条')
+  const history = await six.getHistory('model')
+  const merged = history[history.length - 1]
+  for (let i = 0; i < 6; i++) assert.ok(String(merged.content).includes(`m${i}`))
+})
+
+test('reset() 清空待注入队列，旧会话的通知不漏进新会话', () => {
+  const agent = new Agent({ ...baseOpts })
+  agent.enqueueMessage({ role: 'user', content: '<agent-notification>stale</agent-notification>' })
+  agent.reset()
+  assert.strictEqual(agent._pendingInjections.length, 0)
+})
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3767,6 +3802,24 @@ Expected: FAIL —— `agent.enqueueMessage is not a function`
     this._pendingInjections = []
 ```
 
+模块顶层加 role 白名单常量（紧邻 `INJECTION_MERGE_THRESHOLD`）：
+
+```js
+/**
+ * 允许注入的 role。`'tool'` 必须被拒 —— 一条没有 `tool_call_id` 的孤儿 tool
+ * 消息正是轮边界注入这套机制要防的破坏；`'assistant'` 也拒，伪造一轮助手发言
+ * 会让模型误以为自己说过那句话。
+ */
+const INJECTABLE_ROLES = new Set(['user', 'system'])
+```
+
+`reset()` 里在清 memory 的同时清空队列（一行）：
+
+```js
+    this._pendingInjections = []
+```
+> 上一个会话的通知不该漏进新会话 —— `reset()` 清了 memory 与 history，队列却还留着，下一轮跑到 round 1 就会把陈旧通知注入全新的对话。
+
 新增两个方法：
 
 ```js
@@ -3780,6 +3833,15 @@ Expected: FAIL —— `agent.enqueueMessage is not a function`
   enqueueMessage(message) {
     if (!message || typeof message !== 'object') return this
     if (typeof message.content !== 'string' || message.content.length === 0) return this
+    // role 必须在白名单内。注入的消息会被直接 memory.add，一条 role:'tool' 且没有
+    // tool_call_id 的孤儿消息正是本机制要防的那类破坏 —— 而 `role ?? 'user'` 只挡
+    // null/undefined，挡不住显式传进来的 'tool'。A2A / 图调度这些外部发送方的入参
+    // 不该被当成可信输入。
+    if (!INJECTABLE_ROLES.has(message.role ?? 'user')) {
+      console.warn(`[agent] enqueueMessage: dropping message with role "${message.role}" `
+        + `(injectable roles: ${[...INJECTABLE_ROLES].join(', ')})`)
+      return this
+    }
     this._pendingInjections.push({ role: message.role ?? 'user', content: message.content })
     return this
   }
