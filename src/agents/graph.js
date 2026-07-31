@@ -29,10 +29,6 @@ import { AgentGraphError } from './errors.js'
  * running / waiting_input 由调用方通过 `onAgentSettled` 回报 —— **waiting_input
  * 算"还在跑"**：一个卡在向用户提问上的 agent 并没有干完。
  */
-export const GRAPH_NODE_STATES = Object.freeze([
-  'blocked', 'awaiting_confirm', 'queued', 'running', 'waiting_input',
-  'succeeded', 'failed', 'cancelled', 'skipped',
-])
 
 /** 终态：不再迁移，也不会被迟到的 settle 复活。 */
 export const GRAPH_TERMINAL_STATES = new Set(['succeeded', 'failed', 'cancelled', 'skipped'])
@@ -140,14 +136,16 @@ export class AgentGraph {
    * @param {object} opts
    * @param {(node: object, upstream: object[]) => void} [opts.onReadyNode]
    *        节点就绪且需要主 agent 确认契约时调用。收到的是**快照**，不是活对象。
-   * @param {(node: object) => void} [opts.onAutoStart]
-   *        on_ready:'auto' 的节点就绪时调用（此时节点已是 queued）。
+   * @param {(node: object, upstream: object[]) => void} [opts.onAutoStart]
+   *        on_ready:'auto' 的节点就绪时调用（此时节点已是 queued）。同样是快照。
    * @param {(type: string, payload: object) => void} [opts.emit]
+   * @param {() => number} [opts.now]
    */
-  constructor({ onReadyNode = () => {}, onAutoStart = () => {}, emit = () => {} } = {}) {
+  constructor({ onReadyNode = () => {}, onAutoStart = () => {}, emit = () => {}, now = () => Date.now() } = {}) {
     this.onReadyNode = onReadyNode
     this.onAutoStart = onAutoStart
     this.emit = emit
+    this._now = now
     /** @type {Map<string, object>} 内部活节点。对外一律发快照。 */
     this.nodes = new Map()
     /**
@@ -162,11 +160,6 @@ export class AgentGraph {
   get(nodeId) {
     const node = this.nodes.get(nodeId)
     return node ? snapshot(node) : null
-  }
-
-  /** 全部节点快照，声明顺序。 */
-  list() {
-    return [...this.nodes.values()].map(snapshot)
   }
 
   /**
@@ -215,7 +208,7 @@ export class AgentGraph {
         blockedReason: null,
         agentId: null,
         result: null,
-        declaredAt: Date.now(),
+        declaredAt: this._now(),
       })
       stagedIds.add(nodeId)
     }
@@ -314,14 +307,19 @@ export class AgentGraph {
       return { ok: false, reason: `node "${nodeId}" is blocked (${node.blockedReason ?? 'waiting on upstream'})` }
     }
     if (node.state !== 'awaiting_confirm') {
-      return { ok: false, reason: `node "${nodeId}" is ${node.state}; only ready nodes can be started` }
+      return {
+        ok: false,
+        reason: `node "${nodeId}" is ${node.state}; only a node awaiting confirmation can be started`,
+      }
     }
-    if (patch.prompt) node.prompt = patch.prompt
-    if (patch.subagent_type) node.subagentType = patch.subagent_type
-    if (patch.model) node.model = patch.model
-    if (!node.prompt) {
+    // 先算出最终 prompt 再落盘：启动被拒时不能留下半个 patch。
+    const prompt = patch.prompt || node.prompt
+    if (!prompt) {
       return { ok: false, reason: `node "${nodeId}" has no prompt; supply one when starting it` }
     }
+    node.prompt = prompt
+    if (patch.subagent_type) node.subagentType = patch.subagent_type
+    if (patch.model) node.model = patch.model
     node.state = 'queued'
     this.emit('graph.node.started', { nodeId: node.nodeId, subagentType: node.subagentType })
     return { ok: true, node: snapshot(node) }
@@ -341,6 +339,7 @@ export class AgentGraph {
       throw new AgentGraphError(
         `agent_graph: cannot report unknown agent state "${state}" for node "${nodeId}"`, { nodeId })
     }
+    // agentId 是身份不是状态，先记下来：终态节点也允许迟到的回报补上它。
     if (agentId != null) node.agentId = agentId
     if (GRAPH_TERMINAL_STATES.has(node.state)) return
     node.state = state
