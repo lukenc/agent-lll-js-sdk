@@ -1609,9 +1609,12 @@ import { searchHistory, getHistoryEvent, MAX_SNIPPET } from './history-search.js
 
 function seed() {
   const h = new RuntimeHistory()
+  // 注意：匹配是大小写不敏感的，所以 fixture 里刻意只让 user 那条含 "oauth"
+  // 字样，assistant / tool 两条改用别的词 —— 否则 "命中 1 条" 与 "role 过滤后
+  // 0 条" 这两个断言会互相矛盾（三条都会命中）。
   h.appendMessage({ role: 'user', content: '帮我看看 OAuth 回调的实现' })
-  h.appendMessage({ role: 'assistant', content: '我先读 src/auth/oauth.js' })
-  h.appendMessage({ role: 'tool', name: 'read_file', content: 'export function handleCallback() { /* oauth */ }' })
+  h.appendMessage({ role: 'assistant', content: '我先读 src/auth/callback.js' })
+  h.appendMessage({ role: 'tool', name: 'read_file', content: 'export function handleCallback() { /* 回调入口 */ }' })
   h.appendMessage({ role: 'user', content: '换个话题：数据库迁移' }, { topicId: 'agt_1', tracks: ['all', 'internal'] })
   return h
 }
@@ -1626,7 +1629,10 @@ test('子串命中，返回 eventId 与片段', () => {
 })
 
 test('大小写不敏感', () => {
-  assert.strictEqual(searchHistory(seed(), { query: 'oauth' }).length >= 1, true)
+  // fixture 里只有 user 那条含 "OAuth"；用全小写查也应命中它。
+  const hits = searchHistory(seed(), { query: 'oauth' })
+  assert.strictEqual(hits.length, 1)
+  assert.strictEqual(hits[0].role, 'user')
 })
 
 test('regex 模式', () => {
@@ -1648,8 +1654,12 @@ test('按 agentId 过滤（topicId）', () => {
 })
 
 test('按 role 过滤', () => {
-  assert.strictEqual(searchHistory(seed(), { query: 'oauth', role: 'tool' }).length, 1)
-  assert.strictEqual(searchHistory(seed(), { query: 'oauth', role: 'assistant' }).length, 0)
+  // "callback" 在 assistant（src/auth/callback.js）与 tool（handleCallback）
+  // 两条里都出现，正好用来验证 role 过滤真的在起作用。
+  assert.strictEqual(searchHistory(seed(), { query: 'callback' }).length, 2)
+  assert.strictEqual(searchHistory(seed(), { query: 'callback', role: 'tool' }).length, 1)
+  assert.strictEqual(searchHistory(seed(), { query: 'callback', role: 'assistant' }).length, 1)
+  assert.strictEqual(searchHistory(seed(), { query: 'callback', role: 'user' }).length, 0)
 })
 
 test('limit 生效，默认 20', () => {
