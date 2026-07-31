@@ -9,6 +9,7 @@ import { cancelHandle } from './runner.js'
 
 export const SUBAGENT_TOOL_NAMES = [
   'agent', 'agent_status', 'agent_cancel',
+  'send_message',
   'artifact_write', 'artifact_list',
   'history_search', 'history_get',
 ]
@@ -118,6 +119,28 @@ export function createSubagentTools(runtime) {
         cancelHandle(handle, { reason, emit: (type, payload) => runtime.parent.emit(type, payload) })
         return `agent ${handle.name} cancellation requested (${reason}).`
       },
+    },
+
+    {
+      name: 'send_message',
+      description: 'Send a message to another agent. The message does not interrupt what that agent is '
+        + 'doing — it lands in its context at its next round boundary. Sending to an agent that already '
+        + 'finished resumes it with its context intact. Use "parent" for whoever spawned you, or "main" '
+        + 'for the orchestrator.',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'Target agent id or name, or "parent" / "main"' },
+          message: { type: 'string' },
+          summary: { type: 'string', description: 'Optional 5-10 word preview for the UI' },
+        },
+        required: ['to', 'message'],
+      },
+      execute: async ({ to, message, summary } = {}, ctx = {}) =>
+        runtime.sendMessage({
+          to, body: message, summary,
+          from: { agentId: ctx.agentId ?? 'main', name: ctx.agentName ?? 'main' },
+        }),
     },
 
     {
