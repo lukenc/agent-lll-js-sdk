@@ -62,16 +62,21 @@ export function classifyFailure(err) {
  * handle 误判成失败的前提：转态发生在 `abort()` 调用之前，因此无论 abort 传导
  * 进子 agent 要花多久，`handle.state` 在那之前就已经是 `cancelled` 了。
  *
+ * 给了 `ask` 时还会 settle 掉这个 agent 全部待答提问：abort 信号要等当前那次工具
+ * 调用返回才被看见，而阻塞在 `ask_user` 里的 agent 正卡在一次工具调用里 —— 不
+ * settle 它的提问，这次取消就只是改了个状态，agent 本人还在等人回答。
+ *
  * @param {import('./handle.js').AgentHandle} handle
- * @param {{ reason?: string|null, emit?: (type: string, payload: object) => void }} [opts]
+ * @param {{ reason?: string|null, emit?: (type: string, payload: object) => void, ask?: import('./ask.js').AskRegistry|null }} [opts]
  * @returns {boolean} 是否真的执行了取消（handle 已经是终态时为 false，不做任何事）
  */
-export function cancelHandle(handle, { reason = null, emit = () => {} } = {}) {
+export function cancelHandle(handle, { reason = null, emit = () => {}, ask = null } = {}) {
   if (handle.isTerminal()) return false
   const humanReason = reason ?? 'cancelled'
   handle._cancelReason = humanReason
   handle.transition('cancelled')
   handle._abort?.abort(makeAbortError(humanReason))
+  ask?.cancelByAgent(handle.agentId, humanReason)
   emit('agent.cancelled', {
     agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
     reason: humanReason,

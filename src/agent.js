@@ -203,7 +203,10 @@ export class Agent {
    * @param {(name: string, args: object, result: string) => void} [opts.hooks.afterToolCall] - 工具执行后
    * @param {(round: number) => void} [opts.hooks.onRoundStart] - 每轮 ReAct 循环开始
    * @param {(error: Error, context: object) => void} [opts.hooks.onError] - 错误回调
-   * @param {(question: string) => Promise<string>} [opts.hooks.onAskUser] - 用户交互回调（提供后自动注入 ask_user 工具）
+   * @param {(question: string, meta?: { askId: string, agentId: string, agentName: string, parentAgentId: string, nodeId: string|null, taskDescription: string }) => Promise<string|void>|string|void} [opts.hooks.onAskUser]
+   *   用户交互回调（提供后自动注入 ask_user 工具）。第二参 `meta` 说明这个问题是谁问的
+   *   —— 并发提问因此可区分；只读第一参的旧式单参 hook 不受影响。返回值即回答；返回
+   *   null/undefined 表示"稍后经 `answerQuestion(askId, ...)` 回答"（配置了 subagents 时可用）。
    * @param {boolean} [opts.validateStreamCompletion=true] - 校验流完整性（finish_reason 缺失时抛 LlmStreamIncompleteError）
    * @param {object} [opts.skills] - Skill 系统配置。提供后创建 SkillRegistry 并注入 `skill` 元工具
    * @param {import('./skills/provider.js').SkillProvider[]} opts.skills.providers - skill 来源列表（本地目录 / HTTP 等）
@@ -223,6 +226,10 @@ export class Agent {
    * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
    * @param {object} [opts.subagents.a2a] - A2A 配置。`transport` 默认 'local'（进程内投递）；
    *   其余字段原样交给 transport 工厂（见 `registerA2ATransport`）
+   * @param {object} [opts.subagents.ask] - 提问路由配置
+   * @param {number|null} [opts.subagents.ask.timeoutMs=null] - 单个提问的等待上限；
+   *   null = 永不超时（与旧 `onAskUser` 行为一致）。到点后提问方拿到一段"用户未回答"的
+   *   说明而不是继续挂着
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -362,12 +369,17 @@ export class Agent {
     this._currentRun = null
 
     // ---- 内置工具：ask_user ----
-    // 当提供 hooks.onAskUser 时，自动注入 ask_user 工具，
-    // 让 LLM 在需要时可以向用户提问并等待回答。
-    if (this.hooks.onAskUser) {
-      const onAskUser = this.hooks.onAskUser
+    // 提供 hooks.onAskUser **或**配置了 subagents 时注入 ask_user 工具。
+    // 后者也注入的原因：subagents 下每个提问都经 AskRegistry 登记，主机可以只用
+    // `pendingQuestions()` / `answerQuestion()` 这条命令式通道应答（Web UI、HTTP
+    // 服务这类没法阻塞在 Promise 里的宿主），此时并没有 onAskUser hook。
+    if (this.hooks.onAskUser || opts.subagents) {
+      // 可能不存在 —— 只配了 subagents 而没给 hook 时走登记表通道。
+      const onAskUser = this.hooks.onAskUser ?? null
       this.tools = [
-        ...this.tools,
+        // 同名替换而非追加：子 agent 继承了父的 ask_user（闭包里是**父**的归属），
+        // 再叠一个自己的会让发给模型的工具表出现重名项。留下自己这一个。
+        ...this.tools.filter(t => t.name !== 'ask_user'),
         {
           name: 'ask_user',
           description: 'Ask the user a question and wait for their response. Use this when you need clarification, confirmation, or additional information from the user before proceeding.',
@@ -378,8 +390,24 @@ export class Agent {
             },
             required: ['question'],
           },
-          execute: async function(params) {
-            return await onAskUser(params.question)
+          execute: async (params, ctx = {}) => {
+            const registry = this.subagents?.ask ?? null
+            if (!registry) {
+              // 理论上不可达（注入条件要求二者至少有一个），但别留一个能抛
+              // TypeError 的洞 —— 工具执行失败要以可纠正的字符串回给模型。
+              if (!onAskUser) return 'Error: no user-interaction channel is configured.'
+              return await onAskUser(params.question)
+            }
+            // 登记表内部同时负责通知主机 hook 并与 `answerQuestion` 竞速
+            // （见 agents/ask.js 的 onQuestion）——这里只需把归属交出去。
+            return registry.ask({
+              agentId: ctx.agentId ?? 'main',
+              agentName: ctx.agentName ?? 'main',
+              parentAgentId: ctx.parentAgentId ?? 'main',
+              nodeId: ctx.nodeId ?? null,
+              taskDescription: ctx.taskDescription ?? '',
+              question: params.question,
+            })
           },
         },
       ]
@@ -1267,6 +1295,45 @@ export class Agent {
   async closeSubagents() {
     if (!this.subagents) return
     await this.subagents.close()
+  }
+
+  // ---- 多路提问路由 ----
+
+  /**
+   * 当前全部待答提问（跨 agent 的全局清单，纯数据，可直接给 UI / 序列化）。
+   *
+   * 每条记录带 `askId` 与提问方归属（agentId / agentName / parentAgentId /
+   * nodeId / taskDescription），因此并发提问不会混淆是谁在问什么。
+   * 未配置 subagents 时恒为空数组。
+   *
+   * @returns {object[]}
+   */
+  pendingQuestions() {
+    return this.subagents?.ask?.pending() ?? []
+  }
+
+  /**
+   * 定向应答一个提问 —— 给不能阻塞在 Promise 里的宿主（Web UI / HTTP 服务）用的
+   * 命令式通道。它与 `hooks.onAskUser` 的返回值**竞速**：先到先赢，后到者静默
+   * no-op（返回 false），不抛错也不覆盖已交付的回答。
+   *
+   * @param {string} askId
+   * @param {string} answer
+   * @returns {boolean} false = askId 不存在或已被应答/取消
+   */
+  answerQuestion(askId, answer) {
+    return this.subagents?.ask?.answer(askId, answer, { via: 'api' }) ?? false
+  }
+
+  /**
+   * 取消一个提问。等待方拿到一段取消说明作为 `ask_user` 的结果，而不是挂死。
+   *
+   * @param {string} askId
+   * @param {string} [reason]
+   * @returns {boolean} false = askId 不存在或已被应答/取消
+   */
+  cancelQuestion(askId, reason = 'cancelled by host') {
+    return this.subagents?.ask?.cancel(askId, reason) ?? false
   }
 
   // ---- 轮边界消息注入 ----
