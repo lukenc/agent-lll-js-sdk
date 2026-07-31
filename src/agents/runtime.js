@@ -4,10 +4,15 @@
  */
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
-import { SubagentRunner, cancelHandle } from './runner.js'
+import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
 import { createSubagentTools } from './tools.js'
+import { Mailbox } from './mailbox.js'
+import { resolveA2ATransport, newEnvelopeId } from './a2a/index.js'
+// 内置 local transport 自注册的副作用 import（`a2a/index.js` 不认识它，
+// 与 `mcp/transports/*` 同一套路）。
+import './a2a/local.js'
 
 export function createSubagentRuntime({
   parent,
@@ -19,6 +24,7 @@ export function createSubagentRuntime({
   retry = {},
   artifacts: artifactOpts = {},
   retainCompleted = 20,
+  a2a = {},
   createAgent,
 } = {}) {
   for (const type of types) registerAgentType(type)
@@ -32,10 +38,14 @@ export function createSubagentRuntime({
   const aliases = resolveModelAliases(parent, modelAliases)
   const emit = (type, payload) => parent.emit(type, payload)
 
+  const mailbox = new Mailbox()
+  const transport = resolveA2ATransport({ ...a2a, transport: a2a.transport ?? 'local', mailbox, registry })
+
   const runner = new SubagentRunner({
     parent, registry, artifacts, sharedHistory, aliases,
     opts: { retry: { maxAttempts: retry.maxAttempts ?? 3, attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 }, maxDepth },
     emit,
+    mailbox,
     ...(createAgent ? { createAgent } : {}),
   })
 
@@ -44,6 +54,7 @@ export function createSubagentRuntime({
 
   const runtime = {
     parent, registry, artifacts, runner, sharedHistory, aliases, defaultType, maxDepth,
+    mailbox, transport,
     /** 供 `Agent` 注入的工具集 */
     tools: [],
 
@@ -57,8 +68,8 @@ export function createSubagentRuntime({
     },
 
     /**
-     * 起一个 subagent。`background: true` 时立即返回 started 行，结果稍后经
-     * 轮边界注入（Task 10 接上）。
+     * 起一个 subagent。`background: true` 时立即返回 started 行，结果稍后由
+     * `_onBackgroundSettled` 经轮边界注入通知父 agent。
      */
     async spawn({
       description, prompt, subagentType, model, background = true, isolation = null,
@@ -114,8 +125,131 @@ export function createSubagentRuntime({
       return `[agent:${handle.name} started] background; 完成后会通知你。用 agent_status 查看进度。`
     },
 
-    /** Task 10 用注入替换掉这个默认实现。 */
-    _onBackgroundSettled() {},
+    /**
+     * 后台 agent settle 后的通知：走轮边界注入，不打断父 agent 手上的活。
+     *
+     * `role: 'user'` + `<agent-notification>` 标记 —— `enqueueMessage` 只接受
+     * user / system，一条伪造的 assistant 轮会让父模型以为这话是它自己说的。
+     */
+    _onBackgroundSettled(handle, result) {
+      parent.enqueueMessage?.({
+        role: 'user',
+        content: `<agent-notification agent="${handle.name}" state="${handle.state}">\n${result}\n</agent-notification>`,
+      })
+    },
+
+    /**
+     * A2A 发信。**不打断**收信方手上的工具调用：信落进收信方的收件箱，在它下一个
+     * ReAct 轮边界被注入。
+     *
+     * 三条投递路径：
+     *   - `main` —— 立刻排进父 Agent 的待注入队列（父自己没有收件箱轮询点）；
+     *   - 在跑的 subagent —— 留在收件箱，由 `SubagentRunner` 的 `onRoundStart` 取走；
+     *   - 已终态但上下文还在的 subagent —— 用它保留的 memory 续跑一轮（`_resume`）。
+     *
+     * 全部失败路径返回可纠正的字符串，不抛 —— 与其余元工具一致。
+     */
+    async sendMessage({ to, body, summary, from }) {
+      if (typeof to !== 'string' || to.trim() === '') {
+        return 'Error: `to` is required — an agent id or name, or "parent" / "main".'
+      }
+      if (typeof body !== 'string' || body.trim() === '') {
+        return 'Error: `message` is required — an empty message tells the other agent nothing.'
+      }
+      const targetId = runtime._resolveTarget(to, from)
+      if (!targetId) return `Error: agent "${to}" not found. Use agent_status to list agents.`
+
+      const envelope = {
+        jsonrpc: '2.0', id: newEnvelopeId(), method: 'message/send',
+        params: { from, to: { agentId: targetId }, kind: 'message', correlationId: null, body, meta: { summary } },
+      }
+      const sent = transport.send(envelope)
+      if (!sent.ok) return `Error: could not deliver to "${to}" (${sent.reason}).`
+      emit('a2a.delivered', {
+        envelopeId: envelope.id, from: from.agentId, to: targetId, kind: 'message',
+      })
+
+      if (targetId === 'main') {
+        for (const env of mailbox.drain('main')) {
+          parent.enqueueMessage({ role: 'user', content: mailbox.formatForInjection(env) })
+        }
+        return 'delivered to main; it will read this at its next round boundary.'
+      }
+
+      const handle = registry.get(targetId)
+      if (handle.isTerminal()) {
+        if (registry.evicted(handle.agentId) || !handle._child) {
+          // 信已经投进收件箱了，但这个收件箱再也不会被读 —— 排空掉，否则它会一直
+          // 计在 mailbox.size() 里，看起来像"待送达"。
+          mailbox.drain(handle.agentId)
+          return `Error: agent ${handle.name} already finished (${handle.state}) and its context has been `
+            + 'evicted. Start a new agent instead.'
+        }
+        return runtime._resume(handle)
+      }
+      return `delivered to ${handle.name}; it will read this at its next round boundary.`
+    },
+
+    /**
+     * 解析收信人。`main` 恒指主 agent；`parent` 指**发信人自己的上级**（depth 1 的
+     * agent 那就是 main，与 `main` 等价；depth 2 的 agent 则是派出它的那个 agent，
+     * 而不是越级到 main）。其余按 agentId / name 查注册表。
+     */
+    _resolveTarget(to, from) {
+      if (to === 'main') return 'main'
+      if (to === 'parent') return registry.get(from?.agentId)?.parentAgentId ?? 'main'
+      return registry.get(to)?.agentId ?? null
+    },
+
+    /** 向已结束的 agent 发消息 = 用它保留的 memory 续跑一轮。 */
+    async _resume(handle) {
+      const pending = mailbox.drain(handle.agentId)
+      const text = pending.map(env => mailbox.formatForInjection(env)).join('\n\n')
+      // 这里**故意**绕过 handle.transition() —— 状态机不允许离开终态（那是为了
+      // 拦住并发路径上的非法迁移），而续跑是主 agent 明确要求的、单线程的复活。
+      const from = handle.state
+      // 新 AbortController：旧的那个多半已经 abort 过（或已随上一轮结束作废），
+      // 复用它会让续跑期间的 agent_cancel 打空 —— abort 一个已 abort 的 controller
+      // 什么都不会发生。
+      handle._abort = new AbortController()
+      handle.state = 'running'
+      handle.endedAt = null
+      emit('agent.state', {
+        agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
+        from, to: 'running',
+      })
+      try {
+        const reply = await handle._child.chat(text, { signal: handle._abort.signal })
+        return runtime._settleResume(handle, { status: 'succeeded', text: reply })
+      } catch (err) {
+        return runtime._settleResume(handle, {
+          status: 'failed', failureKind: classifyFailure(err), lastError: String(err?.message ?? err),
+        })
+      }
+    },
+
+    /**
+     * 给续跑收尾。同样绕过状态机，但**取消优先**：`agent_cancel` 若在续跑期间把
+     * handle 转成了 cancelled，那是一次显式的终态，不能被续跑的结果覆盖成
+     * succeeded —— 这与 `runner._finishSucceeded` / `_finishFailed` 让位给
+     * `_finishCancelled` 是同一条规则。
+     */
+    _settleResume(handle, result) {
+      if (handle.state === 'cancelled') {
+        handle.result = {
+          status: 'cancelled', failureKind: 'aborted', lastError: handle._cancelReason ?? 'cancelled',
+        }
+      } else {
+        handle.state = result.status
+        handle.result = result
+        emit('agent.state', {
+          agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
+          from: 'running', to: result.status,
+        })
+      }
+      handle.endedAt = Date.now()
+      return runner.formatResult(handle)
+    },
 
     hasPending() {
       return inflight.size > 0 || registry.list().length > 0

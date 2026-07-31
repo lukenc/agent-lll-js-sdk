@@ -172,7 +172,26 @@ export class SubagentRunner {
     } else if (parentHooks.onAskUser) {
       hooks.onAskUser = parentHooks.onAskUser
     }
+    if (this.mailbox) hooks.onRoundStart = () => this._deliverMail(handle)
     return hooks
+  }
+
+  /**
+   * 轮边界收件：把这个 agent 收件箱里的信封排进它自己的待注入队列。
+   *
+   * 挂在 `onRoundStart` 上而不是在工具执行中间投递 —— `Agent` 每轮先调
+   * `onRoundStart` 再 `_drainPendingInjections()`，所以这里 enqueue 的消息在**同一轮**
+   * 就会落进 memory，且落点一定在上一轮的 `assistant(tool_calls)` 与其全部 `tool`
+   * 结果之后（那个配对不变量是裁剪逻辑的前提）。
+   *
+   * 子 agent 实例还没造好（或是不支持注入的测试替身）时**不排空** —— 排空了信就丢了。
+   */
+  _deliverMail(handle) {
+    const child = handle._child
+    if (!child || typeof child.enqueueMessage !== 'function') return
+    for (const envelope of this.mailbox.drain(handle.agentId)) {
+      child.enqueueMessage({ role: 'user', content: this.mailbox.formatForInjection(envelope) })
+    }
   }
 
   /**
