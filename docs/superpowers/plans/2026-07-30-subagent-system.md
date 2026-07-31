@@ -5540,6 +5540,16 @@ test('keepAlive: false 时 hasPending 不影响收尾', async () => {
   assert.strictEqual(agent.subagents.keepAlive, false)
 })
 
+test('已完成的后台 agent 留下的通知不会被漏读（顺序回归）', async () => {
+  // 回归测试：_keepAliveOnce 曾先查 hasPending() 再查 _pendingInjections。
+  // 后台 agent 跑完后 hasPending() 为 false，于是 return 'idle'、本轮收尾，
+  // 而它的完成通知还在队列里 —— "跑完就通知你"直接失效。
+  const agent = new Agent({ ...baseOpts, subagents: {} })
+  assert.strictEqual(agent.subagents.hasPending(), false, '前置条件：没有在跑的 agent')
+  agent.enqueueMessage({ role: 'user', content: '<agent-notification>done</agent-notification>' })
+  assert.strictEqual(await agent._keepAliveOnce(), 'injected')
+})
+
 test('keep-alive 超时置 lastKeepAliveTimedOut 且 lastStopReason 仍是 completed', async () => {
   const agent = new Agent({ ...baseOpts, subagents: { keepAliveTimeoutMs: 10 } })
   const events = []
@@ -5621,8 +5631,12 @@ test('lastStopReason 的取值集合没有扩张', () => {
    */
   async _keepAliveOnce({ signal } = {}) {
     if (!this.subagents || this.subagents.keepAlive === false) return 'idle'
-    if (!this.subagents.hasPending()) return 'idle'
+    // 待注入消息**先于** hasPending() 判断 —— 顺序颠倒会丢通知：后台 agent 已经
+    // 跑完时 hasPending() 为 false，但它的完成通知还在队列里没被读。先查
+    // hasPending() 就会 return 'idle'、本轮收尾，通知一直躺到未来某轮跑到 round 1
+    // 才被排空 —— 而"跑完就通知你"正是这套机制存在的唯一理由。
     if (this._pendingInjections.length > 0) return 'injected'
+    if (!this.subagents.hasPending()) return 'idle'
 
     const startedAt = performance.now()
     const outcome = await this.subagents.nextEvent({
