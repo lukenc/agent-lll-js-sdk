@@ -5,6 +5,7 @@ import { RuntimeHistory } from '../runtime-history.js'
 import { createSubagentRuntime } from './runtime.js'
 import { resetAgentTypes } from './types.js'
 import { Agent } from '../agent.js'
+import { resetBaseTools } from '../tool-filter.js'
 
 const envelope = (to, body, from = { agentId: 'agt_1', name: 'planner-1' }) => ({
   jsonrpc: '2.0', id: `env_${body}`, method: 'message/send',
@@ -47,6 +48,8 @@ test('main 也能收件', () => {
 // ---- send_message 的三条投递路径 ----
 
 test.beforeEach(() => resetAgentTypes())
+// 端到端那个测试造了真的 Agent，会把元工具注册进全局 BASE_TOOLS —— 收尾时还原。
+test.after(() => { resetAgentTypes(); resetBaseTools() })
 
 function fakeParent() {
   return {
