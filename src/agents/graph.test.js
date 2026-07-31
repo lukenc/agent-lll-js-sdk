@@ -110,6 +110,16 @@ test('start 时的 patch 覆盖声明期的类型与模型', () => {
   assert.strictEqual(started.node.model, 'fast')
 })
 
+test('start 被拒时不留下半个 patch', () => {
+  const { graph } = makeGraph()
+  graph.declare([n('n1', [], { subagent_type: 'general-purpose' })])
+  const rejected = graph.start('n1', { subagent_type: 'explorer' })
+  assert.strictEqual(rejected.ok, false)
+  assert.match(rejected.reason, /prompt/)
+  assert.strictEqual(graph.get('n1').subagentType, 'general-purpose')
+  assert.strictEqual(graph.get('n1').state, 'awaiting_confirm', '被拒的启动不该改状态')
+})
+
 test('上游失败：默认 block，下游停在 blocked 并标注原因', () => {
   const { graph, ready } = makeGraph()
   graph.declare([n('n1'), n('n2', ['n1'])])
