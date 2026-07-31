@@ -49,6 +49,13 @@ import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
 const INJECTION_MERGE_THRESHOLD = 5
 
 /**
+ * 允许注入的 role。`'tool'` 必须被拒 —— 一条没有 `tool_call_id` 的孤儿 tool
+ * 消息正是轮边界注入这套机制要防的破坏；`'assistant'` 也拒，伪造一轮助手发言
+ * 会让模型误以为自己说过那句话。
+ */
+const INJECTABLE_ROLES = new Set(['user', 'system'])
+
+/**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
  * that the per-run aggregation can add to them unconditionally (null-valued
  * provider usage contributes 0 per Requirement 8.6 / 8.7).
@@ -550,6 +557,9 @@ export class Agent {
   reset() {
     this.memory.clear()
     this.memory.add({ role: 'system', content: this.systemPrompt })
+    // 上一个会话的通知不该漏进新会话 —— memory 与 history 都清了，队列还留着的话，
+    // 新会话跑到 round 1 就会把陈旧通知注入进去。
+    this._pendingInjections = []
     // 动态 MCP 生命周期拆除：仅当 `_managedClients` 非空时以 fire-and-forget 方式
     // 触发 `_teardownManagedClients()`（关闭客户端、移除动态工具并取消 Base_Tool
     // 注册、清空集合）。`reset()` 保持同步返回 undefined（Req 7.2），故不 await；
@@ -1266,8 +1276,8 @@ export class Agent {
    * 而不是立刻写 —— 轮中间插消息会切断 `assistant(tool_calls)` 与其 `tool`
    * 结果的配对，`memory-policy.js` 的裁剪逻辑依赖这个不变量。
    *
-   * 非法入参（非对象 / 无 content）被静默忽略：调用方多为后台通知发送者，
-   * 抛异常会打穿它们的 fire-and-forget 路径。
+   * 非法入参（非对象 / 无 content / role 不在 `INJECTABLE_ROLES` 内）被丢弃而不
+   * 抛异常：调用方多为后台通知发送者，抛异常会打穿它们的 fire-and-forget 路径。
    *
    * @param {{ role?: string, content: string }} message
    * @returns {this}
@@ -1275,7 +1285,17 @@ export class Agent {
   enqueueMessage(message) {
     if (!message || typeof message !== 'object') return this
     if (typeof message.content !== 'string' || message.content.length === 0) return this
-    this._pendingInjections.push({ role: message.role ?? 'user', content: message.content })
+    // role 必须在白名单内。注入的消息会被直接 memory.add，一条 role:'tool' 且没有
+    // tool_call_id 的孤儿消息正是本机制要防的那类破坏 —— 而 `role ?? 'user'` 只挡
+    // null/undefined，挡不住显式传进来的 'tool'。A2A / 图调度这些外部发送方的入参
+    // 不该被当成可信输入。
+    const role = message.role ?? 'user'
+    if (!INJECTABLE_ROLES.has(role)) {
+      console.warn(`[agent] enqueueMessage: dropping message with role "${message.role}" `
+        + `(injectable roles: ${[...INJECTABLE_ROLES].join(', ')})`)
+      return this
+    }
+    this._pendingInjections.push({ role, content: message.content })
     return this
   }
 
