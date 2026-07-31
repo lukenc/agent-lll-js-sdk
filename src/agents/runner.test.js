@@ -152,6 +152,21 @@ test('重试用尽：返回结构化失败结果，不抛异常', async () => {
   assert.strictEqual(events.filter(e => e.type === 'agent.failed').length, 1)
 })
 
+test('退避期间被取消：仍然返回结构化结果，不把 AbortError 抛给父 agent', async () => {
+  // 回归测试：`await sleep(delayMs, signal)` 曾直接放在 catch 块里，signal 在
+  // 退避中途 abort 时 sleep 的 rejection 会穿透 run()，违反"run() 永不 throw"
+  // 的契约 —— 而退避正是系统看起来卡住、用户最可能按取消的时刻。
+  const rateLimited = () => { throw Object.assign(new Error('429 Too Many Requests'), { status: 429 }) }
+  const { runner, registry } = makeRunner([rateLimited], { retry: { maxAttempts: 3, backoffMs: () => 50 } })
+  const handle = makeHandle(registry)
+  const ac = new AbortController()
+  setTimeout(() => ac.abort(), 10)
+  const out = await runner.run(handle, { prompt: 'p', signal: ac.signal })
+  assert.match(out, /^\[agent:general-purpose-1 failed\]/m)
+  assert.ok(out.includes('failureKind=aborted'), '退避中途取消应归类为 aborted')
+  assert.strictEqual(handle.state, 'failed')
+})
+
 test('不可重试失败：只跑一次', async () => {
   const boom = () => { throw new Error('tool blew up') }
   const { runner, registry, createAgent } = makeRunner([boom])
