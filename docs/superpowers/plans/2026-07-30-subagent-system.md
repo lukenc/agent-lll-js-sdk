@@ -1834,7 +1834,7 @@ still retrievable."
 - Test: `src/agents/artifacts.test.js`
 
 **Interfaces:**
-- Consumes: `RuntimeHistory`（`appendArtifact` / `project('artifacts')`）
+- Consumes: `RuntimeHistory`（`appendArtifact` / `project('artifacts')`）、`utf8ByteLength`（`../telemetry.js`，已存在，**不要重写一份**）
 - Produces:
   - `fnv1a32(str) -> string` —— 8 位十六进制
   - `class ArtifactTrack`，构造 `new ArtifactTrack({ sharedHistory, policy = 'warn', now })`
@@ -1968,6 +1968,7 @@ Expected: FAIL —— `Cannot find module './artifacts.js'`
  * **这是记账约定，不是强制隔离**：绕过 artifact_write、直接用 shell_exec 改
  * 文件的行为框架检测不到。需要硬保证时用 isolation: 'worktree'。
  */
+import { utf8ByteLength } from '../telemetry.js'
 
 /**
  * FNV-1a 32 位哈希，输出 8 位十六进制。
@@ -2043,7 +2044,7 @@ export class ArtifactTrack {
       kind,
       path,
       sha: content != null ? fnv1a32(content) : fnv1a32(`path:${path ?? key}`),
-      bytes: content != null ? utf8Bytes(content) : null,
+      bytes: content != null ? utf8ByteLength(content) : null,
       summary,
       supersedes: supersedes ?? (previous ? previous.artifactId : null),
       ts: this._now(),
@@ -2066,18 +2067,6 @@ export class ArtifactTrack {
     if (since != null) out = out.filter(r => r.ts >= since)
     return out.slice(0, limit).map(r => ({ ...r }))
   }
-}
-
-/** UTF-8 字节长度。与 telemetry.js 的 utf8ByteLength 同语义，这里避免跨模块耦合。 */
-function utf8Bytes(str) {
-  const s = String(str)
-  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s).length
-  let bytes = 0
-  for (const ch of s) {
-    const code = ch.codePointAt(0)
-    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
-  }
-  return bytes
 }
 ```
 
