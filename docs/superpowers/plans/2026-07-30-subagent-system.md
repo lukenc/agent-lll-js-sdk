@@ -2315,6 +2315,21 @@ test('重试用尽：返回结构化失败结果，不抛异常', async () => {
   assert.strictEqual(events.filter(e => e.type === 'agent.failed').length, 1)
 })
 
+test('退避期间被取消：仍然返回结构化结果，不把 AbortError 抛给父 agent', async () => {
+  // 回归测试：`await sleep(delayMs, signal)` 曾直接放在 catch 块里，signal 在
+  // 退避中途 abort 时 sleep 的 rejection 会穿透 run()，违反"run() 永不 throw"
+  // 的契约 —— 而退避正是系统看起来卡住、用户最可能按取消的时刻。
+  const rateLimited = () => { throw Object.assign(new Error('429 Too Many Requests'), { status: 429 }) }
+  const { runner, registry } = makeRunner([rateLimited], { retry: { maxAttempts: 3, backoffMs: () => 50 } })
+  const handle = makeHandle(registry)
+  const ac = new AbortController()
+  setTimeout(() => ac.abort(), 10)
+  const out = await runner.run(handle, { prompt: 'p', signal: ac.signal })
+  assert.match(out, /^\[agent:general-purpose-1 failed\]/m)
+  assert.ok(out.includes('failureKind=aborted'), '退避中途取消应归类为 aborted')
+  assert.strictEqual(handle.state, 'failed')
+})
+
 test('不可重试失败：只跑一次', async () => {
   const boom = () => { throw new Error('tool blew up') }
   const { runner, registry, createAgent } = makeRunner([boom])
@@ -2447,10 +2462,10 @@ export function classifyFailure(err) {
   return 'tool_error'
 }
 
+/** 默认退避：指数增长，上限 8s。可经 `opts.retry.backoffMs` 注入（测试用）。 */
 function backoffMs(attempt) {
   return Math.min(2 ** attempt * 1000, 8000)
 }
-
 export class SubagentRunner {
   constructor({
     parent, registry, artifacts, sharedHistory, aliases, opts = {}, emit = () => {},
@@ -2585,12 +2600,21 @@ export class SubagentRunner {
         const retryable = RETRYABLE_KINDS.has(kind) && attempt < maxAttempts && !signal?.aborted
         if (!retryable) break
 
-        const delayMs = backoffMs(attempt)
+        const delayMs = this._backoffMs(attempt)
         this.emit('agent.retry', {
           agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
           attempt, failureKind: kind, delayMs,
         })
-        await sleep(delayMs, signal)
+        // `sleep` 在 signal abort 时 reject。它必须被接住 —— 裸 await 会让这个
+        // rejection 穿透 run()，违反"run() 永不 throw"的契约，而退避正是系统看
+        // 起来卡住、用户最可能按取消的时刻。
+        try {
+          await sleep(delayMs, signal)
+        } catch (abortErr) {
+          lastKind = classifyFailure(abortErr)
+          lastError = String(abortErr?.message ?? abortErr)
+          break
+        }
       }
     }
 
@@ -2698,8 +2722,13 @@ export class SubagentRunner {
   /**
    * 渲染 Agent_Result（§2）。头部机器可读，正文人可读 —— 主 agent 的后续决策
    * 完全依赖这个头部。
+   *
+   * `text` 缺省时回落到 `handle.result.text`：单参数形式 `formatResult(handle)`
+   * 属于声明的接口（Task 8 的 agent_status 之类要重新渲染一个已 settle 的
+   * handle），若只默认成空串就会静默丢掉子 agent 的整份报告。
    */
-  formatResult(handle, { text = '', records = null } = {}) {
+  formatResult(handle, { text, records = null } = {}) {
+    const body = text ?? handle.result?.text ?? ''
     const rows = records ?? this.artifacts?.list?.({ agentId: handle.agentId }) ?? []
     const artifactLine = rows.length > 0
       ? rows.map(r => `${r.key} (sha:${r.sha}${r.attempt > 1 ? `, attempt=${r.attempt}` : ''})`).join(' · ')
@@ -2712,7 +2741,7 @@ export class SubagentRunner {
         `[agent:${handle.name} succeeded] type=${handle.type} model=${handle.model?.alias ?? 'inherited'} `
         + `attempts=${handle.attempt} rounds=${m.rounds}`,
         `usage: in=${usage.input_tokens ?? 0} out=${usage.output_tokens ?? 0}  wall=${(m.wallClockMs / 1000).toFixed(1)}s`,
-        text,
+        body,
       ]
       if (artifactLine) lines.push(`--- artifacts (${rows.length}) ---`, artifactLine)
       if (handle.isolation?.dirty) {
