@@ -129,6 +129,14 @@ export function createSubagentRuntime({
     async close() {
       for (const handle of registry.list()) {
         if (!handle.isTerminal()) {
+          // 先 abort 再打标记：只 transition('cancelled') 不 abort 的话，在跑的
+          // 后台 subagent 会继续跑到自然结束（drain 也就一直等着），而它结束时
+          // 的 transition('succeeded') 从终态出发是非法迁移，被重试循环捕获后
+          // 又被翻译成一次失败 —— handle 最终 state=cancelled 而
+          // result.status=failed，自相矛盾。abort 不带 reason，好让子 agent 侧
+          // 抛出的是标准 AbortError（failureKind 因此归类为 aborted）；取消原因
+          // 走下面的事件 payload。
+          handle._abort?.abort()
           handle.transition('cancelled')
           emit('agent.cancelled', {
             agentId: handle.agentId, agentName: handle.name,
