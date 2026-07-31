@@ -116,7 +116,12 @@ export function createSubagentTools(runtime) {
         // 这个工具自己的 description 说"reports as cancelled"就成了假话
         // （state 最终落在 failed）。cancelHandle 同时也是 runtime.close() 用的
         // 同一条路径，两者对 abort() 的用法不再分叉。
-        cancelHandle(handle, { reason, emit: (type, payload) => runtime.parent.emit(type, payload) })
+        cancelHandle(handle, {
+          reason,
+          emit: (type, payload) => runtime.parent.emit(type, payload),
+          // 它若正阻塞在 ask_user 上，光 abort 是叫不停的 —— 见 cancelHandle。
+          ask: runtime.ask,
+        })
         return `agent ${handle.name} cancellation requested (${reason}).`
       },
     },

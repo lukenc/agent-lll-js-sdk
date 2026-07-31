@@ -9,6 +9,7 @@ import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
 import { createSubagentTools } from './tools.js'
 import { Mailbox } from './mailbox.js'
+import { AskRegistry } from './ask.js'
 import { resolveA2ATransport, newEnvelopeId } from './a2a/index.js'
 // 内置 local transport 自注册的副作用 import（`a2a/index.js` 不认识它，
 // 与 `mcp/transports/*` 同一套路）。
@@ -25,6 +26,7 @@ export function createSubagentRuntime({
   artifacts: artifactOpts = {},
   retainCompleted = 20,
   a2a = {},
+  ask: askOpts = {},
   createAgent,
 } = {}) {
   for (const type of types) registerAgentType(type)
@@ -41,11 +43,46 @@ export function createSubagentRuntime({
   const mailbox = new Mailbox()
   const transport = resolveA2ATransport({ ...a2a, transport: a2a.transport ?? 'local', mailbox, registry })
 
+  /**
+   * 多路提问路由。全部提问（main 自己的与每个 subagent 的）共用这一个登记表，
+   * 因此主机拿到的 `pendingQuestions()` 是一张跨 agent 的全局待答清单。
+   *
+   * `onQuestion` 把主机的 `hooks.onAskUser` 接进来 —— 也就是说 subagent 的提问
+   * 同样会送到主机 hook（带上子 agent 的归属 meta），而不只是躺在登记表里等一个
+   * 恰好在轮询 `pendingQuestions()` 的 UI。每次读 `parent.hooks` 而不是在这里
+   * 捕获一份，主机在构造之后改 hooks 也能生效。
+   */
+  const ask = new AskRegistry({
+    timeoutMs: askOpts.timeoutMs ?? null,
+    emit,
+    onStateChange: (agentId, waiting) => {
+      const handle = registry.get(agentId)
+      // `main` 不在注册表里（它是父 Agent 自己），没有 handle 要迁移。
+      if (!handle || handle.isTerminal()) return
+      const to = waiting ? 'waiting_input' : 'running'
+      if (handle.state === to) return
+      const from = handle.state
+      try {
+        handle.transition(to)
+      } catch {
+        // 提问期间发生了别的合法迁移（例如刚被 agent_cancel 掉）时，状态可视化
+        // 让位给那个更权威的迁移 —— 一次状态标注不该把提问路径打断。
+        return
+      }
+      emit('agent.state', {
+        agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
+        from, to,
+      })
+    },
+    onQuestion: (question, meta) => parent?.hooks?.onAskUser?.(question, meta),
+  })
+
   const runner = new SubagentRunner({
     parent, registry, artifacts, sharedHistory, aliases,
     opts: { retry: { maxAttempts: retry.maxAttempts ?? 3, attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 }, maxDepth },
     emit,
     mailbox,
+    ask,
     ...(createAgent ? { createAgent } : {}),
   })
 
@@ -54,7 +91,7 @@ export function createSubagentRuntime({
 
   const runtime = {
     parent, registry, artifacts, runner, sharedHistory, aliases, defaultType, maxDepth,
-    mailbox, transport,
+    mailbox, transport, ask,
     /** 供 `Agent` 注入的工具集 */
     tools: [],
 
@@ -261,6 +298,9 @@ export function createSubagentRuntime({
     },
 
     async close() {
+      // 先取消全部待答提问：阻塞在 `ask_user` 里的 agent 必须先拿到一个结果才能
+      // 走完当前这轮，否则下面的 drain() 会等一个永远不会 settle 的 Promise。
+      ask.cancelAll('runtime closed')
       for (const handle of registry.list()) {
         if (!handle.isTerminal()) {
           // 统一走 cancelHandle：跟 agent_cancel 工具用同一条路径转态 + abort，
@@ -271,7 +311,7 @@ export function createSubagentRuntime({
           // 一个 name=AbortError 的 Error 当 reason，两条路径此后行为一致，
           // 'runtime closed' 这个人类可读理由还能顺着 lastError 一路带到
           // 渲染出的 Agent_Result 里，而不只是留在下面这个事件 payload 里。
-          cancelHandle(handle, { reason: 'runtime closed', emit })
+          cancelHandle(handle, { reason: 'runtime closed', emit, ask })
         }
       }
       await runtime.drain()
