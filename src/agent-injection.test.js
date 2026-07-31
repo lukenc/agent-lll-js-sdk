@@ -186,3 +186,37 @@ test('非法入参被忽略而不是抛异常', () => {
   agent.enqueueMessage({ role: 'user' })
   assert.strictEqual(agent._pendingInjections.length, 0)
 })
+
+test('role 白名单：tool / assistant 被拒，不会写出孤儿 tool 消息', () => {
+  // 回归测试：`role: message.role ?? 'user'` 只挡 null/undefined。显式传 'tool'
+  // 会被原样入队，drain 时直接 memory.add，产生一条没有 tool_call_id 的孤儿
+  // tool 消息 —— 正是本机制存在的理由所要防的那类破坏。
+  const agent = new Agent({ ...baseOpts })
+  agent.enqueueMessage({ role: 'tool', content: 'orphan' })
+  agent.enqueueMessage({ role: 'assistant', content: 'fake turn' })
+  assert.strictEqual(agent._pendingInjections.length, 0, 'tool / assistant 必须被拒')
+
+  agent.enqueueMessage({ role: 'user', content: 'ok' })
+  agent.enqueueMessage({ role: 'system', content: 'also ok' })
+  assert.deepStrictEqual(agent._pendingInjections.map(m => m.role), ['user', 'system'])
+})
+
+test('合并阈值边界：恰好 5 条不合并，6 条合并', async () => {
+  const five = new Agent({ ...baseOpts })
+  for (let i = 0; i < 5; i++) five.enqueueMessage({ role: 'user', content: `m${i}` })
+  assert.strictEqual(five._drainPendingInjections(), 5, '恰好 5 条应逐条写入')
+
+  const six = new Agent({ ...baseOpts })
+  for (let i = 0; i < 6; i++) six.enqueueMessage({ role: 'user', content: `m${i}` })
+  assert.strictEqual(six._drainPendingInjections(), 1, '6 条应合并为 1 条')
+  const history = await six.getHistory('model')
+  const merged = history[history.length - 1]
+  for (let i = 0; i < 6; i++) assert.ok(String(merged.content).includes(`m${i}`))
+})
+
+test('reset() 清空待注入队列，旧会话的通知不漏进新会话', () => {
+  const agent = new Agent({ ...baseOpts })
+  agent.enqueueMessage({ role: 'user', content: '<agent-notification>stale</agent-notification>' })
+  agent.reset()
+  assert.strictEqual(agent._pendingInjections.length, 0)
+})
