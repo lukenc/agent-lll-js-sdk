@@ -24,7 +24,7 @@
 
 - **不实现远程 transport**。A2A 协议与 transport 注册表完整定义，v1 只实现进程内 `local`；`isolation: 'remote'` 返回软失败。
 - **不做沙箱**。subagent 通过主机提供的 `shell_exec` 等工具执行命令，与 skill 系统同一安全模型：主机用工具供给与 `hooks.beforeToolCall` 自行管控。
-- **不做 Task Contract 的结构化校验**。契约是自然语言，写在 `prompt` 里，靠工具 description 引导，不做字段拆解、不做"单一性"启发式检查。
+- **不做 Task Contract 的结构化校验**。契约是自然语言，完整写在入参 `prompt` 里，靠 `agent` 工具自身的 `Tool_Def.description` 引导模型写全，不做字段拆解、不做"单一性"启发式检查。
 - **不改 `memory.js` / `tool.js` / `context-manager.js` / `plan-and-execute.js`**。
 - **不为 `plan_and_execute` 策略注入 agent 类型清单**（与 skill 系统同一既有限制，见 §16）。
 
@@ -60,7 +60,7 @@
   agentId: 'agt_7f3a9c21',        // 稳定唯一 id
   name: 'general-purpose-1',      // 人可读名，重名加 _2/_3 后缀
   type: 'general-purpose',
-  description: 'Audit auth flow',  // agent 工具入参的 description 原文
+  description: 'Audit auth flow',  // 入参 description 原文（3-8 词标签，非任务内容）
   parentAgentId: 'main' | 'agt_...',
   depth: 1,                        // 主 agent = 0
   nodeId: null | 'n1',             // 来自图节点则非空
@@ -203,7 +203,7 @@ path=.worktrees/agent-agt_7f3a9c21 branch=subagent/agt_7f3a9c21 changed=3 files 
 | `agents/index.js` | barrel 导出 |
 | `agents/errors.js` | `SubagentError` / `AgentTypeError` / `AgentGraphError` / `A2AError` / `WorktreeIsolationError`；构造函数只接受白名单标量字段（照 `mcp/errors.js`，防 apiKey 泄进 `err.message`） |
 | `agents/types.js` | Agent_Type 注册表：`registerAgentType` / `getAgentType` / `listAgentTypes` / `unregisterAgentType` / `resetAgentTypes`；内置 `general-purpose` 保留 |
-| `agents/contract.js` | `agent` 工具 description 正文常量 + 把 `{ description, prompt, inputs }` 渲染成子 agent 首条 user 消息 |
+| `agents/contract.js` | `agent` 工具的 `Tool_Def.description` 常量（引导模型把完整契约写进入参 `prompt`）+ 把 `{ description, prompt, inputs }` 渲染成子 agent 首条 user 消息 |
 | `agents/handle.js` | `AgentHandle` 与状态机迁移校验 |
 | `agents/registry.js` | agentId / name 分配（重名 `_2` 后缀，复用 `mcp/namespace.js` 的去重思路）、按 id/name 查（重名时最新者胜）、并发槽位记账、完成态 LRU 保留 |
 | `agents/runner.js` | 造子 `Agent`、跑、按 failureKind 重试、产出 `Agent_Result`、转发遥测 |
@@ -318,8 +318,13 @@ Available agent types for the `agent` tool:
 }
 ```
 
-- `description`：3-8 词短描述，用途是列表显示、agent 命名、日志。**不承载任务内容**。
-- `prompt`：**完整 Task Contract 所在**，自然语言。工具 description 正文明确要求它自带：单一明确的目标；必要背景（子 agent 不继承对话历史）；期望产物的形态与落点；验收标准；约束与禁止事项。并提示：项目知识可以让子 agent 用 `history_search` 或读项目 md 自行找回。
+> **术语消歧（全文通用）**：`agent` 工具涉及两个都叫 "description" 的东西，本文严格区分：
+> - **入参 `description`** —— 模型每次调用时填的那个字段。**3-8 词的短描述，只是给这个 subagent 起的一个标签**，用于 `agent_status` 列表显示、agent 命名、日志与事件。**它不承载任何任务内容。**
+> - **`Tool_Def.description`** —— `agent` 这个工具自身的说明文字（模型在工具列表里读到的那一段，`formatToolsForOpenAI` 输出的 `function.description`）。本文一律写作 `Tool_Def.description`，绝不简称 "description"。
+
+- **入参 `description`**：3-8 词短标签。用途仅限列表显示、agent 命名、日志。**不写任务内容、不写契约。**
+- **入参 `prompt`**：**Task Contract 的唯一所在**，纯自然语言，由主 agent 一次性写全。子 agent 看到的就是这段文字，它没有别的信息来源。
+- 这两个字段的边界由 `Tool_Def.description`（即 §3 的 `agents/contract.js` 里那段常量）向模型讲清楚。该常量必须要求 `prompt` 自带：单一明确的目标；必要背景（子 agent 不继承对话历史）；期望产物的形态与落点；验收标准；约束与禁止事项。并提示：项目知识可以让子 agent 用 `history_search` 或读项目 md 自行找回。
 - `model` 的 enum 在注入时由 `subagents.modelAliases` 的键生成（§10）。
 - `run_in_background` 默认 `true`。
 - `isolation` 见 §11。
@@ -409,7 +414,7 @@ blocked ──上游 failed & 'block'（默认）──> 保持 blocked，在 ag
 ```
 
 - **惰性创建**：只有进入 `queued` 才分配 `AgentHandle`、才构造子 `Agent` 实例。`blocked` / `ready` / `awaiting_confirm` 节点不占任何运行时资源。
-- **就绪确认（默认路径）**：节点转 `awaiting_confirm` 时，emit `graph.node.ready` 并向主 agent 注入一条通知，内容含：节点 id、原始 description、全部上游 `Agent_Result` 的头部行、上游产物 key 列表。主 agent 随后 `graph_start`（可完全重写 prompt / 换类型 / 换模型）或 `agent_cancel`。这是"到了再创建、决策可变"的落点。
+- **就绪确认（默认路径）**：节点转 `awaiting_confirm` 时，emit `graph.node.ready` 并向主 agent 注入一条通知，内容含：节点 id、声明时的入参 `description` 标签、全部上游 `Agent_Result` 的头部行、上游产物 key 列表。主 agent 随后 `graph_start`（在那里才写出该节点最终的 `prompt` 契约，也可换类型 / 换模型）或 `agent_cancel`。这是"到了再创建、决策可变"的落点。
 - **并发**：全局 `maxConcurrent`（默认 4）与图级 `max_concurrent` 取较小值。超额节点停在 `queued`，有槽即按声明顺序放行。同步 `agent` 调用（`run_in_background: false`）同样排队等槽，其间父 agent 的该轮工具调用一直挂起。
 - **并发槽按 depth 分层计数** —— 这是必须的，否则会死锁：若全局共用一个槽池，`maxConcurrent: 4` 的情况下 4 个 depth 1 的 agent 各自同步派一个 depth 2 的孙 agent，4 个槽全被父辈占着，孙辈永远等不到槽，而父辈又在等孙辈返回。每个 depth 维护独立的 `maxConcurrent` 槽池，跨层不争用，死锁在结构上不可能发生。图级 `max_concurrent` 只约束该图所在的那一层。
 - **失败传播**：默认 `block`，即下游不自动取消也不自动启动，等主 agent 定夺 —— 与"框架不自作主张"一致。
@@ -453,7 +458,7 @@ modelAliases: {
 
 `agent` / `graph_start` 的 `model` 参数 enum 在工具注入时由别名表的键生成，形状恒为 `{ type: 'string', enum: [...] }`。每个别名可独立指定 `provider` / `apiKey` / `url`，因此快模型可跨供应商。未指定 `model` → 用 `Agent_Type.model` → 未定义则继承父模型。
 
-工具 description 内含难易度指导：**机械、可枚举、结果易验证的任务用快模型；需要设计判断、跨文件推理、或产出会被直接采纳的任务用主力模型。** 判断权在主 agent，框架不做二次裁决（不额外起 sidecar 判难度 —— 主 agent 本来就在读上下文，它比 sidecar 更清楚这个任务有多重要）。
+`agent` 的 `Tool_Def.description` 内含难易度指导：**机械、可枚举、结果易验证的任务用快模型；需要设计判断、跨文件推理、或产出会被直接采纳的任务用主力模型。** 判断权在主 agent，框架不做二次裁决（不额外起 sidecar 判难度 —— 主 agent 本来就在读上下文，它比 sidecar 更清楚这个任务有多重要）。
 
 ## 11. worktree 隔离
 
