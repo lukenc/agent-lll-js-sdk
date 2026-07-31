@@ -1119,6 +1119,23 @@ test('agentId 唯一，name 按类型递增', () => {
   assert.match(a.agentId, /^agt_[0-9a-f]{8}$/)
 })
 
+test('突发创建不产生 agentId 碰撞（时钟静止也不行）', () => {
+  // 回归测试：曾用 (now() & 0xffffff) * 256 + (SEQ & 0xff) 生成 id，只给计数器
+  // 留 8 位 —— 同一毫秒内第 257 个 agent 静默覆盖第 1 个，`_byId` 里早先那个
+  // handle 再也查不到且不报错。图调度器一次物化多个节点就能触发。
+  const r = new AgentRegistry({ now: () => 1700000000000 })
+  const ids = new Set()
+  const handles = []
+  for (let i = 0; i < 1000; i++) {
+    const h = r.create(base)
+    ids.add(h.agentId)
+    handles.push(h)
+  }
+  assert.strictEqual(ids.size, 1000, 'agentId 必须互不相同')
+  assert.strictEqual(r.list({ includeFinished: true }).length, 1000, '不能有 handle 被静默覆盖')
+  for (const h of handles) assert.strictEqual(r.get(h.agentId), h)
+})
+
 test('不同类型各自计数', () => {
   const r = new AgentRegistry()
   assert.strictEqual(r.create({ ...base, type: 'explorer' }).name, 'explorer-1')
@@ -1232,11 +1249,18 @@ import { AgentHandle } from './handle.js'
 
 let SEQ = 0
 
-/** 生成 `agt_` + 8 位十六进制。进程内单调计数 + 时间低位，避免依赖 crypto。 */
-function newAgentId(now) {
+/**
+ * 生成 `agt_` + 8 位十六进制的进程内唯一 id。
+ *
+ * **纯单调计数器，不混时间位。** 混时间位的写法（`(now() & 0xffffff) * 256 +
+ * (SEQ & 0xff)`）只给计数器留 8 位，同一毫秒内第 257 个 agent 就会拿到与第 1 个
+ * 相同的 id，而 `_byId.set` 会静默覆盖 —— 早先那个 handle 从此再也查不到，且不
+ * 报任何错。图调度器一次物化多个节点就能触发。handle 自己带 `createdAt`，id 里
+ * 再编一份创建时间本就是多余的，而正是这份多余挤掉了计数器的位。
+ */
+function newAgentId() {
   SEQ = (SEQ + 1) >>> 0
-  const mixed = ((now() & 0xffffff) * 256 + (SEQ & 0xff)) >>> 0
-  return `agt_${mixed.toString(16).padStart(8, '0').slice(-8)}`
+  return `agt_${SEQ.toString(16).padStart(8, '0')}`
 }
 
 export class AgentRegistry {
@@ -1270,7 +1294,7 @@ export class AgentRegistry {
   }
 
   create({ type, description, parentAgentId = 'main', depth = 1, nodeId = null, model = null, isolation = null }) {
-    const agentId = newAgentId(this._now)
+    const agentId = newAgentId()
     const name = this.allocateName(type)
     const handle = new AgentHandle({
       agentId, name, type, description, parentAgentId, depth, nodeId, model, isolation, now: this._now,
