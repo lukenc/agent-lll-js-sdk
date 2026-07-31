@@ -136,6 +136,8 @@ test('graph_start 打未就绪节点时软失败', async () => {
   })
   const out = await tool('graph_start').execute({ node_id: 'n2', prompt: 'p' })
   assert.ok(/blocked/i.test(out))
+  assert.match(await tool('graph_start').execute({ node_id: 'n1', prompt: 42 }), /prompt/,
+    'prompt 不是字符串时要软失败，而不是把它 String() 进契约正文')
 })
 
 // ---- 状态可见性 ----
