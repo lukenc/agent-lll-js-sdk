@@ -12,6 +12,12 @@
  *
  * 本模块是纯逻辑，无 I/O：状态机、环检测、就绪集合计算。真正的 spawn / cancel
  * 由调用方（runtime 侧的 `agent_graph` / `graph_start` 工具）接线。
+ *
+ * **宿主回调一律隔离**：`onReadyNode` / `onAutoStart` / `emit` 都是宿主代码，都会
+ * 因为普通原因抛异常（通知入队失败、spawn 失败……）。一次 tick 里往往有一批节点
+ * 同时就绪，所以一个回调抛出去绝不能中断这一轮遍历 —— 否则同批还没访问到的兄弟
+ * 节点会永久留在 blocked，而且没有任何东西会再来 tick 它们，图就卡死了。
+ * 见 `_invoke` / `_emit`。
  */
 import { AgentGraphError } from './errors.js'
 
@@ -208,6 +214,8 @@ export class AgentGraph {
         blockedReason: null,
         agentId: null,
         result: null,
+        /** 宿主回调抛出的异常消息（`_invoke` 记的），失败原因的人类可读部分。 */
+        error: null,
         declaredAt: this._now(),
       })
       stagedIds.add(nodeId)
@@ -235,7 +243,7 @@ export class AgentGraph {
     for (const node of staged) this.nodes.set(node.nodeId, node)
     if (maxConcurrent != null) this.maxConcurrent = maxConcurrent
     const accepted = staged.map(n => n.nodeId)
-    this.emit('graph.declared', { accepted: [...accepted], total: this.nodes.size })
+    this._emit('graph.declared', { accepted: [...accepted], total: this.nodes.size })
     this.tick()
     return { accepted }
   }
@@ -262,13 +270,13 @@ export class AgentGraph {
           if (node.onUpstreamFailure === 'skip') {
             node.state = 'skipped'
             node.blockedReason = reason
-            this.emit('graph.node.skipped', { nodeId: node.nodeId, reason, upstreamNodeId: dead.nodeId })
+            this._emit('graph.node.skipped', { nodeId: node.nodeId, reason, upstreamNodeId: dead.nodeId })
             progressed = true   // 继续向下传播
             continue
           }
           if (node.blockedReason !== reason) {
             node.blockedReason = reason
-            this.emit('graph.node.blocked', { nodeId: node.nodeId, reason, upstreamNodeId: dead.nodeId })
+            this._emit('graph.node.blocked', { nodeId: node.nodeId, reason, upstreamNodeId: dead.nodeId })
           }
           continue
         }
@@ -280,17 +288,57 @@ export class AgentGraph {
         progressed = true
         if (node.onReady === 'auto') {
           node.state = 'queued'
-          this.emit('graph.node.auto_start', { nodeId: node.nodeId })
-          this.onAutoStart(snapshot(node), upstreamView)
+          this._emit('graph.node.auto_start', { nodeId: node.nodeId })
+          const failure = this._invoke(this.onAutoStart, 'onAutoStart', node, upstreamView)
+          if (failure != null) {
+            node.error = failure
+            // 只有节点**还停在 queued** 时才算启动失败 —— 那说明回调连"起来了"
+            // 都没来得及报，再没人会启动它；停在 queued 的话，从图外面看跟"正在
+            // 正常运行"一模一样，图会永远等一个根本没起来的 agent。
+            //
+            // 反过来，如果回调已经报过 running（agent 真起来了）之后才抛，那 agent
+            // 还在跑，会自己走到终态 —— 这时强行标 failed 会让图跟现实脱节。
+            if (node.state === 'queued') {
+              node.state = 'failed'
+              node.blockedReason = 'launch_failed'
+            }
+          }
         } else {
           node.state = 'awaiting_confirm'
-          this.emit('graph.node.ready', {
+          this._emit('graph.node.ready', {
             nodeId: node.nodeId,
             upstream: upstreamView.map(u => ({ nodeId: u.nodeId, agentId: u.agentId, state: u.state })),
           })
-          this.onReadyNode(snapshot(node), upstreamView)
+          // 这里丢掉的只是"通知"，节点本身确实已经就绪 —— 留在 awaiting_confirm，
+          // 主 agent 仍能从 statusTable() / agent_status 里发现它并 start()。
+          const failure = this._invoke(this.onReadyNode, 'onReadyNode', node, upstreamView)
+          if (failure != null) node.error = failure
         }
       }
+    }
+  }
+
+  /**
+   * 调一个宿主回调，异常不外泄。
+   * @returns {string|null} null = 正常；否则是异常消息（已记到节点上并发了事件）
+   */
+  _invoke(fn, name, node, upstreamView) {
+    try {
+      fn.call(this, snapshot(node), upstreamView)
+      return null
+    } catch (err) {
+      const message = err?.message ? String(err.message) : String(err)
+      this._emit('graph.callback.error', { nodeId: node.nodeId, callback: name, error: message })
+      return message
+    }
+  }
+
+  /** 发事件。遥测出口炸了不该拖垮调度，所以这里也吞异常。 */
+  _emit(type, payload) {
+    try {
+      this.emit(type, payload)
+    } catch {
+      // 没有别的地方可以上报了：emit 本身就是上报通道。
     }
   }
 
@@ -321,7 +369,7 @@ export class AgentGraph {
     if (patch.subagent_type) node.subagentType = patch.subagent_type
     if (patch.model) node.model = patch.model
     node.state = 'queued'
-    this.emit('graph.node.started', { nodeId: node.nodeId, subagentType: node.subagentType })
+    this._emit('graph.node.started', { nodeId: node.nodeId, subagentType: node.subagentType })
     return { ok: true, node: snapshot(node) }
   }
 
@@ -333,18 +381,19 @@ export class AgentGraph {
    * 一次终态，不能让它把 cancelled 覆盖掉、把下游从一条已取消的分支上放出去。
    */
   onAgentSettled({ nodeId, state, agentId = null, result = null } = {}) {
-    const node = this.nodes.get(nodeId)
-    if (!node) return
+    // state 先校验：不认识的状态是编程错误，跟节点在不在图里无关。
     if (!REPORTABLE_STATES.has(state)) {
       throw new AgentGraphError(
         `agent_graph: cannot report unknown agent state "${state}" for node "${nodeId}"`, { nodeId })
     }
+    const node = this.nodes.get(nodeId)
+    if (!node) return
     // agentId 是身份不是状态，先记下来：终态节点也允许迟到的回报补上它。
     if (agentId != null) node.agentId = agentId
     if (GRAPH_TERMINAL_STATES.has(node.state)) return
     node.state = state
     if (result != null) node.result = result
-    this.emit('graph.node.settled', { nodeId: node.nodeId, state, agentId: node.agentId })
+    this._emit('graph.node.settled', { nodeId: node.nodeId, state, agentId: node.agentId })
     this.tick()
   }
 
@@ -365,7 +414,7 @@ export class AgentGraph {
     const previousState = node.state
     node.state = 'cancelled'
     node.blockedReason = reason
-    this.emit('graph.node.cancelled', { nodeId: node.nodeId, reason, previousState, agentId: node.agentId })
+    this._emit('graph.node.cancelled', { nodeId: node.nodeId, reason, previousState, agentId: node.agentId })
     this.tick()
     return { ok: true, agentId: node.agentId, previousState }
   }
@@ -384,7 +433,8 @@ export class AgentGraph {
     const rows = [...this.nodes.values()].map((node) => {
       const deps = node.dependsOn.length > 0 ? ` deps=[${node.dependsOn.join(',')}]` : ''
       const why = node.blockedReason ? ` (${node.blockedReason})` : ''
-      return `${node.nodeId} [${node.state}]${why}${deps} — ${node.description}`
+      const error = node.error ? ` error: ${node.error}` : ''
+      return `${node.nodeId} [${node.state}]${why}${deps} — ${node.description}${error}`
     })
     const header = this.maxConcurrent != null ? [`graph (maxConcurrent=${this.maxConcurrent})`] : []
     return [...header, ...rows].join('\n')
@@ -404,6 +454,7 @@ function snapshot(node) {
     onUpstreamFailure: node.onUpstreamFailure,
     state: node.state,
     blockedReason: node.blockedReason,
+    error: node.error,
     agentId: node.agentId,
     result: node.result,
     declaredAt: node.declaredAt,

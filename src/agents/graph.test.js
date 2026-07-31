@@ -229,3 +229,102 @@ test('终态节点不会被迟到的 settle 复活', () => {
   assert.strictEqual(graph.get('n2').state, 'blocked')
   assert.strictEqual(graph.get('n2').blockedReason, 'upstream_cancelled')
 })
+
+test('回报不认识的 agent 状态会抛错，且不把节点写坏', () => {
+  const { graph } = makeGraph()
+  graph.declare([n('n1')])
+  graph.start('n1', { prompt: 'p' })
+  assert.throws(() => graph.onAgentSettled({ nodeId: 'n1', state: 'finished' }),
+    (err) => err instanceof AgentGraphError && /finished/.test(err.message))
+  assert.strictEqual(graph.get('n1').state, 'queued', '抛错前后节点状态不变')
+  // 不认识的 state 跟节点在不在图里无关，一样抛
+  assert.throws(() => graph.onAgentSettled({ nodeId: 'ghost', state: 'finished' }), AgentGraphError)
+  // 但认识的 state 落在未知节点上只是忽略（图可能已经被清掉了）
+  assert.doesNotThrow(() => graph.onAgentSettled({ nodeId: 'ghost', state: 'succeeded' }))
+})
+
+test('onReadyNode 抛异常不会拖死同一次 tick 里的兄弟节点', () => {
+  const seen = []
+  const events = []
+  const graph = new AgentGraph({
+    onReadyNode: (node) => {
+      seen.push(node.nodeId)
+      if (node.nodeId === 'n1') throw new Error('通知入队失败')
+    },
+    onAutoStart: () => {},
+    emit: (type, payload) => events.push({ type, payload }),
+  })
+  graph.declare([n('n1'), n('n2'), n('n3')])
+
+  assert.deepStrictEqual(seen, ['n1', 'n2', 'n3'], '第一个回调炸了，后面的兄弟节点必须照样处理')
+  // 丢的只是通知：节点确实已经就绪，主 agent 还能自己发现并启动它
+  assert.strictEqual(graph.get('n1').state, 'awaiting_confirm')
+  assert.strictEqual(graph.get('n1').error, '通知入队失败')
+  assert.strictEqual(graph.start('n1', { prompt: 'p' }).ok, true)
+  assert.match(graph.statusTable(), /通知入队失败/)
+  const errorEvent = events.find(e => e.type === 'graph.callback.error')
+  assert.strictEqual(errorEvent.payload.callback, 'onReadyNode')
+  assert.strictEqual(errorEvent.payload.nodeId, 'n1')
+})
+
+test('onAutoStart 抛异常：该节点按启动失败处理，兄弟与下游都不被卡住', () => {
+  const seen = []
+  const graph = new AgentGraph({
+    onReadyNode: () => {},
+    onAutoStart: (node) => {
+      seen.push(node.nodeId)
+      if (node.nodeId === 'a1') throw new Error('spawn 失败')
+    },
+  })
+  graph.declare([
+    n('a1', [], { on_ready: 'auto', prompt: 'p' }),
+    n('a2', [], { on_ready: 'auto', prompt: 'p' }),
+    n('downBlock', ['a1']),
+    n('downSkip', ['a1'], { on_upstream_failure: 'skip' }),
+  ])
+
+  assert.deepStrictEqual(seen, ['a1', 'a2'], 'a1 炸了不能连累 a2')
+  // queued 但没人会启动它 = 从外面看跟"跑得正常"一样，图会永远等它，所以算失败
+  assert.strictEqual(graph.get('a1').state, 'failed')
+  assert.strictEqual(graph.get('a1').blockedReason, 'launch_failed')
+  assert.strictEqual(graph.get('a1').error, 'spawn 失败')
+  assert.strictEqual(graph.get('a2').state, 'queued')
+  // 启动失败沿用上游失败的既有传播规则
+  assert.strictEqual(graph.get('downBlock').state, 'blocked')
+  assert.strictEqual(graph.get('downBlock').blockedReason, 'upstream_failed')
+  assert.strictEqual(graph.get('downSkip').state, 'skipped')
+  assert.match(graph.statusTable(), /launch_failed/)
+})
+
+test('onAutoStart 已经报过 running 之后才抛 → 节点不算启动失败', () => {
+  const graph = new AgentGraph({
+    onReadyNode: () => {},
+    onAutoStart: (node) => {
+      // agent 真起来了，回调是在这之后的收尾环节炸的
+      graph.onAgentSettled({ nodeId: node.nodeId, state: 'running', agentId: 'agt_1' })
+      throw new Error('登记 artifact 失败')
+    },
+  })
+  graph.declare([n('a1', [], { on_ready: 'auto', prompt: 'p' })])
+  assert.strictEqual(graph.get('a1').state, 'running', 'agent 在跑，图不能跟现实脱节')
+  assert.strictEqual(graph.get('a1').agentId, 'agt_1')
+  assert.strictEqual(graph.get('a1').error, '登记 artifact 失败', '异常仍要留痕')
+  // 它照常走到终态
+  graph.onAgentSettled({ nodeId: 'a1', state: 'succeeded', result: '干完了' })
+  assert.strictEqual(graph.get('a1').state, 'succeeded')
+  assert.strictEqual(graph.hasPending(), false)
+})
+
+test('emit 抛异常也不会拖死调度', () => {
+  const ready = []
+  const graph = new AgentGraph({
+    onReadyNode: (node) => ready.push(node.nodeId),
+    onAutoStart: () => {},
+    emit: () => { throw new Error('遥测总线炸了') },
+  })
+  assert.doesNotThrow(() => graph.declare([n('n1'), n('n2', ['n1'])]))
+  assert.deepStrictEqual(ready, ['n1'])
+  graph.start('n1', { prompt: 'p' })
+  assert.doesNotThrow(() => graph.onAgentSettled({ nodeId: 'n1', state: 'succeeded' }))
+  assert.strictEqual(graph.get('n2').state, 'awaiting_confirm', '下游照样被放行')
+})
