@@ -95,7 +95,9 @@ test('无 system 消息时类型清单不丢失', () => {
 test('未配置 subagents 时 _withSubagentTypesNote 原样返回', () => {
   const agent = new Agent({ ...baseOpts })
   const input = [{ role: 'system', content: 'sys' }]
-  assert.deepStrictEqual(agent._withSubagentTypesNote(input), input)
+  // strictEqual 而非 deepStrictEqual：未配置时连数组都不该复制一份，
+  // 这样每轮消息组装的开销与旧版本逐字节一致。
+  assert.strictEqual(agent._withSubagentTypesNote(input), input)
 })
 
 test('工具执行 ctx 带上 agentId / depth，且不影响既有工具', async () => {
@@ -133,11 +135,69 @@ test('工具执行 ctx 带上 agentId / depth，且不影响既有工具', async
   }
 })
 
+/**
+ * 造一个装了"只有被 abort 才会结束的假子 agent"的 Agent，并派一个后台 subagent。
+ * 若 `close()` 只打 cancelled 标记不 abort，它内部的 drain() 就会永远等下去。
+ */
+async function spawnBlockingSubagent(extra = {}) {
+  const state = { observedAbort: false }
+  const agent = new Agent({
+    ...baseOpts,
+    subagents: {
+      createAgent: () => ({
+        lastStopReason: null,
+        on() { return this }, off() { return this },
+        getLastRunMetrics: () => null,
+        chat(_message, { signal } = {}) {
+          return new Promise((_resolve, reject) => {
+            const stop = () => {
+              state.observedAbort = true
+              const err = new Error('aborted')
+              err.name = 'AbortError'
+              reject(err)
+            }
+            if (signal?.aborted) stop()
+            else signal?.addEventListener('abort', stop, { once: true })
+          })
+        },
+      }),
+      ...extra,
+    },
+  })
+
+  const spawnTool = agent.getTools().find(t => t.name === 'agent')
+  const started = await spawnTool.execute(
+    { description: 'long job', prompt: 'run forever' },
+    { ...agent._toolContextExtra },
+  )
+  assert.match(started, /started/, `期望后台启动行，实际：${started}`)
+
+  // 让 acquireSlot / transition 的微任务跑完，确认它真的进了 running。
+  await new Promise(resolve => setImmediate(resolve))
+  const [handle] = agent.subagents.registry.list()
+  assert.strictEqual(handle.state, 'running')
+  return { agent, handle, state }
+}
+
+/** close() 挂住时给一个干净的断言失败，而不是让整个测试文件永远等下去。 */
+async function closeOrHang(agent, ms = 500) {
+  return Promise.race([
+    agent.closeSubagents().then(() => 'closed'),
+    new Promise(resolve => setTimeout(() => resolve('hung'), ms)),
+  ])
+}
+
 test('closeSubagents 取消未完成 agent 且可重复调用', async () => {
-  const agent = new Agent({ ...baseOpts, subagents: {} })
-  await agent.closeSubagents()
-  await agent.closeSubagents()
-  assert.ok(true)
+  const cancelled = []
+  const { agent, handle } = await spawnBlockingSubagent()
+  agent.on('agent.cancelled', payload => cancelled.push(payload))
+
+  assert.strictEqual(await closeOrHang(agent), 'closed')
+  assert.strictEqual(await closeOrHang(agent), 'closed', '重复调用必须仍然立即返回')
+
+  assert.strictEqual(cancelled.length, 1, '第二次 close 不该再取消一遍已终态的 agent')
+  assert.strictEqual(cancelled[0].agentId, handle.agentId)
+  assert.strictEqual(cancelled[0].reason, 'runtime closed')
 })
 
 test('getArtifacts 支持 agentId 过滤', async () => {
@@ -153,50 +213,11 @@ test('getArtifacts 支持 agentId 过滤', async () => {
 })
 
 test('closeSubagents 真的中止在跑的后台 subagent（不只是打个 cancelled 标记）', async () => {
-  let observedAbort = false
-  const agent = new Agent({
-    ...baseOpts,
-    subagents: {
-      // 这个假子 agent 只有被 abort 才会结束。若 close() 只打标记不 abort，
-      // 它内部的 drain() 就会永远等下去。
-      createAgent: () => ({
-        lastStopReason: null,
-        on() { return this }, off() { return this },
-        getLastRunMetrics: () => null,
-        chat(_message, { signal } = {}) {
-          return new Promise((_resolve, reject) => {
-            const stop = () => {
-              observedAbort = true
-              const err = new Error('aborted')
-              err.name = 'AbortError'
-              reject(err)
-            }
-            if (signal?.aborted) stop()
-            else signal?.addEventListener('abort', stop, { once: true })
-          })
-        },
-      }),
-    },
-  })
+  const { agent, handle, state } = await spawnBlockingSubagent()
 
-  const spawnTool = agent.getTools().find(t => t.name === 'agent')
-  const started = await spawnTool.execute(
-    { description: 'long job', prompt: 'run forever' },
-    { ...agent._toolContextExtra },
-  )
-  assert.match(started, /started/, `期望后台启动行，实际：${started}`)
-
-  // 让 acquireSlot / transition 的微任务跑完，确认它真的进了 running。
-  await new Promise(resolve => setImmediate(resolve))
-  const [handle] = agent.subagents.registry.list()
-  assert.strictEqual(handle.state, 'running')
-
-  const outcome = await Promise.race([
-    agent.closeSubagents().then(() => 'closed'),
-    new Promise(resolve => setTimeout(() => resolve('hung'), 500)),
-  ])
+  const outcome = await closeOrHang(agent)
   assert.strictEqual(outcome, 'closed', 'close() 必须 abort 在跑的 subagent，而不是等它自然结束')
-  assert.ok(observedAbort, '子 agent 应当收到 abort 信号')
+  assert.ok(state.observedAbort, '子 agent 应当收到 abort 信号')
   assert.strictEqual(handle.state, 'cancelled')
   assert.strictEqual(handle.result?.failureKind, 'aborted',
     '中止收尾应记为 aborted，而不是 illegal-transition 造成的 tool_error')
