@@ -44,6 +44,13 @@ export const GRAPH_PENDING_STATES = new Set([
   'blocked', 'awaiting_confirm', 'queued', 'running', 'waiting_input',
 ])
 
+/**
+ * 真的有 agent 在飞的状态 —— `GRAPH_PENDING_STATES` 减去"等主 agent 动手"的
+ * 那两个。blocked / awaiting_confirm 的节点不占运行时资源，也不会自己产生任何
+ * 事件：把它们算成"还有活"，任何等事件的调用方（keep-alive）都会干等到超时。
+ */
+const GRAPH_IN_FLIGHT_STATES = new Set(['queued', 'running', 'waiting_input'])
+
 /** 调用方可以回报的 agent 状态（`onAgentSettled` 的 state 入参）。 */
 const REPORTABLE_STATES = new Set([
   'queued', 'running', 'waiting_input', 'succeeded', 'failed', 'cancelled',
@@ -423,6 +430,19 @@ export class AgentGraph {
   hasPending() {
     for (const node of this.nodes.values()) {
       if (GRAPH_PENDING_STATES.has(node.state)) return true
+    }
+    return false
+  }
+
+  /**
+   * 有节点的 agent 真在飞？—— 与 `hasPending()` 的区别是不算 blocked /
+   * awaiting_confirm。**要在"该不该继续等下去"上做判断的调用方用这个**：一张
+   * 声明完就被主 agent 遗忘的图会让 `hasPending()` 永远为真，而它既不会产生
+   * 事件也不会自行推进。
+   */
+  hasInFlight() {
+    for (const node of this.nodes.values()) {
+      if (GRAPH_IN_FLIGHT_STATES.has(node.state)) return true
     }
     return false
   }

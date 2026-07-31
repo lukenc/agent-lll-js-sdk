@@ -5,6 +5,7 @@
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
 import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
+import { AgentGraph } from './graph.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
 import { createSubagentTools } from './tools.js'
@@ -89,9 +90,38 @@ export function createSubagentRuntime({
   /** @type {Set<Promise<unknown>>} 在跑的后台任务 */
   const inflight = new Set()
 
+  /**
+   * 依赖图。两个回调就是"声明 ≠ 创建"落地的地方：
+   *
+   *   - `onReadyNode`（默认路径）—— **不启动任何东西**，只把上游产物交回主
+   *     agent，由它看过实际产出之后再用 `graph_start` 写这个节点的最终契约。
+   *   - `onAutoStart` —— `on_ready: 'auto'` 的后门，活儿事先就定死了才用。
+   *
+   * 两个回调都在 `AgentGraph._invoke` 的保护下同步执行，抛出的异常不会中断同批
+   * 兄弟节点的调度（会记到节点上 + 发 `graph.callback.error`）。因此这里**不能**
+   * 靠异常外泄来发现启动失败。
+   */
+  const graph = new AgentGraph({
+    emit,
+    onReadyNode: (node, upstream) => {
+      const lines = upstream.map(u => `- ${u.nodeId} (${u.state}): ${excerpt(u.result)}`)
+      const upstreamNote = lines.length > 0
+        ? `的上游已全部完成：\n${lines.join('\n')}`
+        : '没有依赖，可以直接启动。'
+      parent.enqueueMessage({
+        role: 'user',
+        content: `<graph-node-ready node="${node.nodeId}">\n`
+          + `节点 "${node.nodeId}"（${node.description}）${upstreamNote}\n\n`
+          + '现在决定它到底该做什么：用 graph_start 给出最终的 prompt 契约来启动它，'
+          + '或用 agent_cancel 放弃它。\n</graph-node-ready>',
+      })
+    },
+    onAutoStart: (node) => { void runtime._startNode(node, { background: true }) },
+  })
+
   const runtime = {
     parent, registry, artifacts, runner, sharedHistory, aliases, defaultType, maxDepth,
-    mailbox, transport, ask,
+    mailbox, transport, ask, graph,
     /** 供 `Agent` 注入的工具集 */
     tools: [],
 
@@ -160,6 +190,105 @@ export function createSubagentRuntime({
       inflight.add(tracked)
 
       return `[agent:${handle.name} started] background; 完成后会通知你。用 agent_status 查看进度。`
+    },
+
+    /**
+     * 真正把一个 queued 节点变成 subagent —— 图调度**唯一**的创建入口。
+     *
+     * 入参 `node` 是图给的**快照**（`graph.start()` 与 `onAutoStart` 都发快照），
+     * 改它不影响图。所以节点状态一律通过 `graph.onAgentSettled` 回报，不能直接写。
+     *
+     * @param {object} node 节点快照
+     * @param {{ background?: boolean, signal?: AbortSignal }} [opts]
+     * @returns {Promise<string>}
+     */
+    async _startNode(node, { background = true, signal } = {}) {
+      // 上游产物作为契约的 inputs 交给子 agent（正文由主 agent 写进 prompt）。
+      const upstream = node.dependsOn
+        .map(id => graph.get(id))
+        .filter(u => u?.agentId)
+        .flatMap(u => artifacts.list({ agentId: u.agentId }).map(r => ({
+          key: r.key, agentName: r.agentName, summary: r.summary, sha: r.sha,
+        })))
+
+      /** @type {import('./handle.js').AgentHandle|null} */
+      let handle = null
+
+      /**
+       * 把终态回报给图。**以 handle 为准，不靠结果字符串猜** —— 渲染出来的
+       * `[agent:x cancelled]` 里没有 ' failed]'，猜的话一次主动取消会被读成
+       * succeeded，把下游从一条主 agent 已经放弃的分支上放出来。handle 压根没
+       * 创建出来（未知类型 / 模型解析失败）时按 failed 记。
+       */
+      const settle = (result) => {
+        const status = handle?.result?.status ?? (handle?.state === 'cancelled' ? 'cancelled' : null)
+        const state = status === 'succeeded' || status === 'cancelled' ? status : 'failed'
+        graph.onAgentSettled({ nodeId: node.nodeId, state, agentId: handle?.agentId ?? null, result })
+      }
+
+      const spawned = runtime.spawn({
+        description: node.description,
+        prompt: node.prompt,
+        subagentType: node.subagentType ?? undefined,
+        model: node.model ?? undefined,
+        // 后台化由这里自己做（要在 settle 之后才通知父 agent），spawn 一律同步拿 task。
+        background: false,
+        nodeId: node.nodeId,
+        inputs: upstream,
+        depth: 1,
+        signal,
+        onHandle: (h) => {
+          handle = h
+          // **趁早**回报 running（这里还在 spawn 的同步段里）：节点若停在 queued
+          // 而回调随后抛出，图只能按 launch_failed 处理 —— 而 agent 其实已经起
+          // 飞了，会自己走到终态。见 graph.js `onAutoStart` 那段注释。
+          graph.onAgentSettled({ nodeId: node.nodeId, state: 'running', agentId: h.agentId })
+        },
+      })
+
+      if (!background) {
+        const result = await spawned
+        settle(result)
+        return result
+      }
+
+      /** 后台收尾：先登记结果推进下游，再通知父 agent。 */
+      const finish = (result) => {
+        settle(result)
+        try {
+          // 真 handle 优先：`_onBackgroundSettled` 会把 name / state 写进注入的
+          // 通知里，编一个假 handle 等于给父 agent 一个查不到的 agent 名。
+          runtime._onBackgroundSettled(
+            handle ?? { name: `node:${node.nodeId}`, state: 'failed' }, result)
+        } catch (err) {
+          // 通知入队失败不该变成一个没人接的 rejection —— 结果已经登记进图了，
+          // 主 agent 仍能从 agent_status 的节点表里看到它。
+          emit('graph.callback.error', {
+            nodeId: node.nodeId, callback: 'notify', error: String(err?.message ?? err),
+          })
+        }
+      }
+
+      const tracked = spawned
+        .then(finish, err => finish(`[node:${node.nodeId} failed] ${err?.message ?? err}`))
+        .finally(() => inflight.delete(tracked))
+      inflight.add(tracked)
+      return `[node:${node.nodeId} started] background; 完成后会通知你。用 agent_status 查看进度。`
+    },
+
+    /**
+     * 取消一个图节点。`graph.cancel` 只改图的状态，**活 agent 必须自己走
+     * `cancelHandle`** —— 阻塞在 `ask_user` 里的 agent 要等当前工具调用返回才
+     * 看得见 abort signal，不连它挂起的提问一起结掉，这次取消就只是改了个状态。
+     *
+     * @returns {{ ok: boolean, reason?: string }}
+     */
+    _cancelNode(nodeId, reason) {
+      const cancelled = graph.cancel(nodeId, reason)
+      if (!cancelled.ok) return cancelled
+      const handle = cancelled.agentId ? registry.get(cancelled.agentId) : null
+      if (handle) cancelHandle(handle, { reason, emit, ask })
+      return cancelled
     },
 
     /**
@@ -288,8 +417,19 @@ export function createSubagentRuntime({
       return runner.formatResult(handle)
     },
 
+    /** 图还没走完，或还有 agent 没结束？—— "这活干完了吗"用这个。 */
     hasPending() {
-      return inflight.size > 0 || registry.list().length > 0
+      return inflight.size > 0 || registry.list().length > 0 || graph.hasPending()
+    },
+
+    /**
+     * 真的还有活在飞？—— **"该不该继续等下去"用这个，别用 `hasPending()`**。
+     * blocked / awaiting_confirm 的节点等的是主 agent 下一步动作，不是后台任务：
+     * 它们不产生任何事件，也不会自行推进，一张声明完就被遗忘的图会让
+     * `hasPending()` 永远为真，等事件的调用方于是干等到超时。
+     */
+    hasInFlight() {
+      return inflight.size > 0 || registry.list().length > 0 || graph.hasInFlight()
     },
 
     /** 等全部后台任务 settle。测试与 closeSubagents 用。 */
@@ -301,6 +441,9 @@ export function createSubagentRuntime({
       // 先取消全部待答提问：阻塞在 `ask_user` 里的 agent 必须先拿到一个结果才能
       // 走完当前这轮，否则下面的 drain() 会等一个永远不会 settle 的 Promise。
       ask.cancelAll('runtime closed')
+      // 图上未终态的节点：走 `_cancelNode`，它会把有 agent 在跑的节点连 handle
+      // 一起 cancelHandle 掉。已终态的节点 `graph.cancel` 自己会拒，无需先筛。
+      for (const nodeId of [...graph.nodes.keys()]) runtime._cancelNode(nodeId, 'runtime closed')
       for (const handle of registry.list()) {
         if (!handle.isTerminal()) {
           // 统一走 cancelHandle：跟 agent_cancel 工具用同一条路径转态 + abort，
@@ -320,4 +463,19 @@ export function createSubagentRuntime({
 
   runtime.tools = createSubagentTools(runtime)
   return runtime
+}
+
+/**
+ * 就绪通知里放的上游结果摘录。
+ *
+ * **整段截断，不解析掉 `formatResult` 的头部** —— 一是剥头部就把这里跟那边的
+ * 排版绑死了，那种耦合坏起来是无声的；二是头部的 attempts / rounds 本身就是
+ * 主 agent 写下游契约时用得上的信号（第 3 次尝试才成功的上游，值得一份不一样
+ * 的 prompt）。头部 + usage 约 150 字符，500 的预算里正文还剩得下。
+ */
+function excerpt(text, max = 500) {
+  const body = String(text ?? '').trim()
+  if (body.length === 0) return '(no output)'
+  const collapsed = body.replace(/\n{3,}/g, '\n\n')
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed
 }

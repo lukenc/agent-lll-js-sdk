@@ -9,6 +9,7 @@ import { cancelHandle } from './runner.js'
 
 export const SUBAGENT_TOOL_NAMES = [
   'agent', 'agent_status', 'agent_cancel',
+  'agent_graph', 'graph_start',
   'send_message',
   'artifact_write', 'artifact_list',
   'history_search', 'history_get',
@@ -79,38 +80,47 @@ export function createSubagentTools(runtime) {
         properties: {
           agent_id: { type: 'string', description: 'Inspect one agent by id or name' },
           include_finished: { type: 'boolean', description: 'Include agents that already finished' },
+          include_graph: {
+            type: 'boolean',
+            description: 'Also print the dependency graph: every node, its state, and why it is blocked',
+          },
         },
       },
-      execute: async ({ agent_id: agentId, include_finished: includeFinished = false } = {}) => {
-        if (agentId) {
-          const handle = runtime.registry.get(agentId)
-          if (!handle) return `Error: agent "${agentId}" not found.`
-          return JSON.stringify(handle.toStatus(), null, 2)
-        }
-        const handles = runtime.registry.list({ includeFinished })
-        if (handles.length === 0) return 'no active agents (0 running, 0 queued)'
-        const lines = handles.map(h =>
-          `${h.name} [${h.state}] type=${h.type} model=${h.model?.alias ?? 'inherited'} `
-          + `attempt=${h.attempt} — ${h.description}`)
-        return `${handles.length} agent(s):\n${lines.join('\n')}`
+      execute: async ({
+        agent_id: agentId, include_finished: includeFinished = false, include_graph: includeGraph = false,
+      } = {}) => {
+        const base = renderAgentStatus(runtime, { agentId, includeFinished })
+        if (!includeGraph) return base
+        return `${base}\n\n--- graph ---\n${runtime.graph.statusTable()}`
       },
     },
 
     {
       name: 'agent_cancel',
-      description: 'Cancel a running agent. The agent stops at its next checkpoint and reports as cancelled.',
+      description: 'Cancel a running agent, or give up on a graph node. The agent stops at its next '
+        + 'checkpoint and reports as cancelled. Cancelling a node also cancels whatever agent is running '
+        + 'for it, and leaves everything downstream of it blocked.',
       parameters: {
         type: 'object',
         properties: {
           agent_id: { type: 'string', description: 'Agent id or name' },
+          node_id: { type: 'string', description: 'Graph node id — give either this or agent_id' },
           reason: { type: 'string', description: 'Why it is being cancelled' },
         },
-        required: ['agent_id'],
       },
-      execute: async ({ agent_id: agentId, reason = 'cancelled by orchestrator' } = {}) => {
+      execute: async ({ agent_id: agentId, node_id: nodeId, reason = 'cancelled by orchestrator' } = {}) => {
+        if (!agentId && !nodeId) return 'Error: give either agent_id or node_id.'
+        if (nodeId) {
+          // 节点路径统一走 `_cancelNode`：它负责把节点上在跑的 agent 也
+          // cancelHandle 掉（光改图状态的话那个 agent 还在烧 token）。
+          const cancelled = runtime._cancelNode(nodeId, reason)
+          if (!cancelled.ok) return `Error: ${cancelled.reason}`
+          return `node ${nodeId} cancelled (${reason}).`
+        }
         const handle = runtime.registry.get(agentId)
         if (!handle) return `Error: agent "${agentId}" not found.`
         if (handle.isTerminal()) return `agent ${handle.name} already finished (${handle.state}); nothing to cancel.`
+
         // 立刻把 handle 转到 cancelled，而不是只 abort 底层 controller：否则 abort
         // 传导进子 agent 变成一次异常，被 runner 的重试循环当成普通失败分类，
         // 这个工具自己的 description 说"reports as cancelled"就成了假话
@@ -123,6 +133,89 @@ export function createSubagentTools(runtime) {
           ask: runtime.ask,
         })
         return `agent ${handle.name} cancellation requested (${reason}).`
+      },
+    },
+
+    {
+      name: 'agent_graph',
+      description: 'Declare a dependency graph of tasks. Declaring does NOT create agents — nodes are '
+        + 'instantiated only when their dependencies have succeeded. By default a ready node hands its '
+        + 'upstream results back to you and waits: you then call graph_start with the final prompt, having '
+        + 'seen what upstream actually produced. Use on_ready "auto" only when the downstream task is fully '
+        + 'determined in advance and cannot be affected by upstream results.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nodes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                node_id: { type: 'string' },
+                depends_on: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Node ids this one waits for. They must already exist or be in this same call.',
+                },
+                description: { type: 'string', description: 'A short (3-8 word) label' },
+                prompt: { type: 'string', description: 'Required only for on_ready "auto"' },
+                subagent_type: { type: 'string' },
+                model: { type: 'string', enum: modelEnum(runtime.aliases) },
+                on_ready: {
+                  type: 'string',
+                  enum: ['confirm', 'auto'],
+                  description: 'Default "confirm": you get the upstream results and write the prompt then. '
+                    + '"auto" launches with the prompt declared here.',
+                },
+                on_upstream_failure: {
+                  type: 'string',
+                  enum: ['block', 'skip'],
+                  description: 'Default "block": the node waits for you to decide. "skip" abandons it.',
+                },
+              },
+              required: ['node_id', 'description'],
+            },
+          },
+          max_concurrent: { type: 'number' },
+        },
+        required: ['nodes'],
+      },
+      execute: async ({ nodes, max_concurrent: maxConcurrent } = {}) => {
+        try {
+          const { accepted } = runtime.graph.declare(nodes, { maxConcurrent })
+          return `declared ${accepted.length} node(s): ${accepted.join(', ')}\n${runtime.graph.statusTable()}`
+        } catch (err) {
+          // 整批被拒（环、未知依赖、重名、缺 description……）。返回可纠正的说明，
+          // 图上不会留下半个声明。
+          return `Error: ${err.message}`
+        }
+      },
+    },
+
+    {
+      name: 'graph_start',
+      description: 'Start a graph node that is ready, giving it its final task contract. This is where you '
+        + 'write the prompt — after seeing what upstream produced, not before.',
+      parameters: {
+        type: 'object',
+        properties: {
+          node_id: { type: 'string' },
+          prompt: { type: 'string', description: 'The full task contract for this node' },
+          subagent_type: { type: 'string' },
+          model: { type: 'string', enum: modelEnum(runtime.aliases) },
+          run_in_background: { type: 'boolean' },
+        },
+        required: ['node_id', 'prompt'],
+      },
+      execute: async ({
+        node_id: nodeId, prompt, subagent_type: subagentType, model, run_in_background: bg,
+      } = {}, ctx = {}) => {
+        if (typeof nodeId !== 'string' || nodeId.trim() === '') {
+          return 'Error: `node_id` is required — the id of the node you declared with agent_graph.'
+        }
+        const started = runtime.graph.start(nodeId, { prompt, subagent_type: subagentType, model })
+        if (!started.ok) return `Error: ${started.reason}`
+        return runtime._startNode(started.node, { background: bg !== false, signal: ctx.signal })
       },
     },
 
@@ -266,4 +359,22 @@ export function createSubagentTools(runtime) {
       },
     },
   ]
+}
+
+/**
+ * `agent_status` 的 agent 部分。独立成函数是因为 `include_graph` 必须能追加到
+ * **每一条**返回路径后面（单个 agent 的 JSON、空列表、列表），内联写会漏掉早返回。
+ */
+function renderAgentStatus(runtime, { agentId, includeFinished }) {
+  if (agentId) {
+    const handle = runtime.registry.get(agentId)
+    if (!handle) return `Error: agent "${agentId}" not found.`
+    return JSON.stringify(handle.toStatus(), null, 2)
+  }
+  const handles = runtime.registry.list({ includeFinished })
+  if (handles.length === 0) return 'no active agents (0 running, 0 queued)'
+  const lines = handles.map(h =>
+    `${h.name} [${h.state}] type=${h.type} model=${h.model?.alias ?? 'inherited'} `
+    + `attempt=${h.attempt} — ${h.description}`)
+  return `${handles.length} agent(s):\n${lines.join('\n')}`
 }
