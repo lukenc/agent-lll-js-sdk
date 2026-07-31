@@ -10,6 +10,16 @@ const baseOpts = { provider: 'openai', apiKey: 'sk-test', model: 'gpt-4o' }
 const askTool = (agent) => agent.getTools().find(t => t.name === 'ask_user')
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
+/** 假子 Agent：一进 chat 就走自己的 onAskUser，阻塞等回答。 */
+const askingChild = (options) => ({
+  options,
+  lastStopReason: null,
+  on() { return this }, off() { return this },
+  getLastRunMetrics: () => null,
+  async chat() { return `child got: ${await options.hooks.onAskUser('which db?')}` },
+  async closeMCPClients() {},
+})
+
 test('配置 subagents 后即使没有 onAskUser 也注入 ask_user', () => {
   assert.ok(askTool(new Agent({ ...baseOpts, subagents: {} })))
   assert.strictEqual(askTool(new Agent({ ...baseOpts })), undefined)
@@ -57,6 +67,10 @@ test('hook 与 answerQuestion 竞速，先到先赢', async () => {
   agent.answerQuestion(askId, 'from api')
   release('from hook')
   assert.strictEqual(await p, 'from api')
+  // 迟到的 hook 回答是静默 no-op：不抛，不覆盖已交付的回答，也不复活这条提问
+  await tick()
+  assert.strictEqual(agent.pendingQuestions().length, 0)
+  assert.strictEqual(agent.answerQuestion(askId, 'third'), false)
 })
 
 test('closeSubagents 拒掉全部待答提问，不留悬挂 Promise', async () => {
@@ -68,25 +82,7 @@ test('closeSubagents 拒掉全部待答提问，不留悬挂 Promise', async () 
   assert.match(await p, /runtime closed/)
 })
 
-// ---- 以下三条覆盖 brief 未展开、但正是本任务立意所在的路径 ----
-
-test('answerQuestion 抢先后，迟到的 hook 回答是静默 no-op', async () => {
-  let release
-  const agent = new Agent({
-    ...baseOpts, subagents: {},
-    hooks: { onAskUser: () => new Promise(resolve => { release = resolve }) },
-  })
-  const p = askTool(agent).execute({ question: 'q' }, { agentId: 'main', agentName: 'main' })
-  await tick()
-  const [{ askId }] = agent.pendingQuestions()
-  agent.answerQuestion(askId, 'from api')
-  assert.strictEqual(await p, 'from api')
-  // hook 后到：既不抛，也不改已 settle 的结果，且不复活这条提问
-  release('from hook')
-  await tick()
-  assert.strictEqual(agent.pendingQuestions().length, 0)
-  assert.strictEqual(agent.answerQuestion(askId, 'third'), false)
-})
+// ---- 以下覆盖 brief 未展开、但正是本任务立意所在的路径 ----
 
 test('reset() 也会 settle 掉待答提问（它借道 closeSubagents）', async () => {
   const agent = new Agent({ ...baseOpts, subagents: {} })
@@ -121,18 +117,10 @@ test('hook 抢先后，answerQuestion 是静默 no-op（竞速的另一个方向
 
 test('subagent 的提问带自己的身份，期间 handle 是 waiting_input', async () => {
   const metas = []
-  // 假子 Agent：一进 chat 就走自己的 onAskUser，等回答。
-  const createAgent = (options) => ({
-    options,
-    lastStopReason: null,
-    on() { return this }, off() { return this },
-    getLastRunMetrics: () => null,
-    async chat() { return `child got: ${await options.hooks.onAskUser('which db?')}` },
-    async closeMCPClients() {},
-  })
   const agent = new Agent({
     ...baseOpts,
-    subagents: { createAgent },
+    subagents: { createAgent: askingChild },
+    // 返回 undefined：主机只是"被通知"，回答走命令式通道（Web UI 的典型形态）
     hooks: { onAskUser: (_q, meta) => { metas.push(meta) } },
   })
 
@@ -162,15 +150,7 @@ test('subagent 的提问带自己的身份，期间 handle 是 waiting_input', a
 })
 
 test('agent_cancel 会 settle 掉被取消 agent 的待答提问，它不再卡在 ask_user 上', async () => {
-  const createAgent = (options) => ({
-    options,
-    lastStopReason: null,
-    on() { return this }, off() { return this },
-    getLastRunMetrics: () => null,
-    async chat() { return `child got: ${await options.hooks.onAskUser('which db?')}` },
-    async closeMCPClients() {},
-  })
-  const agent = new Agent({ ...baseOpts, subagents: { createAgent } })
+  const agent = new Agent({ ...baseOpts, subagents: { createAgent: askingChild } })
   let handle = null
   const task = agent.subagents.spawn({
     description: 'Audit auth flow', prompt: 'go', background: false,
