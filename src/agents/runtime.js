@@ -6,6 +6,7 @@ import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
 import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
 import { AgentGraph } from './graph.js'
+import { createWorktree } from './isolation.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
 import { createSubagentTools } from './tools.js'
@@ -24,6 +25,11 @@ export function createSubagentRuntime({
   maxDepth = 2,
   modelAliases,
   retry = {},
+  /**
+   * worktree 隔离的主机配置（`{ worktreeBaseDir, branchPrefix, cwd, exec }`）。
+   * `exec` 是给测试与自带沙箱执行器的主机的注入口，缺省时直接 spawn `git`。
+   */
+  isolation: isolationOpts = {},
   artifacts: artifactOpts = {},
   retainCompleted = 20,
   a2a = {},
@@ -85,7 +91,11 @@ export function createSubagentRuntime({
 
   const runner = new SubagentRunner({
     parent, registry, artifacts, sharedHistory, aliases,
-    opts: { retry: { maxAttempts: retry.maxAttempts ?? 3, attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 }, maxDepth },
+    opts: {
+      retry: { maxAttempts: retry.maxAttempts ?? 3, attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 },
+      maxDepth,
+      isolation: isolationOpts,
+    },
     emit,
     mailbox,
     ask,
@@ -171,10 +181,34 @@ export function createSubagentRuntime({
 
       const handle = registry.create({
         type: typeName, description, parentAgentId, depth, nodeId,
-        model: resolved, isolation,
+        model: resolved, isolation: null,
       })
-      // 图调度用它把 agentId 回填到节点。Task 16 会在这之后插入 worktree 创建。
+      // 图调度用它把 agentId 回填到节点。
       onHandle?.(handle)
+
+      // worktree 要在 handle 之后建（路径与分支名都要 agentId），在执行之前建
+      // 好（契约里那句"你的工作目录是 X"必须在子 agent 读到首条消息之前就是
+      // 真的）。建不出来时**不降级成无隔离** —— 主 agent 之所以要隔离，多半是
+      // 因为有别的 agent 在同一批文件上干活；悄悄退回共享目录正是它想避免的。
+      if (isolation?.mode === 'worktree') {
+        try {
+          const wt = await createWorktree({
+            agentId: handle.agentId,
+            baseDir: isolationOpts.worktreeBaseDir,
+            branchPrefix: isolationOpts.branchPrefix,
+            cwd: isolationOpts.cwd,
+            exec: isolationOpts.exec,
+          })
+          handle.isolation = {
+            mode: 'worktree', path: wt.path, branch: wt.branch, repoRoot: wt.repoRoot,
+            dirty: false, changedFiles: 0, removed: false, branchRemoved: false,
+          }
+        } catch (err) {
+          cancelHandle(handle, { reason: `isolation "worktree" unavailable (${err.reason})`, emit, ask })
+          return `Error: isolation "worktree" unavailable (${err.reason}): ${err.message}\n`
+            + 'Retry without the isolation parameter.'
+        }
+      }
 
       // 每个 agent 一个 AbortController，agent_cancel 就是 abort 它。父的 signal
       // 一旦 abort，子也跟着停。
@@ -187,7 +221,15 @@ export function createSubagentRuntime({
       const childSignal = controller.signal
 
       const task = (async () => {
-        const release = await registry.acquireSlot(depth, { signal: childSignal })
+        let release
+        try {
+          release = await registry.acquireSlot(depth, { signal: childSignal })
+        } catch (err) {
+          // 还没排到并发槽就被取消：`runner.run()` 压根不会跑，它那条收尾路径也
+          // 就不会执行 —— worktree 会一直留在盘上。这里补收一次。
+          await runner._finalizeIsolation(handle)
+          throw err
+        }
         try {
           return await runner.run(handle, { prompt, inputs, signal: childSignal })
         } finally {

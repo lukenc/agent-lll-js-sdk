@@ -73,9 +73,9 @@ export function renderContract({ description, prompt, inputs, cwd } = {}) {
 
   if (cwd) {
     parts.push('', '## Working directory', '',
-      `Your working directory is \`${cwd}\`. All relative paths resolve against it. `
-      + 'You are working on an isolated copy of the repository; changes here do not affect '
-      + 'other agents.')
+      `Your working directory is \`${cwd}\` — an isolated copy of the repository, on its own git `
+      + 'branch. Changes you make there do not affect other agents. Prefer absolute paths under it: '
+      + 'the tools you call may resolve relative paths against the parent process\'s directory instead.')
   }
 
   return parts.join('\n')
