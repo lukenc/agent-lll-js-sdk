@@ -39,7 +39,13 @@ export function createSubagentTools(runtime) {
           isolation: {
             type: 'string',
             enum: ['worktree', 'remote'],
-            description: 'Isolation mode. "worktree" gives the agent its own git worktree.',
+            description: 'Isolation mode. "worktree" gives the agent its own git worktree and branch, so '
+              + 'agents working in parallel cannot overwrite each other\'s files; a worktree left clean is '
+              + 'removed when the agent finishes, one with changes is kept and reported back to you. '
+              + 'Requires a git repository whose worktree base directory is gitignored — you get a plain '
+              + 'error back if that is not the case. Note that the working directory is communicated to '
+              + 'the agent and to its tools, but honouring it is up to the host\'s tool implementations. '
+              + '"remote" is not implemented.',
           },
         },
         required: ['description', 'prompt'],

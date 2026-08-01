@@ -16,6 +16,7 @@
  */
 import { getAgentType } from './types.js'
 import { renderContract } from './contract.js'
+import { finalizeWorktree } from './isolation.js'
 import { wrapMemoryForMirror } from './mirror.js'
 import { SlidingWindowMemory } from '../memory.js'
 
@@ -218,7 +219,10 @@ export class SubagentRunner {
     // `agent_cancel`/`close()` 可能正好在这个缺口里把 handle 转成了 cancelled——
     // 这里若继续往下走 `transition('running')`，会因终态无出边而抛错，违反
     // "run() 永不 throw"。已经是终态（此刻只可能是 cancelled）就直接按取消收尾。
-    if (handle.isTerminal()) return this._finishCancelled(handle, 'aborted', handle._cancelReason)
+    if (handle.isTerminal()) {
+      await this._finalizeIsolation(handle)
+      return this._finishCancelled(handle, 'aborted', handle._cancelReason)
+    }
 
     const type = getAgentType(handle.type)
     const maxDepth = this.opts.maxDepth ?? 2
@@ -228,6 +232,7 @@ export class SubagentRunner {
       handle.transition('queued'); handle.transition('running')
       handle.beginAttempt()
       handle.endAttempt({ failureKind: 'depth_exceeded', error: `depth ${handle.depth} exceeds maxDepth ${maxDepth}` })
+      await this._finalizeIsolation(handle)
       return this._finishFailed(handle, 'depth_exceeded', `depth ${handle.depth} exceeds maxDepth ${maxDepth}`)
     }
 
@@ -250,6 +255,10 @@ export class SubagentRunner {
       try {
         const text = await this._runOnce(handle, { prompt, inputs, signal })
         handle.endAttempt({})
+        // 收尾必须在渲染之前：结果字符串里要交代 worktree 是收掉了还是留着。
+        // `_finalizeIsolation` 自己吞掉全部异常，因此放在 try 里也不会被误当成
+        // 一次可重试的失败。
+        await this._finalizeIsolation(handle)
         return this._finishSucceeded(handle, text)
       } catch (err) {
         const kind = classifyFailure(err)
@@ -276,7 +285,35 @@ export class SubagentRunner {
       }
     }
 
+    await this._finalizeIsolation(handle)
     return this._finishFailed(handle, lastKind, lastError)
+  }
+
+  /**
+   * worktree 收尾。**只在这里做**，因此成功 / 失败 / 取消三条终态路径拿到的
+   * 待遇一样 —— 一个失败的子 agent 留下的半成品改动，比一个成功的更需要被主
+   * agent 看见。
+   *
+   * 幂等（`send_message` 续跑会第二次走到终态收尾），且**永不抛** —— git 出问题
+   * 最多是留下一个待人工清理的目录，不该把一次跑完的子任务翻成失败。
+   */
+  async _finalizeIsolation(handle) {
+    const iso = handle.isolation
+    if (!iso || iso.mode !== 'worktree' || handle._isolationFinalized) return
+    handle._isolationFinalized = true
+    try {
+      const { removed, changedFiles, branchRemoved } = await finalizeWorktree({
+        path: iso.path, branch: iso.branch, cwd: iso.repoRoot, exec: this.opts.isolation?.exec,
+      })
+      iso.removed = removed
+      iso.branchRemoved = branchRemoved
+      iso.changedFiles = changedFiles
+      iso.dirty = !removed && changedFiles > 0
+    } catch {
+      // finalizeWorktree 按契约不抛；真抛了（主机注入了个坏 exec）就按最保守的
+      // 事实记账：什么都没动过。
+      iso.removed = false
+    }
   }
 
   async _runOnce(handle, { prompt, inputs, signal }) {
@@ -428,11 +465,7 @@ export class SubagentRunner {
         body,
       ]
       if (artifactLine) lines.push(`--- artifacts (${rows.length}) ---`, artifactLine)
-      if (handle.isolation?.dirty) {
-        lines.push('--- worktree ---',
-          `path=${handle.isolation.path} branch=${handle.isolation.branch} `
-          + `changed=${handle.isolation.changedFiles} files (已保留，未自动清理)`)
-      }
+      lines.push(...worktreeLines(handle))
       return lines.join('\n')
     }
 
@@ -446,6 +479,7 @@ export class SubagentRunner {
         `reason: ${lastError}`,
       ]
       if (artifactLine) lines.push(`--- partial artifacts (${rows.length}) ---`, artifactLine)
+      lines.push(...worktreeLines(handle))
       return lines.join('\n')
     }
 
@@ -456,9 +490,33 @@ export class SubagentRunner {
       `lastError: ${lastError}`,
     ]
     if (artifactLine) lines.push(`--- partial artifacts (${rows.length}) ---`, artifactLine)
+    lines.push(...worktreeLines(handle))
     lines.push('下一步由你决定：换 model 重发、缩小任务范围重发、或跳过该任务继续。')
     return lines.join('\n')
   }
+}
+
+/**
+ * 结果里的 worktree 交代。**只在还有东西留在盘上时出现** —— 干净收掉的 worktree
+ * 没有任何需要主 agent 决策的余留，多一行只是噪声。
+ *
+ * @param {import('./handle.js').AgentHandle} handle
+ * @returns {string[]}
+ */
+function worktreeLines(handle) {
+  const iso = handle.isolation
+  if (!iso || iso.mode !== 'worktree') return []
+  if (!iso.removed) {
+    return ['--- worktree ---',
+      `path=${iso.path} branch=${iso.branch} `
+      + `changed=${iso.changedFiles} files (已保留，未自动清理)`]
+  }
+  // 目录收掉了但分支没删掉 = 分支上有未合并的提交，git 拒绝丢弃它们。
+  if (iso.branchRemoved === false) {
+    return ['--- worktree ---',
+      `branch=${iso.branch} 保留（有未合并的提交），worktree 目录已移除。`]
+  }
+  return []
 }
 
 async function sleep(ms, signal) {
