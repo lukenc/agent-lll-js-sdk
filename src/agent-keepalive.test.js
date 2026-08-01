@@ -262,6 +262,9 @@ test('等待确认的节点：先命中待注入，模型不接手则干净收�
   // 待注入判断先命中，模型拿到一轮去处理它。模型若不接手，`hasInFlight()`
   // 为假（awaiting_confirm 等的是主 agent，不是后台任务）—— 收尾，不空转。
   const agent = new Agent({ ...baseOpts, subagents: {} })
+  // 图是惰性的（多图容器构造时不预先开图），所以先显式开一张 —— 走工具的话
+  // `agent_graph` 会替你开。
+  agent.subagents.newGraph()
   agent.subagents.graph.declare([{ node_id: 'a', description: '第一步' }])
 
   assert.strictEqual(agent.subagents.graph.get('a').state, 'awaiting_confirm')
@@ -284,6 +287,7 @@ test('超时事件里的 pendingNodes 覆盖 waiting_input 节点', async () => 
   const events = []
   agent.on('run.keep_alive.timeout', p => events.push(p))
 
+  agent.subagents.newGraph()
   agent.subagents.graph.declare([
     { node_id: 'a', description: '在提问' },
     { node_id: 'b', description: '等 a', depends_on: ['a'] },

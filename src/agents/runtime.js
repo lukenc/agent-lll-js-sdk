@@ -17,6 +17,22 @@ import { resolveA2ATransport, newEnvelopeId } from './a2a/index.js'
 // 与 `mcp/transports/*` 同一套路）。
 import './a2a/local.js'
 
+let GRAPH_SEQ = 0
+
+/**
+ * 生成 `gph_` + 8 位十六进制的进程内唯一图 id。
+ *
+ * **纯单调计数器，不混时间位** —— 与 `registry.js` 的 `newAgentId`、
+ * `a2a/index.js` 的 `newEnvelopeId` 同一理由，本项目已经在那两处各踩过一次：
+ * 混进时间位就只剩几位给计数器，同一毫秒内开的第 N 张图会拿到与第 1 张相同的
+ * id，而 `graphs.set` 是静默覆盖 —— 前一张图连它记录的节点归属一起消失，不报
+ * 任何错。图条目自己带 `createdAt`，id 里再编一份创建时间本就是多余的。
+ */
+function newGraphId() {
+  GRAPH_SEQ = (GRAPH_SEQ + 1) >>> 0
+  return `gph_${GRAPH_SEQ.toString(16).padStart(8, '0')}`
+}
+
 export function createSubagentRuntime({
   parent,
   types = [],
@@ -32,6 +48,11 @@ export function createSubagentRuntime({
   isolation: isolationOpts = {},
   artifacts: artifactOpts = {},
   retainCompleted = 20,
+  /**
+   * 保留多少张 closed 图。超限的按 FIFO 整张淘汰 —— 否则"无界增长"只是从节点级
+   * 搬到了图级。有在飞节点的图永远不淘汰，见 `_evictClosedGraphs`。
+   */
+  retainClosedGraphs = 5,
   a2a = {},
   ask: askOpts = {},
   keepAlive = true,
@@ -121,41 +142,214 @@ export function createSubagentRuntime({
   const waiters = []
 
   /**
-   * 依赖图。两个回调就是"声明 ≠ 创建"落地的地方：
+   * 图容器。**图跟的是任务**：同一个任务同一张可变图，一个 agent 可以同时持有
+   * 好几张（不同任务）。每张图有自己的 `nodes` Map，所以 `node_id` 的唯一性天然
+   * 收窄到图级 —— 第二个任务重用 `n1` 不再让整批声明被拒。
    *
-   *   - `onReadyNode`（默认路径）—— **不启动任何东西**，只把上游产物交回主
-   *     agent，由它看过实际产出之后再用 `graph_start` 写这个节点的最终契约。
-   *   - `onAutoStart` —— `on_ready: 'auto'` 的后门，活儿事先就定死了才用。
-   *
-   * 两个回调都在 `AgentGraph._invoke` 的保护下同步执行，抛出的异常不会中断同批
-   * 兄弟节点的调度（会记到节点上 + 发 `graph.callback.error`）。因此这里**不能**
-   * 靠异常外泄来发现启动失败。
+   * @typedef {{
+   *   graph: AgentGraph, graphId: string, label: string|null,
+   *   state: 'open'|'closed', createdAt: number, closedAt: number|null,
+   * }} GraphEntry
+   * @type {Map<string, GraphEntry>} graphId → 条目（插入序 = 创建序）
    */
-  const graph = new AgentGraph({
-    emit,
-    onReadyNode: (node, upstream) => {
+  const graphs = new Map()
+
+  const runtime = {
+    parent, registry, artifacts, runner, sharedHistory, aliases, defaultType, maxDepth,
+    mailbox, transport, ask, graphs,
+    /** @type {string|null} 当前在用的那张图。构造时不预先开图（惰性）。 */
+    activeGraphId: null,
+    /** 供 `Agent` 注入的工具集 */
+    tools: [],
+
+    /**
+     * 活跃图的 `AgentGraph`，没有活跃图时是 `null`。
+     *
+     * 保留成 getter 是为了让既有调用点最小改动。**别在需要"某张特定图"的地方读
+     * 它** —— 尤其不能在回调闭包里读，见 `newGraph` 的注释。
+     * @returns {AgentGraph|null}
+     */
+    get graph() {
+      return graphs.get(runtime.activeGraphId)?.graph ?? null
+    },
+
+    /**
+     * 开一张新图并置为活跃图。
+     *
+     * 两个宿主回调**在这里为每张图单独构造**，各自闭包捕获自己的 `graphId`：
+     * `AgentGraph` 的构造回调不带图身份，而 `onAgentSettled` 对未知 nodeId 是
+     * 静默 `return`（graph.js:397）—— 闭包若读 `runtime.graph`（活跃图 getter），
+     * 活跃图一变，在飞节点的回报就落到别人的图上，**不报任何错**，只是让节点永远
+     * 停在 running。这是这里能出的最坏故障形态。
+     *
+     * 两个回调都在 `AgentGraph._invoke` 的保护下同步执行，抛出的异常不会中断同批
+     * 兄弟节点的调度（会记到节点上 + 发 `graph.callback.error`）。因此这里**不能**
+     * 靠异常外泄来发现启动失败。
+     *
+     * @param {{ label?: string|null }} [opts]
+     * @returns {GraphEntry}
+     */
+    newGraph({ label = null } = {}) {
+      const graphId = newGraphId()
+      /** @type {GraphEntry} */
+      const entry = {
+        graphId, label, state: 'open', createdAt: Date.now(), closedAt: null, graph: null,
+      }
+      entry.graph = new AgentGraph({
+        emit,
+        // 默认路径 —— **不启动任何东西**，只把上游产物交回主 agent，由它看过实际
+        // 产出之后再用 `graph_start` 写这个节点的最终契约。
+        onReadyNode: (node, upstream) => runtime._notifyNodeReady(graphId, node, upstream),
+        // `on_ready: 'auto'` 的后门，活儿事先就定死了才用。
+        onAutoStart: (node) => { void runtime._startNode(node, { graphId, background: true }) },
+      })
+      graphs.set(graphId, entry)
+      runtime.activeGraphId = graphId
+      emit('graph.opened', { graphId, label })
+      // 新图是"closed 图可能已经超限"的另一个时机：上一轮因为在飞节点跳过的图，
+      // 这时可能已经空出来了。
+      runtime._evictClosedGraphs()
+      return entry
+    },
+
+    /**
+     * 把一张图标成 closed。**只是容器层的标记**：closed 图仍查得到状态、里头在飞
+     * 的节点仍取消得掉（解析路径 `_lookupGraph` / `_resolveGraph` 因此对状态不设
+     * 限），变化只有两点 —— 不再接受新的声明，以及成为 FIFO 淘汰的候选。面向模型
+     * 的生命周期与放弃协议不在这一层。
+     *
+     * @param {string|null} [graphId] 省略时关活跃图。**不会像 `_resolveGraph`
+     *        那样顺手新开一张** —— 建一张空图只为了立刻关掉它毫无意义。
+     * @returns {{ ok: true, entry: GraphEntry } | { ok: false, reason: string }}
+     */
+    closeGraph(graphId = null, { reason = null } = {}) {
+      const found = runtime._lookupGraph(graphId)
+      if (!found.ok) return found
+      const { entry } = found
+      if (entry.state === 'closed') {
+        return { ok: false, reason: `graph "${entry.graphId}" is already closed` }
+      }
+      entry.state = 'closed'
+      entry.closedAt = Date.now()
+      // 关掉活跃图之后就没有活跃图了 —— 下一次不带 graph_id 的声明会新开一张，
+      // 而不是继续往一张已经关掉、随时会被淘汰的图里塞节点。
+      if (runtime.activeGraphId === entry.graphId) runtime.activeGraphId = null
+      emit('graph.closed', { graphId: entry.graphId, label: entry.label, reason })
+      runtime._evictClosedGraphs()
+      return { ok: true, entry }
+    },
+
+    /**
+     * 只查不建：给了 id 就查它，不给就查活跃图。
+     *
+     * 与 `_resolveGraph` 的区别只有一条 —— 它不会"没有活跃图就新开一张"。取消、
+     * 关闭、查状态这类操作凭一次注定失败的调用凭空造出一张空图（还把它设成活跃）
+     * 是个说不通的副作用，所以那几条路走这里。
+     *
+     * @returns {{ ok: true, entry: GraphEntry } | { ok: false, reason: string }}
+     */
+    _lookupGraph(graphId = null) {
+      const entry = graphs.get(graphId ?? runtime.activeGraphId)
+      if (entry) return { ok: true, entry }
+      return {
+        ok: false,
+        reason: graphId != null
+          ? `graph "${graphId}" not found. ${runtime._knownGraphsNote()}`
+          : `no graph is active. ${runtime._knownGraphsNote()}`,
+      }
+    },
+
+    /**
+     * 解析目标图。给了 id 就查（查不到软失败）；不给则用活跃图，**活跃图不存在时
+     * 新开一张并置为活跃** —— 让"直接声明一批节点"这条最常见的路径不必先显式开图。
+     *
+     * 对图的 state 不设限：closed 图也照样解析得到，否则一张 closed 图里还在飞的
+     * 节点就再也取消不了、状态也查不到了。要拦 closed 的调用方自己拦（今天只有
+     * `agent_graph` 拦，因为往一张可被淘汰的图里声明节点等于让它们随时消失）。
+     *
+     * @returns {{ ok: true, entry: GraphEntry } | { ok: false, reason: string }}
+     */
+    _resolveGraph(graphId = null) {
+      const found = runtime._lookupGraph(graphId)
+      if (found.ok || graphId != null) return found
+      return { ok: true, entry: runtime.newGraph() }
+    },
+
+    /** 含某个 nodeId 的全部图（含 closed）。软失败提示靠它点名。 */
+    findNodeGraphs(nodeId) {
+      return [...graphs.values()].filter(entry => entry.graph.nodes.has(nodeId))
+    },
+
+    /** 未知 graph_id 的软失败提示：列出模型实际能填的东西。 */
+    _knownGraphsNote() {
+      if (graphs.size === 0) return 'No graph exists yet — declare one with agent_graph.'
+      const known = [...graphs.values()].map(e => `${e.graphId} (${e.state})`).join(', ')
+      return `Known graphs: ${known}.`
+    },
+
+    /**
+     * "这个 node_id 不在这张图里"的软失败提示。**多图之后 node_id 可以跨图重名，
+     * 这句提示是模型自我纠正的唯一依据** —— 所以必须点名到底哪几张图含它。
+     */
+    _nodeNotHereReason(nodeId, entry) {
+      const others = runtime.findNodeGraphs(nodeId).filter(e => e !== entry)
+      if (others.length === 0) {
+        return `node "${nodeId}" is not in graph ${entry.graphId}, and no other graph has it either. `
+          + 'Declare it with agent_graph first.'
+      }
+      const where = others
+        .map(e => `${e.graphId}${e.label ? ` (${JSON.stringify(e.label)}, ${e.state})` : ` (${e.state})`}`)
+        .join(', ')
+      return `node "${nodeId}" is not in graph ${entry.graphId}; it lives in ${where}. `
+        + 'Pass graph_id to act on it there.'
+    },
+
+    /**
+     * closed 图按 FIFO 整张淘汰。
+     *
+     * **有在飞节点的图一律跳过。** 一张图被关掉不代表它里头的 agent 停了；淘汰它
+     * 就把那个还在跑的 agent 的节点归属丢了 —— 它 settle 时找不到自己的图，静默
+     * return，节点的终态无处可记。跳过不消耗淘汰额度，所以会继续往更新的 closed
+     * 图上找，宁可多留一张也不丢归属。
+     */
+    _evictClosedGraphs() {
+      const closed = [...graphs.values()].filter(e => e.state === 'closed')
+      let excess = closed.length - retainClosedGraphs
+      if (excess <= 0) return
+      // closedAt 相等时 sort 的稳定性让它退回创建序 —— 两者都是合理的 FIFO。
+      closed.sort((a, b) => a.closedAt - b.closedAt)
+      for (const entry of closed) {
+        if (excess <= 0) break
+        if (entry.graph.hasInFlight()) continue
+        graphs.delete(entry.graphId)
+        emit('graph.evicted', {
+          graphId: entry.graphId, label: entry.label, nodes: entry.graph.nodes.size,
+        })
+        excess -= 1
+      }
+    },
+
+    /**
+     * 节点就绪通知（默认路径的 `onReadyNode`）。
+     *
+     * `graphId` 是入参而不是从活跃图读的：通知里必须写清是哪张图的哪个节点，否则
+     * 跨图重名的 `node_id` 会让模型的 `graph_start` 打到别的图上。
+     */
+    _notifyNodeReady(graphId, node, upstream) {
       const lines = upstream.map(u => `- ${u.nodeId} (${u.state}): ${excerpt(u.result)}`)
       const upstreamNote = lines.length > 0
         ? `的上游已全部完成：\n${lines.join('\n')}`
         : '没有依赖，可以直接启动。'
       parent.enqueueMessage({
         role: 'user',
-        content: `<graph-node-ready node="${node.nodeId}">\n`
-          + `节点 "${node.nodeId}"（${node.description}）${upstreamNote}\n\n`
-          + '现在决定它到底该做什么：用 graph_start 给出最终的 prompt 契约来启动它，'
+        content: `<graph-node-ready graph="${graphId}" node="${node.nodeId}">\n`
+          + `图 ${graphId} 的节点 "${node.nodeId}"（${node.description}）${upstreamNote}\n\n`
+          + '现在决定它到底该做什么：用 graph_start（带上这个 graph_id）给出最终的 prompt 契约来启动它，'
           + '或用 agent_cancel 放弃它。\n</graph-node-ready>',
       })
       // 同 `_onBackgroundSettled`：通知入队后叫醒可能在等的主 agent。
       runtime._signalEvent()
     },
-    onAutoStart: (node) => { void runtime._startNode(node, { background: true }) },
-  })
-
-  const runtime = {
-    parent, registry, artifacts, runner, sharedHistory, aliases, defaultType, maxDepth,
-    mailbox, transport, ask, graph,
-    /** 供 `Agent` 注入的工具集 */
-    tools: [],
 
     /** Level 1 清单：注入 system 消息，让模型知道 subagent_type 能填什么。 */
     typesNote() {
@@ -262,11 +456,20 @@ export function createSubagentRuntime({
      * 入参 `node` 是图给的**快照**（`graph.start()` 与 `onAutoStart` 都发快照），
      * 改它不影响图。所以节点状态一律通过 `graph.onAgentSettled` 回报，不能直接写。
      *
+     * `graphId` 必须由调用方给全：回报要落回**节点自己那张图**，读活跃图 getter
+     * 的话活跃图一变回报就落到别人头上，而那是个静默错误。
+     *
      * @param {object} node 节点快照
-     * @param {{ background?: boolean, signal?: AbortSignal }} [opts]
+     * @param {{ graphId: string, background?: boolean, signal?: AbortSignal }} opts
      * @returns {Promise<string>}
      */
-    async _startNode(node, { background = true, signal } = {}) {
+    async _startNode(node, { graphId, background = true, signal } = {}) {
+      const graph = graphs.get(graphId)?.graph
+      // 正常路径上不该发生（调用方刚解析过这张图，且启动会立刻让它变成在飞、
+      // 从而免于淘汰）。但 `onAutoStart` 那条路是 `void` 掉的 async 调用，这里抛
+      // TypeError 会变成一个没人接的 rejection —— 宁可返回一句话。
+      if (!graph) return `Error: graph "${graphId}" no longer exists; node "${node.nodeId}" was not started.`
+
       // 上游产物作为契约的 inputs 交给子 agent（正文由主 agent 写进 prompt）。
       const upstream = node.dependsOn
         .map(id => graph.get(id))
@@ -337,7 +540,7 @@ export function createSubagentRuntime({
         .then(finish, err => finish(`[node:${node.nodeId} failed] ${err?.message ?? err}`))
         .finally(() => inflight.delete(tracked))
       inflight.add(tracked)
-      return `[node:${node.nodeId} started] background; 完成后会通知你。用 agent_status 查看进度。`
+      return `[node:${node.nodeId} in graph ${graphId} started] background; 完成后会通知你。用 agent_status 查看进度。`
     },
 
     /**
@@ -345,10 +548,21 @@ export function createSubagentRuntime({
      * `cancelHandle`** —— 阻塞在 `ask_user` 里的 agent 要等当前工具调用返回才
      * 看得见 abort signal，不连它挂起的提问一起结掉，这次取消就只是改了个状态。
      *
+     * @param {string} nodeId
+     * @param {string} reason
+     * @param {{ graphId?: string|null }} [opts] 省略 graphId 时用活跃图
      * @returns {{ ok: boolean, reason?: string }}
      */
-    _cancelNode(nodeId, reason) {
-      const cancelled = graph.cancel(nodeId, reason)
+    _cancelNode(nodeId, reason, { graphId = null } = {}) {
+      const found = runtime._lookupGraph(graphId)
+      if (!found.ok) return found
+      const { entry } = found
+      // `graph.cancel` 只会说"node not found"，那在多图之后不够用 —— 同名节点很
+      // 可能就在隔壁那张图里。
+      if (!entry.graph.nodes.has(nodeId)) {
+        return { ok: false, reason: runtime._nodeNotHereReason(nodeId, entry) }
+      }
+      const cancelled = entry.graph.cancel(nodeId, reason)
       if (!cancelled.ok) return cancelled
       const handle = cancelled.agentId ? registry.get(cancelled.agentId) : null
       if (handle) cancelHandle(handle, { reason, emit, ask })
@@ -490,7 +704,7 @@ export function createSubagentRuntime({
 
     /** 图还没走完，或还有 agent 没结束？—— "这活干完了吗"用这个。 */
     hasPending() {
-      return inflight.size > 0 || registry.list().length > 0 || graph.hasPending()
+      return inflight.size > 0 || registry.list().length > 0 || runtime._anyGraph(g => g.hasPending())
     },
 
     /**
@@ -500,7 +714,46 @@ export function createSubagentRuntime({
      * `hasPending()` 永远为真，等事件的调用方于是干等到超时。
      */
     hasInFlight() {
-      return inflight.size > 0 || registry.list().length > 0 || graph.hasInFlight()
+      return inflight.size > 0 || registry.list().length > 0 || runtime._anyGraph(g => g.hasInFlight())
+    },
+
+    /**
+     * 跨**全部**图聚合一个谓词，**含 closed 图**。
+     *
+     * closed 不能漏：一个在飞的 agent 不因为它所属的图被关掉就停止存在。只问活跃
+     * 图的话，主 agent 一切换活跃图就不再等旧图里还在跑的 agent —— 那些结果回来
+     * 时没人接。这条同样是 `_evictClosedGraphs` 跳过在飞图的理由。
+     */
+    _anyGraph(predicate) {
+      for (const entry of graphs.values()) {
+        if (predicate(entry.graph)) return true
+      }
+      return false
+    },
+
+    /**
+     * 渲染图状态给 LLM / 人看。**默认只渲染活跃图** —— 把全部图都摊开等于把
+     * 无界增长从节点级搬到图级，那正是多图容器要收掉的东西。`graphId: 'all'`
+     * 是显式的全量出口（含 closed）。
+     *
+     * @param {{ graphId?: string|null }} [opts]
+     * @returns {string}
+     */
+    statusTable({ graphId = null } = {}) {
+      if (graphs.size === 0) return 'no graph declared'
+      if (graphId === 'all') {
+        return [...graphs.values()].map(e => renderGraphEntry(e, runtime.activeGraphId)).join('\n\n')
+      }
+      if (graphId != null) {
+        const found = runtime._lookupGraph(graphId)
+        if (!found.ok) return found.reason
+        return renderGraphEntry(found.entry, runtime.activeGraphId)
+      }
+      const active = graphs.get(runtime.activeGraphId)
+      if (!active) {
+        return `no active graph (${graphs.size} other graph(s) — pass graph_id "all" to list them)`
+      }
+      return renderGraphEntry(active, runtime.activeGraphId)
     },
 
     /** keep-alive 总开关与单次等待上限（`Agent._keepAliveOnce` 读它们）。 */
@@ -574,7 +827,12 @@ export function createSubagentRuntime({
       ask.cancelAll('runtime closed')
       // 图上未终态的节点：走 `_cancelNode`，它会把有 agent 在跑的节点连 handle
       // 一起 cancelHandle 掉。已终态的节点 `graph.cancel` 自己会拒，无需先筛。
-      for (const nodeId of [...graph.nodes.keys()]) runtime._cancelNode(nodeId, 'runtime closed')
+      // **全部图，不只是活跃图** —— 一张被关掉或被切走的图里照样可能有 agent 在跑。
+      for (const entry of [...graphs.values()]) {
+        for (const nodeId of [...entry.graph.nodes.keys()]) {
+          runtime._cancelNode(nodeId, 'runtime closed', { graphId: entry.graphId })
+        }
+      }
       for (const handle of registry.list()) {
         if (!handle.isTerminal()) {
           // 统一走 cancelHandle：跟 agent_cancel 工具用同一条路径转态 + abort，
@@ -594,6 +852,18 @@ export function createSubagentRuntime({
 
   runtime.tools = createSubagentTools(runtime)
   return runtime
+}
+
+/**
+ * 一张图的状态段：`graphId "label" [state, active]` 一行，再接图自己的节点表。
+ * 图 id 必须出现在渲染里 —— 跨图重名的 node_id 之后，模型全靠它决定 `graph_id`
+ * 该填什么。
+ */
+function renderGraphEntry(entry, activeGraphId) {
+  const bits = [`graph ${entry.graphId}`]
+  if (entry.label) bits.push(JSON.stringify(entry.label))
+  bits.push(`[${entry.state}${entry.graphId === activeGraphId ? ', active' : ''}]`)
+  return `${bits.join(' ')}\n${entry.graph.statusTable()}`
 }
 
 /**

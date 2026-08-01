@@ -90,14 +90,21 @@ export function createSubagentTools(runtime) {
             type: 'boolean',
             description: 'Also print the dependency graph: every node, its state, and why it is blocked',
           },
+          graph_id: {
+            type: 'string',
+            description: 'Which graph to print. Defaults to the one you are working in; pass "all" to list '
+              + 'every graph you have, including closed ones. Implies include_graph.',
+          },
         },
       },
       execute: async ({
         agent_id: agentId, include_finished: includeFinished = false, include_graph: includeGraph = false,
+        graph_id: graphId,
       } = {}) => {
         const base = renderAgentStatus(runtime, { agentId, includeFinished })
-        if (!includeGraph) return base
-        return `${base}\n\n--- graph ---\n${runtime.graph.statusTable()}`
+        // 给了 graph_id 却什么图都不打印是个静默空操作 —— 它本身就是"我要看图"。
+        if (!includeGraph && graphId == null) return base
+        return `${base}\n\n--- graph ---\n${runtime.statusTable({ graphId })}`
       },
     },
 
@@ -111,15 +118,21 @@ export function createSubagentTools(runtime) {
         properties: {
           agent_id: { type: 'string', description: 'Agent id or name' },
           node_id: { type: 'string', description: 'Graph node id — give either this or agent_id' },
+          graph_id: {
+            type: 'string',
+            description: 'Which graph the node_id belongs to. Defaults to the one you are working in.',
+          },
           reason: { type: 'string', description: 'Why it is being cancelled' },
         },
       },
-      execute: async ({ agent_id: agentId, node_id: nodeId, reason = 'cancelled by orchestrator' } = {}) => {
+      execute: async ({
+        agent_id: agentId, node_id: nodeId, graph_id: graphId, reason = 'cancelled by orchestrator',
+      } = {}) => {
         if (!agentId && !nodeId) return 'Error: give either agent_id or node_id.'
         if (nodeId) {
           // 节点路径统一走 `_cancelNode`：它负责把节点上在跑的 agent 也
           // cancelHandle 掉（光改图状态的话那个 agent 还在烧 token）。
-          const cancelled = runtime._cancelNode(nodeId, reason)
+          const cancelled = runtime._cancelNode(nodeId, reason, { graphId })
           if (!cancelled.ok) return `Error: ${cancelled.reason}`
           return `node ${nodeId} cancelled (${reason}).`
         }
@@ -178,13 +191,33 @@ export function createSubagentTools(runtime) {
             },
           },
           max_concurrent: { type: 'number' },
+          graph_id: {
+            type: 'string',
+            description: 'Add these nodes to an existing graph. Omit to use the graph you are currently '
+              + 'working in (one is started for you if you have none).',
+          },
+          label: {
+            type: 'string',
+            description: 'A name for the task this graph tracks. Declaring with a label you have used before '
+              + 'adds to that same graph; a new label starts a separate one, so unrelated tasks keep '
+              + 'independent node_id namespaces and separate status listings.',
+          },
         },
         required: ['nodes'],
       },
-      execute: async ({ nodes, max_concurrent: maxConcurrent } = {}) => {
+      execute: async ({
+        nodes, max_concurrent: maxConcurrent, graph_id: graphId, label,
+      } = {}) => {
+        const resolved = resolveDeclareTarget(runtime, { graphId, label })
+        if (!resolved.ok) return `Error: ${resolved.reason}`
+        const { entry } = resolved
         try {
-          const { accepted } = runtime.graph.declare(nodes, { maxConcurrent })
-          return `declared ${accepted.length} node(s): ${accepted.join(', ')}\n${runtime.graph.statusTable()}`
+          const { accepted } = entry.graph.declare(nodes, { maxConcurrent })
+          // 声明成功才切活跃图：一批被拒的声明不该顺手换掉工作现场。（新开的图是
+          // 例外 —— `newGraph` 自己就置活跃，那张空图留着给模型重试。）
+          runtime.activeGraphId = entry.graphId
+          return `declared ${accepted.length} node(s) in graph ${entry.graphId}: ${accepted.join(', ')}\n`
+            + runtime.statusTable({ graphId: entry.graphId })
         } catch (err) {
           // 整批被拒（环、未知依赖、重名、缺 description……）。返回可纠正的说明，
           // 图上不会留下半个声明。
@@ -201,6 +234,10 @@ export function createSubagentTools(runtime) {
         type: 'object',
         properties: {
           node_id: { type: 'string' },
+          graph_id: {
+            type: 'string',
+            description: 'Which graph the node belongs to. Defaults to the one you are working in.',
+          },
           prompt: { type: 'string', description: 'The full task contract for this node' },
           subagent_type: { type: 'string' },
           model: { type: 'string', enum: modelEnum(runtime.aliases) },
@@ -209,7 +246,8 @@ export function createSubagentTools(runtime) {
         required: ['node_id', 'prompt'],
       },
       execute: async ({
-        node_id: nodeId, prompt, subagent_type: subagentType, model, run_in_background: bg,
+        node_id: nodeId, graph_id: graphId, prompt, subagent_type: subagentType, model,
+        run_in_background: bg,
       } = {}, ctx = {}) => {
         if (typeof nodeId !== 'string' || nodeId.trim() === '') {
           return 'Error: `node_id` is required — the id of the node you declared with agent_graph.'
@@ -219,9 +257,21 @@ export function createSubagentTools(runtime) {
         if (prompt != null && (typeof prompt !== 'string' || prompt.trim() === '')) {
           return 'Error: `prompt` must be this node\'s full task contract in natural language.'
         }
-        const started = runtime.graph.start(nodeId, { prompt, subagent_type: subagentType, model })
+        // 只查不建：`graph_start` 打的是一个已经声明过的节点，凭它凭空造出一张
+        // 空图毫无意义。
+        const resolved = runtime._lookupGraph(graphId)
+        if (!resolved.ok) return `Error: ${resolved.reason}`
+        const { entry } = resolved
+        // 多图之后 node_id 可以跨图重名，所以"不在这张图里"要点名到底哪张图有它
+        // —— `graph.start` 自己只会说 not found，模型没法据此纠正。
+        if (!entry.graph.nodes.has(nodeId)) {
+          return `Error: ${runtime._nodeNotHereReason(nodeId, entry)}`
+        }
+        const started = entry.graph.start(nodeId, { prompt, subagent_type: subagentType, model })
         if (!started.ok) return `Error: ${started.reason}`
-        return runtime._startNode(started.node, { background: bg !== false, signal: ctx.signal })
+        return runtime._startNode(started.node, {
+          graphId: entry.graphId, background: bg !== false, signal: ctx.signal,
+        })
       },
     },
 
@@ -365,6 +415,38 @@ export function createSubagentTools(runtime) {
       },
     },
   ]
+}
+
+/**
+ * `agent_graph` 的目标图选择。三条路，从最显式到最省事：
+ *
+ *   1. 给了 `graph_id` —— 就用它。**closed 的拒掉**：closed 图随时会被 FIFO
+ *      淘汰，往里声明的节点会连带消失，那是个静默的丢活。（只在这里拦；查状态
+ *      与取消一张 closed 图里的节点都必须照旧可行。）
+ *   2. 给了 `label` —— label 就是任务名，"同一任务同一张可变图"：找一张同名的
+ *      open 图接着往里加，没有就新开一张。
+ *   3. 都没给 —— 活跃图，没有活跃图就新开一张。
+ *
+ * @returns {{ ok: true, entry: object } | { ok: false, reason: string }}
+ */
+function resolveDeclareTarget(runtime, { graphId, label }) {
+  if (graphId != null) {
+    const resolved = runtime._resolveGraph(graphId)
+    if (!resolved.ok) return resolved
+    if (resolved.entry.state === 'closed') {
+      return {
+        ok: false,
+        reason: `graph "${graphId}" is closed and no longer takes new nodes. `
+          + 'Omit graph_id to declare into a fresh graph, or pass a label to name it.',
+      }
+    }
+    return resolved
+  }
+  if (typeof label === 'string' && label.trim() !== '') {
+    const match = [...runtime.graphs.values()].find(e => e.state === 'open' && e.label === label)
+    return { ok: true, entry: match ?? runtime.newGraph({ label }) }
+  }
+  return runtime._resolveGraph(null)
 }
 
 /**
