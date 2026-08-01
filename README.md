@@ -944,6 +944,12 @@ agent.lastStopReason             // 取值集合未变：null | 'completed' | 'm
 轮次仍受 `maxRounds` 约束，因此不存在无界循环。`keepAlive: false` 时本轮直接结束，
 通知暂存到下一次 `chat()` / `stream()` 的第一个轮边界。
 
+等待的判据是"真的还有活在飞"（在跑的 agent、排队中的 agent、running 的图节点），
+**不包括 `blocked` 与 `awaiting_confirm` 的图节点** —— 那些等的是主 agent 自己的下一步
+动作，不会自行推进也不产生事件，按它们来等就是每轮干等到超时。所以一个就绪待确认的
+节点：它的就绪通知会被投进上下文（待注入的判断优先于在飞判断），但通知投完之后若没有
+别的活在飞，这一轮就正常收尾，把决定权交回主机与模型。
+
 ### DAG 编排
 
 `agent_graph` 只声明与排队，**不创建任何实例**：`blocked` / `ready` /
@@ -1134,7 +1140,12 @@ subagents: {
    值，但**没有任何代码读它，单次 attempt 超时并未被强制**。一个卡在挂死工具调用上的
    子 agent 目前只受 `maxRounds` 与调用方 `signal` 约束。待后续任务处理（要么实现，
    要么删掉这个选项）。
-8. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
+8. **`Agent_Type.maxAttempts` 取不到效** —— `runner.js` 读的是
+   `this.opts.retry?.maxAttempts ?? type.maxAttempts ?? 3`，而 `runtime.js` 总会把
+   `opts.retry.maxAttempts` 填上（默认 3），于是类型上那个值永远轮不到。类型里写
+   `maxAttempts: 5` 会被静默忽略，实际生效的只有 `subagents.retry.maxAttempts`。
+   与第 7 条同一批待处理。
+9. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
    `RuntimeHistory` 兜底，此时 `history_search` 搜不到父历史，工具结果里会明确说明这一
    点，不假装能搜。
 

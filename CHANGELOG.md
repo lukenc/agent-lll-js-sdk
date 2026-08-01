@@ -146,7 +146,9 @@ subagent 执行，若每个 subagent 各自一个 worktree，下游节点看到�
 
 **`retry.attemptTimeoutMs` 目前是死配置** —— `agent.js` 有文档、`runtime.js` 有默认值，
 但没有任何代码读它，**单次 attempt 超时并未被强制**。一个卡在挂死工具调用上的子 agent
-只受 `maxRounds` 与调用方 `signal` 约束。请不要依赖这个选项。
+只受 `maxRounds` 与调用方 `signal` 约束。请不要依赖这个选项。同一批里还有
+**`Agent_Type.maxAttempts` 取不到效**：`runtime.js` 总会填上 `opts.retry.maxAttempts`
+（默认 3），类型上那个值永远轮不到，实际生效的只有 `subagents.retry.maxAttempts`。
 
 **保留下来的 worktree 会在 `.git/worktrees/<name>` 留下管理项并逐渐累积。** 主机应自行
 `git worktree prune`；框架**有意**不做，因为 prune 是仓库级操作，会碰到本 SDK 之外的
