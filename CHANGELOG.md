@@ -25,7 +25,8 @@
     消息，模型因此知道 `subagent_type` 能填什么。
   - **结构化结果与按类重试**：终态渲染成头部机器可读、正文人可读的 `Agent_Result`
     字符串。`failureKind` 为 `rate_limited` / `llm_error` / `network` / `timeout`
-    时自动重试（默认 `maxAttempts: 3`，退避 `min(2^attempt·1000, 8000)ms`）；
+    时自动重试，退避 `min(2^attempt·1000, 8000)ms`；`maxAttempts` 优先级
+    `subagents.retry.maxAttempts` > `Agent_Type.maxAttempts` > 默认 `3`。
     `max_rounds` / `tool_error` / `aborted` / `depth_exceeded` 不重试，直接作为
     结构化失败回给主 agent 定夺（换模型重发、缩小范围重发、或跳过继续）。重试起的是
     **同一份契约上的全新实例**，不续用失败实例被污染的 memory。契约缺字段、
@@ -144,11 +145,10 @@ subagent 执行，若每个 subagent 各自一个 worktree，下游节点看到�
 入参，因为静默重写路径会造出"看起来隔离、实际没隔离"的错觉 —— 那比没有隔离更坏，因为
 主机会信它。
 
-**`retry.attemptTimeoutMs` 目前是死配置** —— `agent.js` 有文档、`runtime.js` 有默认值，
-但没有任何代码读它，**单次 attempt 超时并未被强制**。一个卡在挂死工具调用上的子 agent
-只受 `maxRounds` 与调用方 `signal` 约束。请不要依赖这个选项。同一批里还有
-**`Agent_Type.maxAttempts` 取不到效**：`runtime.js` 总会填上 `opts.retry.maxAttempts`
-（默认 3），类型上那个值永远轮不到，实际生效的只有 `subagents.retry.maxAttempts`。
+**单次 attempt 没有独立超时。** 一个卡在挂死工具调用上的子 agent 只受 `maxRounds` 与
+调用方 `signal` 约束；`subagents.retry` 只控制"重试几次、多久退避一次"（`maxAttempts`
+优先级：`subagents.retry.maxAttempts` > `Agent_Type.maxAttempts` > 默认 `3`），不控制
+"单次 attempt 能跑多久"——这是刻意留白，而非疏漏，需要单次超时请自行经 `signal` 实现。
 
 **保留下来的 worktree 会在 `.git/worktrees/<name>` 留下管理项并逐渐累积。** 主机应自行
 `git worktree prune`；框架**有意**不做，因为 prune 是仓库级操作，会碰到本 SDK 之外的

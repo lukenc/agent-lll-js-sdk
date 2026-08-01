@@ -123,7 +123,7 @@ path=.worktrees/agent-agt_7f3a9c21 branch=subagent/agt_7f3a9c21 changed=3 files 
 | `rate_limited` | 429（`llm-client` 重试用尽后仍失败） | 是 |
 | `llm_error` | 5xx / 协议错误 / 流截断 | 是 |
 | `network` | fetch 层失败 | 是 |
-| `timeout` | 单次 attempt 超过 `attemptTimeoutMs` | 是 |
+| `timeout` | 底层 LLM/工具调用自行超时（`TimeoutError` 或消息含 "timed out"）；框架不额外强制单次 attempt 超时 | 是 |
 | `max_rounds` | 子 agent 轮次耗尽 | 否 |
 | `tool_error` | 工具连续失败导致子 agent 自行放弃 | 否 |
 | `aborted` | 被 `agent_cancel` / signal 取消 | 否 |
@@ -131,7 +131,7 @@ path=.worktrees/agent-agt_7f3a9c21 branch=subagent/agt_7f3a9c21 changed=3 files 
 | `depth_exceeded` | 超过 `maxDepth` | 否 |
 | `isolation_unavailable` | `isolation` 指定但环境不支持 | 否 |
 
-重试 = **同一份契约起一个全新子 agent 实例**（不续用失败实例的 memory，避免把污染的上下文带进重试）。`attempt` 计入产物归属。重试之间沿用 `llm-client` 已有的指数退避语义，额外在 run 级重试前等待 `min(2^attempt * 1000, 8000)ms`。默认 `maxAttempts: 3`，可按类型、按 `subagents.retry` 全局覆盖。
+重试 = **同一份契约起一个全新子 agent 实例**（不续用失败实例的 memory，避免把污染的上下文带进重试）。`attempt` 计入产物归属。重试之间沿用 `llm-client` 已有的指数退避语义，额外在 run 级重试前等待 `min(2^attempt * 1000, 8000)ms`。`maxAttempts` 优先级：`subagents.retry.maxAttempts` > `Agent_Type.maxAttempts` > 默认 `3`。
 
 ### Graph_Node
 
@@ -233,7 +233,7 @@ opts.subagents = {
   maxConcurrent: 4,                       // 每个 depth 层独立的并发槽数（见 §7）
   maxDepth: 2,                            // 主 agent depth=0；depth 2 的 agent 不能再派
   modelAliases: { fast: {...}, main: {...} },
-  retry: { maxAttempts: 3, attemptTimeoutMs: 600000 },
+  retry: { maxAttempts: 3 },              // 优先级：本字段 > Agent_Type.maxAttempts > 3
   keepAlive: true,                        // §8
   keepAliveTimeoutMs: 600000,
   artifacts: { policy: 'warn' },          // 'warn' | 'deny'
@@ -297,7 +297,7 @@ Available agent types for the `agent` tool:
 
 ## 5. 工具集
 
-10 个工具，仅在 `opts.subagents` 配置后注入，全部注册为 base tool。子 agent 默认只看到 `send_message` / `history_search` / `history_get` / `artifact_write` / `artifact_list` / `ask_user`；`agent` / `agent_graph` / `graph_start` 仅给 `canSpawn: true` 的类型。
+10 个工具，仅在 `opts.subagents` 配置后注入，全部注册为 base tool。子 agent 拿到哪些工具由 `Agent_Type.tools` 决定：`'*'` 继承父 agent 整个工具集（`agent` / `agent_graph` / `graph_start` 仅给 `canSpawn: true` 的类型保留）；显式数组则是"数组点名的任务工具"∪"固定的基础设施 floor"——`send_message` / `history_search` / `history_get` / `artifact_write` / `artifact_list` / `ask_user`（`FLOOR_TOOLS`，见 `runner.js`）无论数组里写没写都会带上，与父 agent 实际拥有的工具取交集。floor **不含** `agent` / `agent_graph` / `graph_start`——派生子 agent 的能力仍然只由 `canSpawn` 把关。
 
 ### 5.1 `agent`
 
