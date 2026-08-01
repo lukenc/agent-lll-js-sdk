@@ -6204,7 +6204,13 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 
 ### Task 19: 图生命周期、弃图协议与节点重新激活
 
-**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`、`src/agents/contract.js`、`src/agents/graph.js`；Test `src/agents/graph-lifecycle.test.js`
+**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`、`src/agents/contract.js`、`src/agents/graph.js`、`src/agent.js`；Test `src/agents/graph-lifecycle.test.js`
+
+**19-前置. 修 Task 18 遗留的一处跨图统计（小，但会误导模型）**
+
+`agent.js:1450` 的 `pendingNodes` 仍只数活跃图（`this.subagents.graph?.pendingCount()`）。这个数字同时进两处：`run.keep_alive.timeout` 事件，**以及注入给模型的收尾提示文本**（"还有 N 个 agent、M 个图节点未完成…请收尾"）。若未完成节点在非活跃图里，模型会被告知"0 个图节点未完成"并被要求收尾 —— 正好在它决定要不要停下来的那一刻拿到错的数。keep-alive 的**决策**是对的（用的是跨图 `hasInFlight()`），错的只是告知。
+
+加 `runtime.pendingNodeCount()` 跨全部图聚合，`agent.js` 改用它。测试：两张图各有待办节点时，切换活跃图不改变这个数。
 
 **19a. 关闭与弃图协议**
 
