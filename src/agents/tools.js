@@ -2,7 +2,7 @@
  * subagent 系统的元工具。全部遵循本仓库的**软失败**风格：入参非法、类型未注册、
  * 目标不存在等情况返回说明字符串让模型自行纠正，不 throw。
  */
-import { AGENT_TOOL_DESCRIPTION } from './contract.js'
+import { AGENT_TOOL_DESCRIPTION, AGENT_GRAPH_DESCRIPTION } from './contract.js'
 import { modelEnum } from './models.js'
 import { searchHistory, getHistoryEvent } from './history-search.js'
 import { cancelHandle } from './runner.js'
@@ -143,11 +143,7 @@ export function createSubagentTools(runtime) {
 
     {
       name: 'agent_graph',
-      description: 'Declare a dependency graph of tasks. Declaring does NOT create agents — nodes are '
-        + 'instantiated only when their dependencies have succeeded. By default a ready node hands its '
-        + 'upstream results back to you and waits: you then call graph_start with the final prompt, having '
-        + 'seen what upstream actually produced. Use on_ready "auto" only when the downstream task is fully '
-        + 'determined in advance and cannot be affected by upstream results.',
+      description: AGENT_GRAPH_DESCRIPTION,
       parameters: {
         type: 'object',
         properties: {

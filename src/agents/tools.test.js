@@ -3,6 +3,7 @@ import assert from 'node:assert'
 import { RuntimeHistory } from '../runtime-history.js'
 import { createSubagentRuntime } from './runtime.js'
 import { SUBAGENT_TOOL_NAMES } from './tools.js'
+import { AGENT_GRAPH_DESCRIPTION } from './contract.js'
 import { resetAgentTypes, registerAgentType } from './types.js'
 
 function fakeParent(reply = '子 agent 报告') {
@@ -58,6 +59,11 @@ test('agent 工具的 schema 严格对齐参考实现', () => {
   assert.deepStrictEqual(p.properties.isolation.enum, ['worktree', 'remote'])
   assert.strictEqual(p.properties.run_in_background.type, 'boolean')
   assert.match(tool.description, /3-8 word/)
+})
+
+test('agent_graph 工具的 description 就是 AGENT_GRAPH_DESCRIPTION（无本地拷贝、不会漂移）', () => {
+  const tool = byName(makeRuntime(fakeParent()).tools, 'agent_graph')
+  assert.strictEqual(tool.description, AGENT_GRAPH_DESCRIPTION)
 })
 
 test('model enum 跟随主机别名表', () => {
