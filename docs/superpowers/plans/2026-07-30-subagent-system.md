@@ -63,11 +63,12 @@
 
 **阶段划分（每阶段结束时全绿且可用）：**
 
-- **Phase 1（Task 1-8）**：能派 subagent、能查状态、能取消、产物记账、历史检索。
-- **Phase 2（Task 9-11）**：轮边界注入、A2A 邮箱与 `send_message`、多路提问路由。
-- **Phase 3（Task 12-13）**：DAG 声明与惰性调度、keep-alive。
-- **Phase 4（Task 14）**：worktree 隔离。
-- **Phase 5（Task 15）**：导出与文档。
+- **Phase 1（Task 1-9）**：能派 subagent、能查状态、能取消、产物记账、历史检索；接入 `Agent`。
+- **Phase 2（Task 10-12）**：轮边界注入、A2A 邮箱与 `send_message`、多路提问路由。
+- **Phase 3（Task 13-15）**：DAG 声明与惰性调度、图工具接入、keep-alive。
+- **Phase 4（Task 16）**：worktree 隔离（**后经用户决定搁置为 Node-only 实验特性**，见 spec §11）。
+- **Phase 5（Task 17）**：导出与文档。
+- **Phase 6（Task 18-20）**：多图 —— 图按任务划分（用户决定，2026-08-01，见本文末尾）。
 
 ---
 
@@ -6146,7 +6147,15 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 ### 本阶段替用户拍定的三处（可否决）
 
 1. **`graphId` 由框架生成**（`gph_` + 单调计数器，不混时间位 —— 与 `agentId` / `newEnvelopeId` 同一教训，本项目已两次因时间戳撞号）。模型可另给 `label` 便于人读。
-2. **关闭是单向的，v1 不支持重开**。已关闭的图的节点仍可查询，但要恢复工作就重新声明一张新图。理由：重开要处理"取消过的节点能不能复活"，而 `AgentGraph` 的 no-resurrection 规则（Task 13）刻意禁止终态节点被迟到的回报改写；为了重开去松动那条规则，风险大于收益。
+2. **关闭是单向的,但节点可以重新激活**(用户决定,2026-08-01)。用例:用户在外部提出局部修改,正好命中一个**已完成**节点的工作 —— 主 agent 应当能重新激活那个节点,以及那些用过它产物的后续节点。
+
+   这本质是**缓存失效**:已完成节点的产物是一份缓存,输入变了,它与消费过它的下游都得重跑。
+
+   **它不与 Task 13 的 no-resurrection 规则冲突。** 那条规则防的是**异步迟到回报**(一个被取消节点的 agent 事后才 settle,不该把节点救活);它防的不是**主 agent 显式、同步地决定重跑**。这与取消语义那轮确立的区分是同一条:刻意的动作 vs 偶发的迟到信号。所以重新激活不需要削弱那条规则,它需要一条那条规则管不到的显式通道 + 一个 generation 令牌把两者区分开。
+
+3. **失效范围由模型决定,框架不自动推导**(用户决定)。`graph_reactivate({ node_ids })` 精确激活模型点名的节点,框架不自动扩散到下游。
+
+   **但框架必须把判断依据摆到模型面前。** 模型手工挑节点会漏 —— 它得靠记忆推断"谁消费过 n1 的产物",而它的上下文可能已被压缩过;漏一个下游,那个下游就拿着过期认知继续跑。所以激活的返回值必须列出:哪些节点在拓扑上位于被激活节点的下游、其中哪些的 `inputs` 里出现过被激活节点的产物 key、以及这些节点里**哪些没有被列进本次 `node_ids`**。让漏掉成为一个看得见的选择,而不是一次无声的遗忘。
 3. **`hasInFlight()` / `hasPending()` 跨全部图聚合，不分 open/closed** —— 在飞的 agent 不因为它所属的图被关掉就消失。这是 keep-alive 正确性的硬要求。
 
 ### Task 18: 多图容器与 graph_id 透传
@@ -6164,9 +6173,11 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 - `close()` 取消全部图的未终态节点
 - `retainClosedGraphs` 默认 5：整张 closed 图按 FIFO 淘汰，防止把无界增长从节点级搬到图级
 
-### Task 19: 图生命周期与弃图协议
+### Task 19: 图生命周期、弃图协议与节点重新激活
 
-**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`、`src/agents/contract.js`；Test `src/agents/graph-lifecycle.test.js`
+**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`、`src/agents/contract.js`、`src/agents/graph.js`；Test `src/agents/graph-lifecycle.test.js`
+
+**19a. 关闭与弃图协议**
 
 - `graph_close({ graph_id, disposition, reason? })`，`disposition` ∈ `'cancel_outstanding'` | `'keep_running'`
   - `cancel_outstanding` → 每个未终态节点走 `runtime._cancelNode`（经 `cancelHandle`，连带结算 `ask_user` 上挂着的提问）
@@ -6174,6 +6185,21 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 - 关闭活跃图后 `activeGraphId` 置空；下一次 `agent_graph` 不带 `graph_id` 时新建
 - **`AGENT_GRAPH_DESCRIPTION` 与 `graph_close` 的 `Tool_Def.description` 必须写明弃图协议**：话题变了就是任务结束的信号；关闭一张仍有未完成节点的图之前，**必须先用 `ask_user` 问用户**怎么处理（等它跑完 / 取消掉 / 留着不管），拿到答复再 `graph_close`。框架无法判断任务是否结束，这个判断只能由模型做，而后果（取消别人跑了一半的活）只能由用户决定。
 - 协议不需要新机制：`ask_user` 已是带归属、可乱序应答的注册表（Task 12）
+
+**19b. 节点重新激活（缓存失效）**
+
+`graph.js` 需要三处改动，其余仍不动：
+
+1. **节点加 `generation` 计数器。** `reactivate` 时自增。
+2. **`onAgentSettled` 改按 generation 收报，不再只看"当前是不是终态"。** 现在的守卫是 `if (GRAPH_TERMINAL_STATES.has(node.state)) return`（graph.js:400），看的是**节点当前状态**；节点一旦被激活就不再是终态，于是**旧那一轮 agent 的迟到回报会通过这道守卫**，在下一行把节点改回 `succeeded`，把陈旧结果复活并据此放行本该重跑的下游 —— 典型 ABA。回报必须带上它所属的 generation，不匹配就丢弃。同时 graph.js:399 那句 `if (agentId != null) node.agentId = agentId` 也要纳入同一判断：现在它连终态节点的 `agentId` 都会被迟到回报无条件覆写。
+
+   > 可达性说明（诚实记录）：`_resume` 不向图回报（只有 `_startNode` 的两处会），所以恢复一个已完成 agent 撞不到图上。当前唯一可达路径是**对 `running` 状态的节点做激活**。generation 匹配仍要做 —— 它便宜，且把这条不变量从"碰巧没人踩"变成"显式挡住"。
+3. **`reactivate(nodeIds)`**：把点名的节点从终态送回 `blocked`，清空 `agentId` / `result` / `error`，自增 generation，然后 `tick()`（依赖已满足的会重新走到 `awaiting_confirm`，由主 agent 用 `graph_start` 写新契约）。**只接受点名的节点，不自动扩散。**
+
+- `graph_reactivate({ graph_id?, node_ids, reason? })` 工具。**已关闭的图也允许激活**（这正是用户的用例：任务收尾后又来了局部修改）；激活会把该图重新置为 open。
+- **返回值必须给出模型漏掉的东西**：哪些节点在拓扑上位于被激活节点下游、其中哪些的 `inputs` 曾出现被激活节点产出的 artifact key、以及这些里**哪些没被列进本次 `node_ids`**。措辞要让"没列进来"读起来是一个待确认的选择，而不是一句可以忽略的提示。
+- `Tool_Def.description` 要说清：重新激活一个节点，就是宣告它的产物已过期；任何消费过那份产物的下游若不一并激活，就会拿着过期认知继续跑。
+
 
 ### Task 20: 文档修订
 
