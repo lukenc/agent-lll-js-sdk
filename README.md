@@ -916,10 +916,16 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 
 子 agent 拿到哪些工具由它的 `Agent_Type.tools` 决定：`'*'`（内置
 `general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但**始终剔除**
-`agent` / `agent_graph` / `graph_start`，除非该类型 `canSpawn: true`；给一个名字数组则
-只保留数组里点到的工具。所以一个窄类型若需要记产物或检索历史，必须把
-`artifact_write` / `history_search` 这些元工具**显式写进它的 `tools` 数组**（上面
-`explorer` 的例子就是这么做的），否则它们不会被继承。
+`agent` / `agent_graph` / `graph_start`，除非该类型 `canSpawn: true`；给一个名字
+数组则保留数组里点到的工具，**外加一组固定的基础设施工具（floor）**：
+`artifact_write` / `artifact_list` / `history_search` / `history_get` /
+`send_message` / `ask_user` 无论数组里写没写都会带上（与父 agent 实际拥有的工具
+取交集 —— 父 agent 自己都没有的 floor 工具不会被凭空生造出来）。`explorer` 这样
+的窄类型不再需要把这些元工具显式写进 `tools` 数组：一个类型写 `tools:
+['read_file']` 的意思是"这个 agent 只读文件"，不是"它也不准写产物、搜历史、
+问用户" —— 与 `tool-filter.js` 的 `BASE_TOOLS`（`ToolFilter` 对任何意图过滤结果都
+恒定保留）同一思路。派生新 agent 的能力仍然只由 `canSpawn` 把关，floor **不**
+包含 `agent` / `agent_graph` / `graph_start`。
 
 ### 后台派发与 keep-alive
 
@@ -1136,16 +1142,7 @@ subagents: {
 6. **保留下来的 worktree 会在 `.git/worktrees/<name>` 留下管理项并逐渐累积** ——
    主机应自行 `git worktree prune`；框架**有意**不做，因为 prune 是仓库级操作，会碰到
    本 SDK 之外的 worktree。
-7. **`retry.attemptTimeoutMs` 是死配置** —— `agent.js` 里有文档、`runtime.js` 里有默认
-   值，但**没有任何代码读它，单次 attempt 超时并未被强制**。一个卡在挂死工具调用上的
-   子 agent 目前只受 `maxRounds` 与调用方 `signal` 约束。待后续任务处理（要么实现，
-   要么删掉这个选项）。
-8. **`Agent_Type.maxAttempts` 取不到效** —— `runner.js` 读的是
-   `this.opts.retry?.maxAttempts ?? type.maxAttempts ?? 3`，而 `runtime.js` 总会把
-   `opts.retry.maxAttempts` 填上（默认 3），于是类型上那个值永远轮不到。类型里写
-   `maxAttempts: 5` 会被静默忽略，实际生效的只有 `subagents.retry.maxAttempts`。
-   与第 7 条同一批待处理。
-9. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
+7. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
    `RuntimeHistory` 兜底，此时 `history_search` 搜不到父历史，工具结果里会明确说明这一
    点，不假装能搜。
 
