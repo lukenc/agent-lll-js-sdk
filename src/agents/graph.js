@@ -63,6 +63,9 @@ const UPSTREAM_DEAD_REASON = Object.freeze({
   skipped: 'upstream_skipped',
 })
 
+/** `UPSTREAM_DEAD_REASON` 的取值集合 —— `tick` 用它认出一条已经作废的 blockedReason。 */
+const UPSTREAM_DEAD_REASONS = new Set(Object.values(UPSTREAM_DEAD_REASON))
+
 /**
  * Kahn 拓扑排序。返回 null（无环）或一条可读的环路径。
  *
@@ -221,6 +224,11 @@ export class AgentGraph {
         blockedReason: null,
         agentId: null,
         result: null,
+        /**
+         * 这个节点跑到第几轮了。`reactivate` 自增，`onAgentSettled` 拿它收报 ——
+         * 见那里的注释：不带 generation 的判断在重新激活面前是个 ABA。
+         */
+        generation: 0,
         /** 宿主回调抛出的异常消息（`_invoke` 记的），失败原因的人类可读部分。 */
         error: null,
         declaredAt: this._now(),
@@ -287,6 +295,10 @@ export class AgentGraph {
           }
           continue
         }
+        // 上游不再是死的了（唯一的成因：那个上游刚被 `reactivate` 送回来），可
+        // `blockedReason` 还写着 `upstream_cancelled` 之类。留着它就是一句假话，
+        // 而 `statusTable()` 是模型看图的唯一窗口。
+        if (UPSTREAM_DEAD_REASONS.has(node.blockedReason)) node.blockedReason = null
         if (!upstream.every(u => u.state === 'succeeded')) continue
 
         const upstreamView = upstream.map(u => ({
@@ -384,10 +396,24 @@ export class AgentGraph {
    * agent 状态回报：登记结果并推进下游。终态之外的 `running` / `waiting_input`
    * 也走这里（顺带把 agentId 挂到节点上），因为图需要知道谁还在飞。
    *
-   * 已经是终态的节点会忽略迟到的回报 —— 被取消的 agent 收尾时 runner 仍会报
-   * 一次终态，不能让它把 cancelled 覆盖掉、把下游从一条已取消的分支上放出去。
+   * **回报要不要采信，看的是"它属于哪一轮"，不是"节点现在什么状态"。** 两条要挡的
+   * 路径：
+   *
+   *   - 已终态的节点：被取消的 agent 收尾时 runner 仍会报一次终态，不能让它把
+   *     cancelled 覆盖掉、把下游从一条已取消的分支上放出去（Task 13）。
+   *   - **已被 `reactivate` 送回来的节点**：它此刻不是终态，于是上一条守卫放它过
+   *     去，下一行就把节点改回 succeeded、把陈旧结果写回去，并据此放行本该重跑的
+   *     下游 —— 典型 ABA，全程不报错。`generation` 就是为这条路径存在的令牌：
+   *     `_startNode` 在启动时捕获当轮的 generation 并随两次回报一起带回来，对不上
+   *     就丢掉。
+   *
+   * 省略 `generation` 的回报照旧被采信（宿主与老调用点不必都改），此时守的只剩终态
+   * 那一条。
+   *
+   * `agentId` 也在同一道判断之内：它是身份不是状态，但一份不该被采信的回报里的身份
+   * 同样不该被采信 —— 让上一轮的 agentId 覆盖上去，取消与查状态就都打到错的 agent。
    */
-  onAgentSettled({ nodeId, state, agentId = null, result = null } = {}) {
+  onAgentSettled({ nodeId, state, agentId = null, result = null, generation = null } = {}) {
     // state 先校验：不认识的状态是编程错误，跟节点在不在图里无关。
     if (!REPORTABLE_STATES.has(state)) {
       throw new AgentGraphError(
@@ -395,9 +421,14 @@ export class AgentGraph {
     }
     const node = this.nodes.get(nodeId)
     if (!node) return
-    // agentId 是身份不是状态，先记下来：终态节点也允许迟到的回报补上它。
-    if (agentId != null) node.agentId = agentId
+    if (generation != null && generation !== node.generation) {
+      this._emit('graph.node.stale_report', {
+        nodeId: node.nodeId, state, agentId, generation, currentGeneration: node.generation,
+      })
+      return
+    }
     if (GRAPH_TERMINAL_STATES.has(node.state)) return
+    if (agentId != null) node.agentId = agentId
     node.state = state
     if (result != null) node.result = result
     this._emit('graph.node.settled', { nodeId: node.nodeId, state, agentId: node.agentId })
@@ -424,6 +455,73 @@ export class AgentGraph {
     this._emit('graph.node.cancelled', { nodeId: node.nodeId, reason, previousState, agentId: node.agentId })
     this.tick()
     return { ok: true, agentId: node.agentId, previousState }
+  }
+
+  /**
+   * 重新激活一批已终态的节点 —— 缓存失效。
+   *
+   * 一个已完成节点的产物是一份**缓存**：输入变了（用户提了局部修改、上游被重跑），
+   * 它就得重跑。节点回到 `blocked`，清掉上一轮的 `agentId` / `result` / `error`，
+   * 自增 `generation`，然后 `tick()` —— 依赖已满足的会走到 `awaiting_confirm`，由
+   * 主 agent 用 `graph_start` 写新契约（不是沿用旧的：输入变了，契约多半也该变）。
+   *
+   * **只接受点名的节点，不自动扩散到下游。** 失效范围由模型决定：框架自动铲掉整
+   * 条下游会连模型判断"仍然有效"的那些一起铲，而框架没有依据做那个判断。代价是
+   * 模型会漏 —— 所以调用方（`graph_reactivate`）必须把漏掉的下游摆到它面前。
+   *
+   * 与 Task 13 的"终态节点不被迟到回报复活"不冲突：那条规则防的是**异步迟到的
+   * 信号**，这里是主 agent **显式、同步**的决定。两者靠 `generation` 区分开，见
+   * `onAgentSettled`。
+   *
+   * `prompt` 故意留着（当 `graph_start` 的默认值）。于是 `on_ready: 'auto'` 的节点
+   * 一被激活就带着原来那份 prompt 自己重新起飞 —— 与 `auto` 的语义一致（"活儿事先
+   * 就定死了"），要改契约的话本来就不该声明成 auto。
+   *
+   * @param {string[]} nodeIds
+   * @returns {{ reactivated: string[], skipped: Array<{ nodeId: string, reason: string }> }}
+   */
+  reactivate(nodeIds) {
+    if (!Array.isArray(nodeIds) || nodeIds.length === 0
+      || nodeIds.some(id => typeof id !== 'string' || id.length === 0)) {
+      throw new AgentGraphError(
+        'agent_graph: node_ids must be a non-empty array of node ids')
+    }
+    const reactivated = []
+    /** @type {Array<{ nodeId: string, reason: string }>} */
+    const skipped = []
+
+    for (const nodeId of [...new Set(nodeIds)]) {
+      const node = this.nodes.get(nodeId)
+      if (!node) {
+        skipped.push({ nodeId, reason: `node "${nodeId}" not found` })
+        continue
+      }
+      if (!GRAPH_TERMINAL_STATES.has(node.state)) {
+        // 一个还没跑完的节点没有"过期的产物"可言 —— 想让它停下来是 agent_cancel。
+        skipped.push({
+          nodeId,
+          reason: `node "${nodeId}" is ${node.state}; only a node in a terminal state `
+            + `(${[...GRAPH_TERMINAL_STATES].join(' / ')}) can be reactivated`,
+        })
+        continue
+      }
+      const previousState = node.state
+      node.state = 'blocked'
+      node.blockedReason = null
+      node.agentId = null
+      node.result = null
+      node.error = null
+      node.generation += 1
+      reactivated.push(nodeId)
+      this._emit('graph.node.reactivated', {
+        nodeId, previousState, generation: node.generation,
+      })
+    }
+
+    // 一次 tick 收尾，不是每个节点一次：同一批里可能互为上下游，逐个 tick 只会
+    // 让中间态多跑几遍。
+    if (reactivated.length > 0) this.tick()
+    return { reactivated, skipped }
   }
 
   /** 还有节点没走到终态？（waiting_input 算还在跑） */
@@ -490,6 +588,7 @@ function snapshot(node) {
     error: node.error,
     agentId: node.agentId,
     result: node.result,
+    generation: node.generation,
     declaredAt: node.declaredAt,
   }
 }

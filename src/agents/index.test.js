@@ -31,6 +31,7 @@ const INTERNAL = [
   'ArtifactTrack', 'wrapMemoryForMirror', 'createWorktree', 'removeWorktree',
   // 工具工厂与 contract 常量：由 runtime 自己装配，主机不该手搓
   'createSubagentTools', 'renderContract', 'AGENT_TOOL_DESCRIPTION', 'AGENT_GRAPH_DESCRIPTION',
+  'GRAPH_CLOSE_DESCRIPTION', 'GRAPH_REACTIVATE_DESCRIPTION',
   // a2a 内部：解析器与内部注册入口
   'encodeEnvelope', 'decodeEnvelope', 'resolveA2ATransport', '_setBuiltinTransport',
   'createLocalTransport',
@@ -90,10 +91,11 @@ test('导出的东西类型正确', () => {
   assert.ok(Array.isArray(agents.SUBAGENT_TOOL_NAMES))
 })
 
-test('SUBAGENT_TOOL_NAMES 就是 10 个元工具', () => {
+test('SUBAGENT_TOOL_NAMES 就是 12 个元工具', () => {
   assert.deepStrictEqual([...agents.SUBAGENT_TOOL_NAMES].sort(), [
     'agent', 'agent_cancel', 'agent_graph', 'agent_status',
     'artifact_list', 'artifact_write',
-    'graph_start', 'history_get', 'history_search', 'send_message',
+    'graph_close', 'graph_reactivate', 'graph_start',
+    'history_get', 'history_search', 'send_message',
   ])
 })
