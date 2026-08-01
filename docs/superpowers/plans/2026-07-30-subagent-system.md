@@ -6132,3 +6132,51 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 
 **每个任务的收尾动作固定为：`npm test` 全绿 → commit。** 既有 354 个测试任何一个挂掉都意味着触点破坏了向后兼容，必须修到全绿再提交，不能带着红灯往下走。
 
+
+---
+
+## Phase 5 — 多图：图按任务划分
+
+**背景（用户决定，2026-08-01）**：图的生命周期应当对齐"任务"，不是对齐"Agent 实例"。同一任务同一张图且可继续修改；任务结束时先问用户怎么处理旧图，再开新图；一个主 agent 可同时持有多张图。
+
+现状是一个 Agent 一张永久累积的图。这带来两个已知缺陷：`node_id` 会话级唯一（跨任务撞车整批被拒），`statusTable()` 无界增长。
+
+**改动面实测 21 处，集中在 `runtime.js` / `tools.js`。`graph.js` 不需要改** —— `AgentGraph` 已是自包含实例，本阶段要的是"多个它"，不是重写调度器。
+
+### 本阶段替用户拍定的三处（可否决）
+
+1. **`graphId` 由框架生成**（`gph_` + 单调计数器，不混时间位 —— 与 `agentId` / `newEnvelopeId` 同一教训，本项目已两次因时间戳撞号）。模型可另给 `label` 便于人读。
+2. **关闭是单向的，v1 不支持重开**。已关闭的图的节点仍可查询，但要恢复工作就重新声明一张新图。理由：重开要处理"取消过的节点能不能复活"，而 `AgentGraph` 的 no-resurrection 规则（Task 13）刻意禁止终态节点被迟到的回报改写；为了重开去松动那条规则，风险大于收益。
+3. **`hasInFlight()` / `hasPending()` 跨全部图聚合，不分 open/closed** —— 在飞的 agent 不因为它所属的图被关掉就消失。这是 keep-alive 正确性的硬要求。
+
+### Task 18: 多图容器与 graph_id 透传
+
+**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`；Test `src/agents/graph-multi.test.js`
+
+- `runtime.graphs: Map<graphId, { graph, label, state: 'open'|'closed', createdAt, closedAt }>`，`runtime.activeGraphId`
+- `runtime._resolveGraph(graphId)`：给 id 用给的；不给用活跃图；活跃图不存在则新建一张并置为活跃
+- `runtime.graphs` 之外保留 `runtime.graph` getter 指向活跃图的 `AgentGraph`，让 21 处调用点最小改动
+- `node_id` 唯一性收窄到图级（天然结果：每张图自己的 `nodes` Map）
+- `agent_graph({ nodes, graph_id?, label? })`；`graph_start` / `agent_cancel` / `agent_status` 加可选 `graph_id`
+- `graph_start({ node_id })` 不给 graph_id 时默认活跃图；node_id 不在活跃图内则软失败，并列出哪几张图含这个 node_id
+- `agent_status({ graph_id })` 默认只列活跃图；`graph_id: 'all'` 列全部
+- **`hasInFlight()` / `hasPending()` 跨全部图聚合**（含 closed）
+- `close()` 取消全部图的未终态节点
+- `retainClosedGraphs` 默认 5：整张 closed 图按 FIFO 淘汰，防止把无界增长从节点级搬到图级
+
+### Task 19: 图生命周期与弃图协议
+
+**Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`、`src/agents/contract.js`；Test `src/agents/graph-lifecycle.test.js`
+
+- `graph_close({ graph_id, disposition, reason? })`，`disposition` ∈ `'cancel_outstanding'` | `'keep_running'`
+  - `cancel_outstanding` → 每个未终态节点走 `runtime._cancelNode`（经 `cancelHandle`，连带结算 `ask_user` 上挂着的提问）
+  - `keep_running` → 图标记 closed，在飞 agent 继续跑，`hasInFlight()` 仍算它们
+- 关闭活跃图后 `activeGraphId` 置空；下一次 `agent_graph` 不带 `graph_id` 时新建
+- **`AGENT_GRAPH_DESCRIPTION` 与 `graph_close` 的 `Tool_Def.description` 必须写明弃图协议**：话题变了就是任务结束的信号；关闭一张仍有未完成节点的图之前，**必须先用 `ask_user` 问用户**怎么处理（等它跑完 / 取消掉 / 留着不管），拿到答复再 `graph_close`。框架无法判断任务是否结束，这个判断只能由模型做，而后果（取消别人跑了一半的活）只能由用户决定。
+- 协议不需要新机制：`ask_user` 已是带归属、可乱序应答的注册表（Task 12）
+
+### Task 20: 文档修订
+
+**Files:** Modify `CLAUDE.md`、`README.md`、`CHANGELOG.md`、`docs/superpowers/specs/2026-07-30-subagent-system-design.md`
+
+Task 17 的文档是按单图模型写的，本阶段落地后其中 DAG 部分需修订：图按任务划分、`node_id` 图级唯一、多图共存、弃图协议、`retainClosedGraphs`。spec 的 §5.4 / §7 / §16 同步更新。
