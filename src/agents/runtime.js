@@ -92,7 +92,15 @@ export function createSubagentRuntime({
   const runner = new SubagentRunner({
     parent, registry, artifacts, sharedHistory, aliases,
     opts: {
-      retry: { maxAttempts: retry.maxAttempts ?? 3, attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 },
+      // `{ ...retry }`，不是挑着重建 `{ maxAttempts, attemptTimeoutMs }` 两个键：
+      // 早年这里连同 `maxAttempts` 一起 eager 填了默认值 `3`，于是 `runner.js`
+      // 那条 `opts.retry?.maxAttempts ?? type.maxAttempts ?? 3` 回退链里
+      // `opts.retry.maxAttempts` 恒非 undefined，`?? type.maxAttempts` 永远轮
+      // 不到 —— `Agent_Type.maxAttempts` 因此不可达（followup 修复）。默认值
+      // 唯一该解析的地方是 runner.js 那条回退链本身，这里不能替它抢答；顺带
+      // 让 host 传的其余 retry 字段（比如 `backoffMs`）不再被这里的白名单
+      // 悄悄吞掉。
+      retry: { ...retry },
       maxDepth,
       isolation: isolationOpts,
     },

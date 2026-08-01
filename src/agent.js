@@ -221,7 +221,8 @@ export class Agent {
    * @param {number} [opts.subagents.maxConcurrent=4] - 每个 depth 层的并发上限
    * @param {number} [opts.subagents.maxDepth=2] - 允许的最大派生深度
    * @param {Record<string, { model?: string, apiKey?: string, url?: string }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）
-   * @param {object} [opts.subagents.retry] - 重试配置（maxAttempts 默认 3，attemptTimeoutMs 默认 600000）
+   * @param {object} [opts.subagents.retry] - 重试配置。`maxAttempts` 优先级：本字段 >
+   *   `Agent_Type.maxAttempts` > 3；`backoffMs` 为退避基数（默认 `min(2^attempt·1000, 8000)`）
    * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
    * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
    * @param {object} [opts.subagents.a2a] - A2A 配置。`transport` 默认 'local'（进程内投递）；
