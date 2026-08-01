@@ -6162,16 +6162,45 @@ git commit -m "docs(agents): export the subagent public surface and document it"
 
 **Files:** Modify `src/agents/runtime.js`、`src/agents/tools.js`；Test `src/agents/graph-multi.test.js`
 
-- `runtime.graphs: Map<graphId, { graph, label, state: 'open'|'closed', createdAt, closedAt }>`，`runtime.activeGraphId`
-- `runtime._resolveGraph(graphId)`：给 id 用给的；不给用活跃图；活跃图不存在则新建一张并置为活跃
-- `runtime.graphs` 之外保留 `runtime.graph` getter 指向活跃图的 `AgentGraph`，让 21 处调用点最小改动
-- `node_id` 唯一性收窄到图级（天然结果：每张图自己的 `nodes` Map）
+**Interfaces:**
+- Consumes: `AgentGraph`（`./graph.js`，**不改**）、`cancelHandle`（`./runner.js`）
+- Produces（`runtime` 上的新面）：
+  - `runtime.graphs: Map<graphId, GraphEntry>`，`GraphEntry = { graph, graphId, label, state: 'open'|'closed', createdAt, closedAt }`
+  - `runtime.activeGraphId: string | null`
+  - `runtime.newGraph({ label? }) -> GraphEntry` —— `graphId` = `gph_` + 单调计数器补零到 8 位十六进制（**不混时间位**，与 `newAgentId` / `newEnvelopeId` 同一理由，本项目已两次因时间戳撞号）
+  - `runtime._resolveGraph(graphId) -> { ok: true, entry } | { ok: false, reason }` —— 给了 id 就查，查不到 `ok:false`；不给则用活跃图，活跃图不存在时**新建一张并置为活跃**
+  - `runtime.graph` 保留为 **getter**，返回活跃图的 `AgentGraph`（活跃图不存在时返回 `null`）—— 让既有 21 处调用点最小改动
+  - `runtime.findNodeGraphs(nodeId) -> GraphEntry[]` —— 供 `graph_start` 的软失败提示用
+  - `runtime.hasInFlight()` / `runtime.hasPending()` —— **跨全部图聚合，含 closed**
+  - `runtime.statusTable({ graphId })`
+
+**实现要点**
+
+- `node_id` 唯一性天然收窄到图级：每张图自己的 `nodes` Map，`AgentGraph` 无需改动
 - `agent_graph({ nodes, graph_id?, label? })`；`graph_start` / `agent_cancel` / `agent_status` 加可选 `graph_id`
-- `graph_start({ node_id })` 不给 graph_id 时默认活跃图；node_id 不在活跃图内则软失败，并列出哪几张图含这个 node_id
-- `agent_status({ graph_id })` 默认只列活跃图；`graph_id: 'all'` 列全部
-- **`hasInFlight()` / `hasPending()` 跨全部图聚合**（含 closed）
-- `close()` 取消全部图的未终态节点
-- `retainClosedGraphs` 默认 5：整张 closed 图按 FIFO 淘汰，防止把无界增长从节点级搬到图级
+- `graph_start({ node_id })` 不给 `graph_id` 时用活跃图；node_id 不在活跃图内则**软失败并列出哪几张图含这个 node_id**（用 `findNodeGraphs`）—— 多图之后 node_id 可跨图重名，这个提示是模型自我纠正的唯一依据
+- `agent_status({ graph_id })` 默认只列活跃图；`graph_id: 'all'` 列全部（含 closed）
+- `close()` 取消**全部图**的未终态节点，仍经 `_cancelNode` → `cancelHandle(handle, { reason, emit, ask })`
+- `retainClosedGraphs` 默认 5：整张 closed 图按 FIFO 淘汰，防止把无界增长从节点级搬到图级。**淘汰前必须确认该图无在飞节点** —— 否则会丢掉一个还在跑的 agent 的归属
+- `_startNode` / `onReadyNode` / `onAutoStart` 的回调闭包现在必须知道自己属于哪张图：`AgentGraph` 的构造回调不带 graphId，所以在 `newGraph()` 里为每张图单独构造回调闭包捕获其 `graphId`
+
+**必须做对的两处（否则静默坏掉）**
+
+1. **`hasInFlight()` 跨图聚合。** 现在它问的是"那一张图有没有在飞的活"。多图后必须是"任意一张图有没有"，**且包含 closed 图** —— 一个在飞的 agent 不因为它所属的图被关掉就停止存在。漏了这条，主 agent 一切换活跃图就不再等旧图里还在跑的 agent，那些结果没人接。这正是 Task 15 花一整轮修的那类问题。
+2. **`graph.onAgentSettled` 必须回报到正确的图。** 回调闭包若捕获了 `runtime.graph`（活跃图 getter）而不是自己那张图，则活跃图一变，在飞节点的回报就落到别人的图上 —— 而 `onAgentSettled` 对未知 nodeId 是静默 `return`（graph.js:397），所以这个错误**不会报错，只会让节点永远停在 running**。
+
+**Tests（`src/agents/graph-multi.test.js`，至少覆盖）**
+
+1. 不给 `graph_id` 时首次 `agent_graph` 新建一张图并置为活跃
+2. 同一 `node_id` 可在两张不同图里共存，互不干扰
+3. `graph_start({ node_id })` 在 node_id 属于非活跃图时软失败，且提示里含那张图的 `graph_id`
+4. `agent_status()` 默认只列活跃图；`agent_status({ graph_id: 'all' })` 列出全部
+5. **一张图有在飞节点时，切换活跃图后 `hasInFlight()` 仍为 true**（第 1 条硬要求的回归测试）
+6. **在飞节点的 settle 落回它自己那张图**：A 图节点在跑时切到 B 图，A 节点 settle 后 A 图里该节点是终态、B 图不受影响（第 2 条硬要求的回归测试）
+7. `retainClosedGraphs` 超限时最旧的 closed 图被整张淘汰，且**有在飞节点的图不被淘汰**
+8. `close()` 取消全部图的未终态节点，不只是活跃图
+9. `runtime.graph` getter 在无活跃图时返回 `null` 而不抛
+
 
 ### Task 19: 图生命周期、弃图协议与节点重新激活
 
