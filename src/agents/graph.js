@@ -435,6 +435,19 @@ export class AgentGraph {
   }
 
   /**
+   * 还没走到终态的节点数。与 `hasPending()` 共用同一份状态集合 —— 调用方要报
+   * "还剩几个节点"时用它，别在别的文件里手抄一份状态清单（抄错了是无声的：
+   * 漏掉 waiting_input 就会把一个卡在提问上的节点报成"没有待办"）。
+   */
+  pendingCount() {
+    let n = 0
+    for (const node of this.nodes.values()) {
+      if (GRAPH_PENDING_STATES.has(node.state)) n += 1
+    }
+    return n
+  }
+
+  /**
    * 有节点的 agent 真在飞？—— 与 `hasPending()` 的区别是不算 blocked /
    * awaiting_confirm。**要在"该不该继续等下去"上做判断的调用方用这个**：一张
    * 声明完就被主 agent 遗忘的图会让 `hasPending()` 永远为真，而它既不会产生
