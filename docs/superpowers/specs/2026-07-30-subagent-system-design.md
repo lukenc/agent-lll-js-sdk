@@ -461,7 +461,13 @@ modelAliases: {
 
 `agent` 的 `Tool_Def.description` 内含难易度指导：**机械、可枚举、结果易验证的任务用快模型；需要设计判断、跨文件推理、或产出会被直接采纳的任务用主力模型。** 判断权在主 agent，框架不做二次裁决（不额外起 sidecar 判难度 —— 主 agent 本来就在读上下文，它比 sidecar 更清楚这个任务有多重要）。
 
-## 11. worktree 隔离
+## 11. worktree 隔离（已搁置 — Node-only 实验特性）
+
+> **状态：搁置。** 实现完整、17 个测试覆盖，但**不作为推荐的隔离路径**。
+>
+> 原因有二。其一，目标环境包含浏览器，那里没有 git worktree —— 一个在一半目标环境里不存在的机制，不能承担"隔离主方案"的角色；跨 agent 安全的主线是产物轨（§12）。其二，它与 DAG 的语义相冲突：一个 DAG 节点是一个子任务、由一个 subagent 执行，若每个 subagent 各自一个 worktree，下游节点看到的是上游动手**之前**的仓库状态，据此产生的修改必然与上游错位且不会报错。所以 `agent_graph` / `graph_start` **有意不提供** `isolation` 参数，图节点共享工作区。
+>
+> 它仍然适用于一种情形：Node 环境下、经 `agent` 工具直接派发的、彼此独立且不需要看到对方改动的并行任务。
 
 `agents/isolation.js`，Node-only，动态 `import('node:child_process')`。
 
@@ -482,7 +488,9 @@ modelAliases: {
 
 `sha` 用 FNV-1a 32 位（8 位十六进制），零依赖、Node/浏览器同实现，用途是变更与冲突检测，**非加密**，spec 与 JSDoc 都标注这点。
 
-**诚实的局限**：绕过 `artifact_write`、直接用 `shell_exec` 改文件的行为框架检测不到。产物轨是**记账约定**而非强制隔离；需要硬保证时用 `isolation: 'worktree'`。
+**诚实的局限**：绕过 `artifact_write`、直接用 `shell_exec` 改文件的行为框架检测不到 —— 产物轨是**记账约定**，不是强制隔离。
+
+**但它是主方案，不是退路。** 目标环境包含浏览器，而浏览器里没有 git worktree、也没有 `shell_exec`。产物轨（归属记录 + 同 key 跨 agent 冲突 warn/deny）是唯一跨 Node 与浏览器都成立、每个 agent 都能用的跨 agent 护栏。`isolation: 'worktree'`（§11）是 **Node-only 的可选加强**，不是"需要硬保证时的正解"——它在一半的目标环境里根本不存在。这一层的强度就是这套系统跨 agent 安全的实际上限，不能再削弱。
 
 ## 13. 共享历史与检索
 
@@ -545,7 +553,9 @@ wrapMemoryForMirror(inner, { sharedHistory, agentId })
 
 1. **`plan_and_execute` 策略下不注入 agent 类型清单** —— `PlanAndExecuteStrategy` 自建 step system prompt，与 skill 系统同一既有限制。`agent` 工具在该策略下仍可调用，只是模型看不到类型清单（未指定 `subagent_type` 时落到 `general-purpose`）。**keep-alive 与 `_pendingInjections` 的轮边界排空同样只在 `react` 策略下生效** —— 该策略下后台 agent 的完成通知会滞留到下一次走 `react` 的调用，或只能经事件被主机感知。
 2. **无沙箱** —— 子 agent 经主机工具执行命令，主机须用工具供给与 `hooks.beforeToolCall` 管控。
-3. **产物轨是记账而非强制** —— 见 §12。
+3. **产物轨是记账而非强制，且它是主方案** —— 见 §12。浏览器环境没有 worktree 也没有 `shell_exec`，产物轨是唯一跨环境成立的跨 agent 护栏。
+4. **`isolation: 'worktree'` 已搁置为 Node-only 实验特性** —— 实现完整且有测试覆盖，但不作为推荐路径。原因见 §11 开头。
+5. **DAG 节点共享工作区是有意设计，不是缺口** —— 一个 DAG 节点是一个子任务、由一个 subagent 执行；若每个 subagent 各自一个 worktree，下游节点看到的是上游动手**之前**的仓库状态，据此做的修改必然与上游错位，且静默产生冲突。流水线要成立，下游就必须看得见上游的改动。
 4. **`ctx.cwd` 需要主机工具配合** —— 见 §11.3。
 5. **`isolation: 'remote'` 未实现** —— 协议与注册表已就位，需第三方注册非 local transport。
 6. **父 memory 无 `runtimeHistory` 时历史检索退化** —— 见 §13。
