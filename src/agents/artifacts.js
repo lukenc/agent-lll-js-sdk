@@ -3,7 +3,14 @@
  * 记清楚谁产出了什么、什么时候、内容指纹是多少。
  *
  * **这是记账约定，不是强制隔离**：绕过 artifact_write、直接用 shell_exec 改
- * 文件的行为框架检测不到。需要硬保证时用 isolation: 'worktree'。
+ * 文件的行为框架检测不到。
+ *
+ * **但它是跨 agent 安全的主方案，不是退路。** 目标环境包含浏览器，那里既没有
+ * git worktree 也没有 shell_exec —— 归属记录加同 key 跨 agent 的 warn/deny 是
+ * 唯一在 Node 与浏览器都成立、每个 agent 都能用的护栏。`isolation: 'worktree'`
+ * （`isolation.js`）是 Node-only 的可选加强，已搁置为实验特性，不是"需要硬保证
+ * 时的正解" —— 它在一半的目标环境里根本不存在。这一层的强度就是这套系统跨
+ * agent 安全的实际上限。
  */
 import { utf8ByteLength } from '../telemetry.js'
 

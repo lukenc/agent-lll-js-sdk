@@ -840,6 +840,305 @@ GET {baseUrl}/skills/{name}/{relPath}
   v1 没有沙箱。接入不受信任的 skill server 时，请通过工具授权 + `hooks.beforeToolCall`
   自行把关。
 
+## Subagent 系统
+
+把一个明确、单一、描述完整的任务派给一个独立的 agent 实例去做，主 agent 只收结论。
+解决的是单 agent 运行时的老问题：要"读 8 个文件后给个结论"，主 agent 必须把全部中间
+产物吃进自己的上下文，压缩一次就丢一批事实。
+
+subagent 通过一个普通 `Tool_Def`（`agent` 工具）暴露给模型，因此自动获得
+`ToolFilter` / `ContextManager` / telemetry 的既有处理；它的特殊之处不在接口，而在
+`execute` 内部启动了一个能自己调工具、能在执行中收消息、能对外发事件的嵌套运行时。
+
+```js
+import { Agent } from 'lll-web-agent'
+
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  model: 'gpt-4o',
+  simpleModel: 'gpt-4o-mini',        // 成为 fast 别名（见"模型别名"）
+  tools: [readFile, keywordSearch],  // 主机自己的工具；子 agent 按类型裁剪后继承
+  subagents: {
+    types: [
+      {
+        name: 'explorer',
+        description: '只读检索：跨文件找定义、找用法、找配置，不改任何文件。',
+        systemPrompt: 'You are a read-only research subagent. Report what you found, with file paths.',
+        model: 'fast',
+        tools: ['read_file', 'keyword_search', 'project_tree', 'history_search'],
+      },
+    ],
+    maxConcurrent: 4,                // 每个 depth 层独立的并发槽数
+    maxDepth: 2,                     // 主 agent 是 depth 0；depth 2 的 agent 不能再派
+    artifacts: { policy: 'warn' },   // 'warn'（默认）| 'deny'
+  },
+})
+
+await agent.chat('审一下认证链路，把 token 校验的每个位置都找出来')
+```
+
+未配置 `opts.subagents` 时 `agent.subagents` 恒为 `null`，不注入任何工具、不发任何新
+事件，行为与旧版本逐字节一致（零开销）。
+
+内置类型 `general-purpose` 始终可用且不可覆盖。类型也可以在运行时注册：
+
+```js
+import { registerAgentType, listAgentTypes, resetAgentTypes } from 'lll-web-agent'
+
+registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt: '...' })
+```
+
+> 类型注册表是**进程级全局**的（与 `BASE_TOOLS` 同）。多个 `Agent` 实例共享同一张表，
+> `resetAgentTypes()` 会把它清回内置类型。
+
+### 10 个元工具
+
+配置 `subagents` 后注入，且全部经 `registerBaseTool()` 注册为 base tool —— 否则开启
+`enableIntentRecognition` 时 `ToolFilter` 会把它们裁掉，而 system prompt 里的类型清单
+还在宣传它们（`skill` 已经踩过这个坑）。
+
+| 工具 | 用途 |
+|------|------|
+| `agent` | 派一个 subagent。`{ description, prompt, subagent_type?, model?, run_in_background?, isolation? }` |
+| `agent_status` | 查状态。`{ agent_id?, include_finished?, include_graph? }` |
+| `agent_cancel` | 取消在跑的 agent 或放弃一个图节点。`{ agent_id?, node_id?, reason? }` |
+| `agent_graph` | 声明依赖图（只声明，不创建）。`{ nodes, max_concurrent? }` |
+| `graph_start` | 就绪节点的确认闸门，在这里给出最终契约。`{ node_id, prompt, ... }` |
+| `send_message` | 给另一个 agent 发消息（不打断它正在执行的工具）。`{ to, message, summary? }` |
+| `artifact_write` / `artifact_list` | 产物记账与查询 |
+| `history_search` / `history_get` | 检索整个会话的**原始**事件轨（含已被压缩掉的内容） |
+
+`agent` 工具的两个 "description" 是两回事，容易混：入参 `description` 是 3-8 词的**标签**
+（用于列表显示、agent 命名、日志），**不承载任务内容**；Task Contract 的唯一所在是入参
+`prompt` —— 子 agent 不继承对话历史，它看到的就只有这段文字。这条边界由
+`AGENT_TOOL_DESCRIPTION`（`src/agents/contract.js`）向模型讲清楚。
+
+子 agent 拿到哪些工具由它的 `Agent_Type.tools` 决定：`'*'`（内置
+`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但**始终剔除**
+`agent` / `agent_graph` / `graph_start`，除非该类型 `canSpawn: true`；给一个名字数组则
+只保留数组里点到的工具。所以一个窄类型若需要记产物或检索历史，必须把
+`artifact_write` / `history_search` 这些元工具**显式写进它的 `tools` 数组**（上面
+`explorer` 的例子就是这么做的），否则它们不会被继承。
+
+### 后台派发与 keep-alive
+
+`run_in_background` 默认 `true`：`agent` 工具立刻返回一行 `[agent:<name> started]`，
+结果稍后在主 agent 的**轮边界**注入。轮边界（而不是任意时刻）是关键 —— 那时上一轮的
+`assistant(tool_calls)` 与全部 `tool` 结果消息已经成对落盘，插入 `user` 消息不会破坏
+工具调用配对。
+
+`keepAlive`（默认 `true`）补的是这个洞：模型说完"我派了三个 agent，等它们回来"就给出
+了一个无工具调用的回复，ReAct 循环照旧会立即 `return`，结果回来时已经没人读了。开启后
+这一轮不收尾，而是等下一个 subagent 事件回来、把结果带进上下文让模型继续决策。
+
+```js
+agent.on('agent.succeeded', ({ agentName, rounds, usage }) => { /* ... */ })
+agent.on('run.keep_alive.timeout', ({ pendingAgents, pendingNodes, waitedMs }) => { /* ... */ })
+
+// 每轮对话最多超时一次；超时后给模型留一条"收尾或 agent_cancel"的提示
+agent.lastKeepAliveTimedOut      // boolean
+agent.lastStopReason             // 取值集合未变：null | 'completed' | 'max_rounds'
+```
+
+轮次仍受 `maxRounds` 约束，因此不存在无界循环。`keepAlive: false` 时本轮直接结束，
+通知暂存到下一次 `chat()` / `stream()` 的第一个轮边界。
+
+### DAG 编排
+
+`agent_graph` 只声明与排队，**不创建任何实例**：`blocked` / `ready` /
+`awaiting_confirm` 的节点没有 handle、没有子 `Agent`、不占并发槽。模型发出的调用形如：
+
+```json
+{
+  "nodes": [
+    { "node_id": "n1", "description": "Map the schema",
+      "prompt": "List every table and its columns.", "on_ready": "auto" },
+    { "node_id": "n2", "depends_on": ["n1"], "description": "Write the migration" }
+  ],
+  "max_concurrent": 2
+}
+```
+
+`n1` 的活儿事先就定死了，用 `on_ready: 'auto'` 直接跑。`n2` 走默认的
+`on_ready: 'confirm'`：`n1` 成功后框架**不**启动 `n2`，而是把上游结果注入回主 agent，
+由它看过 `n1` 实际产出之后再用 `graph_start` 写 `n2` 的最终契约（也可以在那里换类型、
+换模型，或者 `agent_cancel` 放弃它）。前序结果经常会改变后续该干什么，这个闸门就是
+"到了再创建、决策可变"的落点。
+
+声明时校验 `node_id` 唯一、`depends_on` 指向已知节点、Kahn 环检测（有环整批拒绝并回报
+环路径）、`on_ready: 'auto'` 的节点必须有 `prompt`。`agent_graph` 可多次调用增量追加，
+新节点可依赖旧节点，每次都重跑环检测。失败传播默认 `block`（下游既不自动取消也不自动
+启动，等主 agent 定夺），可按节点设 `on_upstream_failure: 'skip'`。
+
+#### `depends_on` 是安全边界，不是调度提示
+
+图节点**共享同一个工作目录**，这是有意设计（见下文），且**没有任何 per-node 隔离兜底**。
+于是：**两个之间没有依赖路径的节点，一定会并行跑在同一个目录里。** 漏掉一条本该存在的
+边，不是"跑慢了"或"顺序不理想"，而是两个 subagent 同时改同一批文件、彼此都不知道对方
+改了什么 —— 静默产生冲突的代码，只剩产物轨事后告警。
+
+`AGENT_GRAPH_DESCRIPTION` 把这一点讲给模型：一个节点 = 一个单一、边界清晰的子任务；
+凡是 B 会读或写 A 产出/改动的东西就必须声明 `depends_on`（文件重叠本身就是依赖）；
+拿不准就把边加上（多一条边只损失并行度，少一条边损失正确性且不会报错，两种代价不对称）；
+但也不要编造不存在的顺序，把本可并行的活儿串成一条链，DAG 就退化成了顺序执行。
+
+### 提问路由
+
+多个 agent 可能同时向用户提问。每个问题拿一个 `askId` 并登记提问者，用户的回答按
+`askId` 定向送回对应的等待方 —— 主机因此可以乱序回答。主 agent 自己的提问也走同一张表
+（归属 `agentId: 'main'`）。
+
+主机有两条接法，可以只用一条，也可以同时用（两条**竞速，先到先赢**，后到者静默 no-op）：
+
+```js
+// 接法 1：hook。签名扩展为 (question, meta)，旧的单参数写法继续工作。
+const agent = new Agent({
+  /* ... */
+  subagents: {},
+  hooks: {
+    onAskUser: async (question, meta) => {
+      // meta = { askId, agentId, agentName, parentAgentId, nodeId, taskDescription, question, askedAt }
+      return await promptTheUser(`[${meta.agentName}] ${question}`)
+      // 返回 null / undefined = 不在这里答，留给接法 2
+    },
+  },
+})
+
+// 接法 2：命令式通道。Web UI / HTTP 服务端更顺手 —— 不需要在请求上下文里 await。
+for (const q of agent.pendingQuestions()) {
+  console.log(q.askId, q.agentName, q.taskDescription, q.question)
+}
+agent.answerQuestion(askId, 'prisma')             // → true 表示被这条通道接走了
+agent.cancelQuestion(askId, 'user closed the tab')
+```
+
+提问期间该 agent 状态转 `waiting_input`（在 `agent_status` 里可见），仍占并发槽。
+`ask.timeoutMs` 默认 `null`（永不超时）；配置后超时返回"用户未在 N 秒内回答"，由子
+agent 自己决定猜默认值还是放弃。
+
+### 产物轨 —— 跨 agent 安全的主方案
+
+`artifact_write` 把产出登记到共享的 `RuntimeHistory` `artifacts` 轨（只追加不覆盖，
+历史版本全留），记清楚谁产出了什么、指纹是多少。同 `key` 的最新记录属于**另一个** agent
+且本次写入未在 `supersedes` 中显式引用它时：
+
+- `policy: 'warn'`（默认）—— 允许写入，返回一句告警指名上一版的归属，并 emit
+  `artifact.conflict`；
+- `policy: 'deny'` —— 拒绝写入，返回 owner 与 sha，让模型改 key 或先协调。
+
+```js
+const rows = await agent.getArtifacts()                        // 全部
+const mine = await agent.getArtifacts({ agentId: 'agt_...' })  // 按 agent 过滤
+```
+
+`sha` 是 FNV-1a 32 位（8 位十六进制），零依赖、Node 与浏览器同实现，用途是**变更与冲突
+检测，非加密**。
+
+**它是主方案，不是退路。** 目标环境包含浏览器，而浏览器里既没有 git worktree 也没有
+`shell_exec`。产物轨（归属记录 + 同 key 跨 agent warn/deny）是唯一跨 Node 与浏览器都
+成立、每个 agent 都能用的跨 agent 护栏，这一层的强度就是这套系统跨 agent 安全的实际
+上限。同时它**是记账约定，不是强制隔离**：绕过 `artifact_write` 直接改文件的行为框架
+检测不到（见"已知限制"）。
+
+### 历史检索
+
+`history_search` / `history_get` 搜的是共享轨上的**原始事件**，所以被
+`SummarizingMemory` 压缩掉的内容照样能捞回来（摘要只影响投影时的跳过逻辑，不删原事件）。
+这也是子 agent 不必继承父上下文的前提 —— 缺什么自己去捞，而不是一开始就把整个上下文
+复制一份。子 agent 的消息只进 `internal` 与 `agent:<id>` 轨，**不进 `model` 轨**，
+因此不会污染主 agent 的对话投影。
+
+### 模型别名
+
+```js
+subagents: {
+  modelAliases: {
+    fast: { model: 'deepseek-chat', apiKey: process.env.DEEPSEEK_KEY, url: '...' },
+    main: { model: 'gpt-4o' },   // 省略的字段继承父 Agent
+  },
+}
+```
+
+不配置时默认两个别名：`fast` → 父 `Agent` 的 `simpleModel` / `simpleApiKey` /
+`simpleUrl` 三件套，`main` → 父的 `model` / `apiKey` / `url`。`agent` / `graph_start`
+的 `model` 参数 enum 在工具注入时由别名表的键生成（不写死型号 —— 本 SDK 是多供应商的），
+每个别名可独立指定 `apiKey` / `url`，因此快模型可以跨供应商。优先级：调用入参 `model`
+> `Agent_Type.model` > 继承父模型。
+
+### worktree 隔离（Node-only 实验特性，已搁置）
+
+> **状态：搁置，不作为推荐的隔离路径。** 实现完整、有测试覆盖、代码保留，但请不要把它
+> 当成"怎么防止多个 agent 互相踩"的答案 —— 那个答案是产物轨。
+>
+> 原因有二。其一，目标环境包含浏览器，那里没有 git worktree；一个在一半目标环境里不
+> 存在的机制不能承担隔离主方案。其二，它与 DAG 语义相冲突：一个 DAG 节点是一个子任务、
+> 由一个 subagent 执行，若每个 subagent 各自一个 worktree，下游节点看到的是上游动手
+> **之前**的仓库状态，据此产生的修改必然与上游错位且不会报错。流水线要成立，下游就必须
+> 看得见上游的改动 —— 所以 `agent_graph` / `graph_start` **有意不提供** `isolation`
+> 参数，图节点共享工作区是设计决策，不是缺口。
+>
+> 它仍然适用于一种情形：Node 环境下、经 `agent` 工具直接派发的、彼此独立且不需要看到
+> 对方改动的并行任务。
+
+`agent` 工具传 `isolation: 'worktree'` 时，框架 `git worktree add` 一个
+`<worktreeBaseDir>/agent-<agentId>` 与 `<branchPrefix><agentId>` 分支。收尾时
+`git status --porcelain` 为空则删除 worktree 与分支；非空则保留，并在 `Agent_Result`
+里报路径、分支与改动文件数，由主 agent 决定合并还是丢弃。非 git 仓库、`git` 不可用、
+或 `worktreeBaseDir` 未被 `.gitignore` 忽略时**软失败**（返回一句"不带 isolation 参数
+重试"，而不是炸掉这次派活）。
+
+```js
+subagents: {
+  isolation: { worktreeBaseDir: '.worktrees', branchPrefix: 'subagent/' },
+}
+```
+
+工作目录以两种**通告**方式传达给子 agent：写进它首条消息的上下文事实，以及工具执行时的
+`ctx.cwd`。**框架不重写工具入参** —— `read_file` / `shell_exec` 是主机提供的，框架无权
+改其语义；静默把路径重写进 worktree 会造出"看起来隔离、实际没隔离"的错觉，而那是最坏的
+结果，因为主机会信它。
+
+`isolation: 'remote'` 未实现，软失败。
+
+### 注意事项
+
+1. **后台 agent 跨 `chat()` 存活。** 它们不随 `chat()` 返回而终止，会一路跑到终态 ——
+   因此宿主进程在全部后台 agent settle 之前不会自然退出。
+2. **退出前调 `closeSubagents()`。** 它取消全部在跑的 agent、reject 全部待答提问
+   （避免悬挂 Promise 卡住进程退出）、清理未改动的 worktree。可重复调用；`reset()` 已
+   包含它；未配置 subagents 时是安全空操作。
+3. **产物轨是记账约定。** 见上文 —— 它是主方案，但拦不住绕过它的行为。
+4. **`hooks` 会转发给每个子 agent。** `beforeToolCall` / `afterToolCall` / `onError`
+   必须转发，否则主机的工具管控策略对子 agent 就失效了 —— 这是安全边界，不是便利。
+
+### 已知限制
+
+1. **只在 ReAct 策略下生效** —— 类型清单注入、轮边界注入、keep-alive、以及
+   `ctx` 的归属字段（`_toolContextExtra`）全都住在 `_reactLoop` / `_reactLoopStream`
+   里。`strategy: 'plan_and_execute'` 下这些一概没有：`agent` 工具仍可调用，但模型看不
+   到类型清单，后台 agent 的完成通知会滞留到下一次走 `react` 的调用，或只能经事件被主机
+   感知。与 skill 清单注入是同一个既有限制。
+2. **无沙箱** —— 子 agent 经主机提供的工具执行命令，与 skill 系统同一安全模型。主机须
+   用工具供给 + `hooks.beforeToolCall` 自行把关。
+3. **产物轨是记账而非强制** —— 一个绕过 `artifact_write`、直接改文件的 subagent，框架
+   检测不到。
+4. **`ctx.cwd` 是通告，不是保证** —— 主机工具认不认它由主机决定。框架**有意**不重写工具
+   入参：静默重写路径会造出"看起来隔离、实际没隔离"的错觉。
+5. **`isolation: 'remote'` 未实现** —— 协议与 transport 注册表已就位，但没有非 local
+   的 transport 随包发布，需第三方 `registerA2ATransport()`。
+6. **保留下来的 worktree 会在 `.git/worktrees/<name>` 留下管理项并逐渐累积** ——
+   主机应自行 `git worktree prune`；框架**有意**不做，因为 prune 是仓库级操作，会碰到
+   本 SDK 之外的 worktree。
+7. **`retry.attemptTimeoutMs` 是死配置** —— `agent.js` 里有文档、`runtime.js` 里有默认
+   值，但**没有任何代码读它，单次 attempt 超时并未被强制**。一个卡在挂死工具调用上的
+   子 agent 目前只受 `maxRounds` 与调用方 `signal` 约束。待后续任务处理（要么实现，
+   要么删掉这个选项）。
+8. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
+   `RuntimeHistory` 兜底，此时 `history_search` 搜不到父历史，工具结果里会明确说明这一
+   点，不假装能搜。
+
 ## License
+
 
 MIT
