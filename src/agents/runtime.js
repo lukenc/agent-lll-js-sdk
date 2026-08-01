@@ -5,7 +5,7 @@
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
 import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
-import { AgentGraph, GRAPH_TERMINAL_STATES } from './graph.js'
+import { AgentGraph, GRAPH_TERMINAL_STATES, GRAPH_IN_FLIGHT_STATES } from './graph.js'
 import { createWorktree } from './isolation.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
@@ -230,8 +230,13 @@ export function createSubagentRuntime({
      *        `keep_running`（宿主省略时的默认）只标记，在飞的 agent 继续跑，
      *        `hasInFlight()` 仍算它们；`cancel_outstanding` 把每个未终态节点走一遍
      *        `_cancelNode`（连它挂在 `ask_user` 上的提问一起结算）。
+     * `outstanding` 是每个未终态节点，`inFlight` / `awaitingConfirm` / `blocked` 是
+     * 按 `node.state` 拆出来的三个子集（并集等于 `outstanding`）—— `graph_close`
+     * 工具靠这三份分别报告"真在跑" vs "等模型自己动手" vs "等上游"，不能把它们
+     * 混在一起说成同一件事（见 `tools.js` 的 `keep_running` 分支）。
      * @returns {{ ok: true, entry: GraphEntry, cancelled: string[], stoppedAgents: number,
-     *   outstanding: string[] } | { ok: false, reason: string }}
+     *   outstanding: string[], inFlight: string[], awaitingConfirm: string[],
+     *   blocked: string[] } | { ok: false, reason: string }}
      */
     closeGraph(graphId = null, { reason = null, disposition = 'keep_running' } = {}) {
       if (disposition !== 'keep_running' && disposition !== 'cancel_outstanding') {
@@ -261,9 +266,17 @@ export function createSubagentRuntime({
           if (out.agentStopped) stoppedAgents += 1
         }
       }
-      const outstanding = [...entry.graph.nodes.values()]
+      const outstandingNodes = [...entry.graph.nodes.values()]
         .filter(node => !GRAPH_TERMINAL_STATES.has(node.state))
-        .map(node => node.nodeId)
+      const outstanding = outstandingNodes.map(node => node.nodeId)
+      // 三个子集互斥且并集等于 outstanding：GRAPH_IN_FLIGHT_STATES 复用 graph.js
+      // 那份状态集合，不是这里另抄一份 —— `hasInFlight()` 用的是同一份。
+      const inFlight = outstandingNodes
+        .filter(node => GRAPH_IN_FLIGHT_STATES.has(node.state)).map(node => node.nodeId)
+      const awaitingConfirm = outstandingNodes
+        .filter(node => node.state === 'awaiting_confirm').map(node => node.nodeId)
+      const blocked = outstandingNodes
+        .filter(node => node.state === 'blocked').map(node => node.nodeId)
 
       entry.state = 'closed'
       entry.closedAt = Date.now()
@@ -275,7 +288,7 @@ export function createSubagentRuntime({
         cancelled: cancelled.length, stoppedAgents, outstanding: outstanding.length,
       })
       runtime._evictClosedGraphs()
-      return { ok: true, entry, cancelled, stoppedAgents, outstanding }
+      return { ok: true, entry, cancelled, stoppedAgents, outstanding, inFlight, awaitingConfirm, blocked }
     },
 
     /**

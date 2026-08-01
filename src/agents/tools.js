@@ -308,7 +308,7 @@ export function createSubagentTools(runtime) {
           reason: reason ?? null, disposition: disposition ?? null,
         })
         if (!closed.ok) return `Error: ${closed.reason}`
-        const { entry, cancelled, stoppedAgents, outstanding } = closed
+        const { entry, cancelled, stoppedAgents, outstanding, inFlight, awaitingConfirm, blocked } = closed
         const label = entry.label ? ` ${JSON.stringify(entry.label)}` : ''
         const lines = [`graph ${entry.graphId}${label} closed (${disposition}${reason ? `: ${reason}` : ''}).`]
         if (disposition === 'cancel_outstanding') {
@@ -319,8 +319,25 @@ export function createSubagentTools(runtime) {
               + `${stoppedAgents > 0 ? ` — ${stoppedAgents} running agent(s) stopped.` : '; none of them had an agent running.'}`
             : 'Nothing was outstanding — no node had to be cancelled.')
         } else if (outstanding.length > 0) {
-          lines.push(`${outstanding.length} node(s) left running: ${outstanding.join(', ')}. `
-            + 'You will still be notified as they finish, and they still count as work in flight.')
+          // 同一个理由，反过来也要分账：`outstanding` 里混着真在飞的节点和压根没起
+          // agent 的 blocked / awaiting_confirm 节点，笼统说"都还在跑、都会通知你"
+          // 对后两种是假话 —— blocked 没有 agent 可通知，awaiting_confirm 是在等模型
+          // 自己调 graph_start，不是在等事件。
+          if (inFlight.length > 0) {
+            lines.push(`${inFlight.length} node(s) still in flight: ${inFlight.join(', ')} — their `
+              + 'agent(s) keep running, completion notices still arrive, and they still count as work '
+              + 'in flight.')
+          }
+          if (awaitingConfirm.length > 0) {
+            lines.push(`${awaitingConfirm.length} node(s) awaiting_confirm: ${awaitingConfirm.join(', ')} `
+              + '— no agent is running; they are waiting on your own graph_start. This graph is no '
+              + `longer active, so pass graph_id ${JSON.stringify(entry.graphId)} explicitly, or call `
+              + 'agent_cancel to give up on them.')
+          }
+          if (blocked.length > 0) {
+            lines.push(`${blocked.length} node(s) blocked: ${blocked.join(', ')} — no agent is running; `
+              + 'they are waiting on upstream that has not finished, and may never finish.')
+          }
         }
         lines.push('You have no active graph now: your next agent_graph call without a graph_id '
           + 'starts a fresh one.')
