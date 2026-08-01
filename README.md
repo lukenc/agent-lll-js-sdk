@@ -872,6 +872,7 @@ const agent = new Agent({
     maxConcurrent: 4,                // 每个 depth 层独立的并发槽数
     maxDepth: 2,                     // 主 agent 是 depth 0；depth 2 的 agent 不能再派
     artifacts: { policy: 'warn' },   // 'warn'（默认）| 'deny'
+    retainClosedGraphs: 5,           // 保留多少张已关闭的图（超出按 FIFO 整张淘汰）
   },
 })
 
@@ -892,7 +893,7 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 > 类型注册表是**进程级全局**的（与 `BASE_TOOLS` 同）。多个 `Agent` 实例共享同一张表，
 > `resetAgentTypes()` 会把它清回内置类型。
 
-### 10 个元工具
+### 12 个元工具
 
 配置 `subagents` 后注入，且全部经 `registerBaseTool()` 注册为 base tool —— 否则开启
 `enableIntentRecognition` 时 `ToolFilter` 会把它们裁掉，而 system prompt 里的类型清单
@@ -901,13 +902,18 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 | 工具 | 用途 |
 |------|------|
 | `agent` | 派一个 subagent。`{ description, prompt, subagent_type?, model?, run_in_background?, isolation? }` |
-| `agent_status` | 查状态。`{ agent_id?, include_finished?, include_graph? }` |
-| `agent_cancel` | 取消在跑的 agent 或放弃一个图节点。`{ agent_id?, node_id?, reason? }` |
-| `agent_graph` | 声明依赖图（只声明，不创建）。`{ nodes, max_concurrent? }` |
-| `graph_start` | 就绪节点的确认闸门，在这里给出最终契约。`{ node_id, prompt, ... }` |
+| `agent_status` | 查状态。`{ agent_id?, include_finished?, include_graph?, graph_id? }`（`graph_id: 'all'` 列出全部图，含已关闭的） |
+| `agent_cancel` | 取消在跑的 agent 或放弃一个图节点。`{ agent_id?, node_id?, graph_id?, reason? }` |
+| `agent_graph` | 声明依赖图（只声明，不创建）。`{ nodes, max_concurrent?, graph_id?, label? }` |
+| `graph_start` | 就绪节点的确认闸门，在这里给出最终契约。`{ node_id, graph_id?, prompt, ... }` |
+| `graph_close` | 任务结束时关掉它的图。`{ graph_id?, disposition, reason? }` |
+| `graph_reactivate` | 让已完成节点重跑（缓存失效）。`{ graph_id?, node_ids, reason? }` |
 | `send_message` | 给另一个 agent 发消息（不打断它正在执行的工具）。`{ to, message, summary? }` |
 | `artifact_write` / `artifact_list` | 产物记账与查询 |
 | `history_search` / `history_get` | 检索整个会话的**原始**事件轨（含已被压缩掉的内容） |
+
+四个图工具与 `agent_status` / `agent_cancel` 的 `graph_id` 都可省，省略即"当前在用的那张图"
+（见"一张图 = 一个任务"）。
 
 `agent` 工具的两个 "description" 是两回事，容易混：入参 `description` 是 3-8 词的**标签**
 （用于列表显示、agent 命名、日志），**不承载任务内容**；Task Contract 的唯一所在是入参
@@ -915,8 +921,10 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 `AGENT_TOOL_DESCRIPTION`（`src/agents/contract.js`）向模型讲清楚。
 
 子 agent 拿到哪些工具由它的 `Agent_Type.tools` 决定：`'*'`（内置
-`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但**始终剔除**
-`agent` / `agent_graph` / `graph_start`，除非该类型 `canSpawn: true`；给一个名字
+`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但**始终剔除**五个
+编排工具 `agent` / `agent_graph` / `graph_start` / `graph_close` / `graph_reactivate`，
+除非该类型 `canSpawn: true`（`graph_close` / `graph_reactivate` 在这一组里，是因为
+关掉或重跑**父 agent 正在编排的**那个任务，子 agent 没有依据做这个决定）；给一个名字
 数组则保留数组里点到的工具，**外加一组固定的基础设施工具（floor）**：
 `artifact_write` / `artifact_list` / `history_search` / `history_get` /
 `send_message` / `ask_user` 无论数组里写没写都会带上（与父 agent 实际拥有的工具
@@ -925,7 +933,7 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 ['read_file']` 的意思是"这个 agent 只读文件"，不是"它也不准写产物、搜历史、
 问用户" —— 与 `tool-filter.js` 的 `BASE_TOOLS`（`ToolFilter` 对任何意图过滤结果都
 恒定保留）同一思路。派生新 agent 的能力仍然只由 `canSpawn` 把关，floor **不**
-包含 `agent` / `agent_graph` / `graph_start`。
+包含那五个编排工具。
 
 ### 后台派发与 keep-alive
 
@@ -956,10 +964,15 @@ agent.lastStopReason             // 取值集合未变：null | 'completed' | 'm
 节点：它的就绪通知会被投进上下文（待注入的判断优先于在飞判断），但通知投完之后若没有
 别的活在飞，这一轮就正常收尾，把决定权交回主机与模型。
 
+判据与告知都是**跨全部图**的（含已关闭的图）：一个在飞的 agent 不因为它所属的图被关掉就
+停止存在。`run.keep_alive.timeout` 的 `pendingNodes` 同样跨图统计 —— 若未完成节点在另一
+张图里而这个数报成 0，模型正好会在它决定要不要收尾的那一刻拿到一个假数。
+
 ### DAG 编排
 
-`agent_graph` 只声明与排队，**不创建任何实例**：`blocked` / `ready` /
-`awaiting_confirm` 的节点没有 handle、没有子 `Agent`、不占并发槽。模型发出的调用形如：
+`agent_graph` 只声明与排队，**不创建任何实例**：`blocked` / `awaiting_confirm`
+的节点没有 handle、没有子 `Agent`、不占并发槽（没有一个停留态的 `ready`：依赖一满足，
+节点在同一次 `tick()` 里直接走到 `awaiting_confirm` 或 `queued`）。模型发出的调用形如：
 
 ```json
 {
@@ -978,10 +991,122 @@ agent.lastStopReason             // 取值集合未变：null | 'completed' | 'm
 换模型，或者 `agent_cancel` 放弃它）。前序结果经常会改变后续该干什么，这个闸门就是
 "到了再创建、决策可变"的落点。
 
-声明时校验 `node_id` 唯一、`depends_on` 指向已知节点、Kahn 环检测（有环整批拒绝并回报
-环路径）、`on_ready: 'auto'` 的节点必须有 `prompt`。`agent_graph` 可多次调用增量追加，
-新节点可依赖旧节点，每次都重跑环检测。失败传播默认 `block`（下游既不自动取消也不自动
-启动，等主 agent 定夺），可按节点设 `on_upstream_failure: 'skip'`。
+声明时校验**同一张图内** `node_id` 唯一、`depends_on` 指向已知节点、Kahn 环检测（有环
+整批拒绝并回报环路径）、`on_ready: 'auto'` 的节点必须有 `prompt`。`agent_graph` 可多次
+调用增量追加，新节点可依赖旧节点，每次都重跑环检测。失败传播默认 `block`（下游既不自动
+取消也不自动启动，等主 agent 定夺），可按节点设 `on_upstream_failure: 'skip'`。
+
+#### 一张图 = 一个任务（多图共存）
+
+图跟的是**任务**，不是 `Agent` 实例：同一个任务始终往同一张图里加节点，图可以一直改；
+任务变了就换一张新图。因此一个主 agent 可以同时持有多张图，`node_id` 的唯一性也只到
+**图级**（第二个任务复用 `n1` 不再让整批声明被判重复而拒掉 —— 单图时代这是个真实缺陷，
+不是可有可无的放宽）。
+
+容器是惰性的：`agent.subagents.graphs` 是一张 `Map<graphId, GraphEntry>`，
+`activeGraphId` 起手为 `null`，第一次声明才建图。`agent.subagents.graph` 仍是指向"当前
+在用的那张图"的 getter，没有活跃图时返回 `null`（不抛）。`graphId` 由框架生成，形如
+`gph_00000001`（`gph_` + 单调计数器的 8 位十六进制，**不混时间位** —— 本项目已经在
+agentId 与 envelopeId 上各因时间戳撞号踩过一次）。
+
+模型开第二张图的入口是 `label`（任务名）：
+
+```json
+{ "nodes": [{ "node_id": "n1", "description": "Map the schema" }], "label": "订单导出重构" }
+```
+
+同一个 `label` 再声明就接着往那张图里加；换一个 `label` 就是另一张图，两张图各有独立的
+`node_id` 命名空间与独立的状态列表。`label` 与 `graph_id` 都不给时用当前活跃图（没有就
+新建一张）。跨图重名之后，"这个 `node_id` 不在这张图里"必须点名它在哪张图，否则模型无从
+自我纠正：
+
+```
+Error: node "x1" is not in graph gph_00000001; it lives in gph_00000002 ("登录埋点", open). Pass graph_id to act on it there.
+```
+
+`agent_status()` 默认只列活跃图；`agent_status({ graph_id: 'all' })` 列出全部（含已关闭
+的），每段带一行 `graph gph_00000001 "订单导出" [open, active]` 的抬头。
+
+#### 关闭与弃图协议
+
+任务结束就关掉它的图：`graph_close({ graph_id?, disposition, reason? })`。
+
+- `disposition: 'cancel_outstanding'` —— 每个未走到终态的节点都过一遍取消路径
+  （`cancelHandle`，连它挂在 `ask_user` 上的提问一起结算）。
+- `disposition: 'keep_running'` —— 图关掉不再收新节点，但已经在飞的 agent 继续跑到终态，
+  完成通知照旧投递，`hasInFlight()` 仍然算它们。
+
+`disposition` 是必填的，漏填会拿到一句列出两个取值的软失败（工具层刻意把 `undefined`
+换成 `null` 传下去，否则会命中"只标记"的默认值，静默关掉一张图）。关掉活跃图之后就没有
+活跃图了：下一次不带 `graph_id` 的 `agent_graph` 会新建一张。已关闭的图只有**声明**被拦
+（往一张随时可能被淘汰的图里加节点等于静默丢活）；`graph_start` / `agent_cancel` /
+`agent_status` / `graph_reactivate` 对它照旧可用 —— 一张已关闭的图里还在飞的节点必须仍
+能启动、取消、查看。`retainClosedGraphs`（默认 `5`）按 FIFO 整张淘汰多余的已关闭图，
+但**永不淘汰还有在飞节点的图**（那会让一个在跑 agent 的节点归属凭空消失）。
+
+**"任务结束了"这个判断只在 prompt 里，这是有意的设计边界，不是遗漏。** 框架分不清用户的
+新消息是同一个任务的续集还是另一个任务 —— 那是语义判断，只有看得见话题变化的模型（或有
+显式"新任务"入口的主机）做得出来。所以协议写在模型读得到的地方（`AGENT_GRAPH_DESCRIPTION`
+与 `graph_close` 的 `Tool_Def.description`）：话题变了就是上一个任务结束的信号；而关闭一张
+**仍有未完成节点**的图之前，必须先用 `ask_user` 点名那些节点、问用户是等它们跑完、取消掉、
+还是留着不管，拿到答复再调 `graph_close`。框架不强制，也无法强制：猜错的代价是取消掉别人
+跑了一半的活，那个代价该由用户决定要不要付。协议本身不需要新机制 —— 提问路由已经是一张带
+归属、可乱序应答的登记表。
+
+#### 节点重新激活（缓存失效）
+
+任务收尾之后用户又提了一个局部修改，正好命中某个**已完成**节点干过的活 —— 这时该做的不是
+重开一张图从头再来，而是把那个节点连同消费过它产物的下游一起送回去重跑：
+
+```json
+{ "graph_id": "gph_00000005", "node_ids": ["schema", "docs"], "reason": "用户改了字段命名" }
+```
+
+一个已完成节点的产物本质是一份**缓存**：输入变了，它与消费过它的下游都得重跑。
+`graph_reactivate` 把点名的节点送回 `blocked`（依赖已满足的会被 `tick()` 推到
+`awaiting_confirm`，由主 agent 用 `graph_start` 写**新**契约 —— 输入变了，旧契约多半也
+该变），清掉上一轮的 `agentId` / `result` / `error`，并自增该节点的 `generation`。
+**只接受终态节点**（`succeeded` / `failed` / `cancelled` / `skipped`）：一个还在跑的节点
+没有"过期产物"可言，想让它停下来是 `agent_cancel`。**已关闭的图也可以激活**，激活会把它
+重新置为 open 并成为当前在用的那张（下一句 `graph_start` 才落在对的图上）—— 不过关闭活跃
+图会清空 `activeGraphId`，所以这条最常见的路径要显式带上 `graph_id`，否则拿到的是
+`Error: no graph is active. Known graphs: gph_00000005 (closed).`（软失败里点名了图 id，
+模型一轮就能纠正）。
+
+**框架不自动扩散到下游 —— 失效范围由模型决定，但框架必须把它漏掉的摆到它面前。** 模型手工
+挑节点会漏（它得靠记忆推断"谁消费过这份产物"，而它的上下文可能已被压缩过），而漏掉的那个
+下游会拿着过期认知继续跑，**并且不报任何错**。所以返回值列出：下游有哪些节点、其中哪些读过
+刚被作废的产物 key、以及这些里哪些**没有**被本次点名：
+
+```
+reactivated 2 node(s) in graph gph_00000005: schema (generation 1), docs (generation 1).
+That graph was closed; it is open again.
+Graph gph_00000005 is now the one you are working in. ...
+
+Artifacts you just declared stale: db/schema.sql.
+
+Downstream of your selection — 3 node(s):
+- api [succeeded] read db/schema.sql — NOT reactivated
+- docs [blocked] read db/schema.sql — reactivated in this call
+- e2e [succeeded] further downstream (via api) — NOT reactivated
+
+Still to decide — not reactivated: api, e2e. ...
+```
+
+这段话是**机制而不是排版**：它只提供判断依据，决定权仍在模型 —— 把一个下游留在外面是一个
+"它的活仍然成立"的决定，而不是一次无声的遗忘。直接依赖的节点报出它当初真读到的 key（一个
+节点的契约 `inputs` 恰好就是其直接上游已登记的产物），更远的下游标 `further downstream
+(via …)`，不硬编一份它从未读过的 key。
+
+`prompt` 被刻意保留，所以 `on_ready: 'auto'` 的节点一被激活就带着原契约自己重新起飞（与
+`auto` 的语义一致：活儿事先就定死了）。激活**不动产物轨** —— 旧记录留着，好让重跑的结果能
+和它对比（代价见"已知限制"）。
+
+`generation` 这个计数器挡的是一处具体的 ABA，不是为了整齐：`agent_cancel`（或
+`graph_close` 的 `cancel_outstanding`）会把一个节点变成终态**而它的 agent 还在跑**，
+`graph_reactivate` 又把它从终态取出来 —— 于是那个被放弃的 agent 迟到的回报会穿过图原有的
+"终态节点不被迟到回报复活"守卫，把陈旧的 `succeeded` 写回去，并据此放行本该重跑的下游。
+启动时捕获的 generation 随回报一起带回来，对不上就丢弃并发 `graph.node.stale_report`。
 
 #### `depends_on` 是安全边界，不是调度提示
 
@@ -1123,6 +1248,10 @@ subagents: {
 3. **产物轨是记账约定。** 见上文 —— 它是主方案，但拦不住绕过它的行为。
 4. **`hooks` 会转发给每个子 agent。** `beforeToolCall` / `afterToolCall` / `onError`
    必须转发，否则主机的工具管控策略对子 agent 就失效了 —— 这是安全边界，不是便利。
+5. **`agent.subagents.graph` 起手是 `null`。** 图容器是惰性的，第一次声明才建图；主机若
+   直接读这个 getter（例如自己 `declare()`），要么先 `agent.subagents.newGraph()`，要么
+   判空。全部图在 `agent.subagents.graphs` 这张 Map 里，`closeGraph(graphId, { reason,
+   disposition })` 是主机侧的关图入口（`disposition` 缺省为 `'keep_running'`）。
 
 ### 已知限制
 
@@ -1145,6 +1274,19 @@ subagents: {
 7. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
    `RuntimeHistory` 兜底，此时 `history_search` 搜不到父历史，工具结果里会明确说明这一
    点，不假装能搜。
+8. **"任务结束了"的判断只在 prompt 里** —— 弃图协议（话题变了 = 任务结束；关一张仍有未
+   完成节点的图之前必须先 `ask_user`）由 `AGENT_GRAPH_DESCRIPTION` 与 `graph_close` 的
+   描述讲给模型，框架不强制、也无法强制。这是设计边界而不是遗漏：区分"续集"与"新任务"是
+   语义判断。
+9. **重新激活不自动扩散到下游** —— 失效范围由模型决定，框架只把漏掉的下游摆出来。没被一并
+   激活的下游会拿着过期认知继续跑，**并且不报错**：图会在一个已经不成立的答案上报成功。
+10. **`agent_status` 的节点表不显示 `generation`** —— 一个正在重跑的节点与首次运行的节点
+    在表里长得一样。这个字段在节点快照里（主机读得到），但模型看图的那个窗口看不见它。
+11. **`label` 没有唯一性约束** —— `agent_graph({ label })` 取**第一张** open 的同名图，
+    所以两张图可以共用一个 label，而第二张就再也无法用 label 命中。
+12. **重跑与产物冲突策略的组合** —— 激活刻意不动产物轨（旧记录留着好做对比），因此在
+    `artifacts.policy: 'deny'` 下，重跑写同一个 `key` 时若上一代记录属于另一个 agent，
+    写入会被拒。这是既有语义，但"重跑 + deny"这个组合是新出现的。
 
 ## License
 
