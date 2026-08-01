@@ -34,6 +34,12 @@ test('AGENT_GRAPH_DESCRIPTION 讲清 depends_on 是安全边界而非调度提�
   assert.match(d, /do not invent ordering/i)
   assert.match(d, /genuine read\/write overlap/i)
   assert.match(d, /degenerates into sequential execution/i)
+  // 点 4 的检测器：链式图（每个节点只依赖上一个）是过度声明依赖的信号，
+  // 而不是一律禁止链式——工作确实是顺序的时候，confirm gate 仍然有价值
+  assert.match(d, /depends only on the one declared immediately before it/i)
+  assert.match(d, /straight chain/i)
+  assert.match(d, /not automatically wrong/i)
+  assert.match(d, /confirm gate/i)
   // 点 5：depends_on 只能指向已声明的节点
   assert.match(d, /already declared/i)
   // 保留现有正确的部分：声明不创建实例；ready 节点等待 graph_start；auto 仅用于预先确定的工作
