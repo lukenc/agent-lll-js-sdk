@@ -248,6 +248,13 @@ export class Agent {
     this.validateStreamCompletion = opts.validateStreamCompletion ?? true
     /** 最近一次 run 的终止原因：null | 'completed' | 'max_rounds'。 */
     this.lastStopReason = null
+    /**
+     * 最近一次 run 里 keep-alive 是否等超时了 —— 即"这轮对话收尾时还有后台
+     * 工作没完"。**它是独立于 `lastStopReason` 的一面旗子**：那个取值集合是
+     * 跨包契约（CHANGELOG 里写了 null | 'completed' | 'max_rounds'），不能为
+     * 超时新增一个值。
+     */
+    this.lastKeepAliveTimedOut = false
 
     // ---- Tool_Registry generation 与动态 MCP 状态 ----
     // `this.tools` 保持为数组（元素顺序 = 加入顺序），既有 `tools` 选项语义不变。
@@ -920,6 +927,9 @@ export class Agent {
     // (Finding M-5). plan_and_execute itself doesn't set `lastStopReason`,
     // so it correctly reads back as `null` after such a run.
     this.lastStopReason = null
+    // keep-alive 的"已放弃过一次"闸门必须**按 run 重置**：它在本 run 内抑制第
+    // 二次等待（见 `_keepAliveOnce`），粘到下一轮对话就成了永久关闭 keep-alive。
+    this.lastKeepAliveTimedOut = false
 
     const rootCtx = {
       traceId,
@@ -988,8 +998,10 @@ export class Agent {
     const startedAt = Date.now()
     const startedPerfNow = performance.now()
 
-    // See `_runWithSession` — same staleness-reset rationale (Finding M-5).
+    // See `_runWithSession` — same staleness-reset rationale (Finding M-5)，
+    // keep-alive 的闸门同理按 run 重置。
     this.lastStopReason = null
+    this.lastKeepAliveTimedOut = false
 
     const rootCtx = {
       traceId,
@@ -1385,6 +1397,64 @@ export class Agent {
   }
 
   /**
+   * keep-alive 的一次等待 —— ReAct 循环在"模型给了最终回答、没有工具调用"时调它，
+   * 决定这一轮到底能不能收尾。
+   *
+   * 四种去向：
+   *   - `'injected'` —— 有待注入消息，直接进下一轮把它读了；
+   *   - `'event'` —— 被 subagent 事件唤醒（通常伴随一条刚入队的通知）；
+   *   - `'timeout'` —— 等到上限还没动静，已置旗子 + 发事件 + 给模型留话；
+   *   - `'aborted'` —— 调用方的 signal abort 了（下一轮开头 throwIfAborted）；
+   *   - `'idle'` —— 没有该等的东西，收尾。
+   *
+   * 三道判断的**顺序是本方法的全部要害**，逐条说明见内联注释。
+   *
+   * @param {{ signal?: AbortSignal }} [opts]
+   * @returns {Promise<'injected'|'event'|'timeout'|'aborted'|'idle'>}
+   */
+  async _keepAliveOnce({ signal } = {}) {
+    if (!this.subagents || this.subagents.keepAlive === false) return 'idle'
+
+    // (1) 待注入消息**先于**任何在飞判断。后台 agent 已经跑完时没有任何东西在
+    // 飞，但它的完成通知还在队列里没被读 —— 先判在飞就会 return 'idle'、本轮
+    // 收尾，通知一直躺到未来某轮跑到 round 1 才被排空（drain 只在 round > 0
+    // 发生）。而"跑完就通知你"正是这套机制存在的唯一理由。
+    if (this._pendingInjections.length > 0) return 'injected'
+
+    // (2) 本 run 已经等超时过一次就不再等第二次。超时那次已经给模型留了"收尾
+    // 或 agent_cancel"的话；它若不接手，再等一个完整超时只是把同一次干等重放
+    // 一遍 —— `maxRounds` 默认 300，那是 300 × 10 分钟 ≈ 50 小时的挂起和 300
+    // 次超时事件。注意这道闸在 (1) 之后：抑制的是第二次**等待**，不是第二次
+    // **投递**，迟到的完成通知照样会被 (1) 接住。
+    if (this.lastKeepAliveTimedOut) return 'idle'
+
+    // (3) 用 `hasInFlight()` 而不是 `hasPending()`。blocked / awaiting_confirm
+    // 的图节点等的是主 agent 自己的下一步动作，不是后台任务：它们不产生任何
+    // 事件、也不会自行推进，按它们来等就是每轮干等到超时。
+    if (!this.subagents.hasInFlight()) return 'idle'
+
+    const startedAt = performance.now()
+    const outcome = await this.subagents.nextEvent({
+      signal, timeoutMs: this.subagents.keepAliveTimeoutMs,
+    })
+    if (outcome === 'timeout') {
+      this.lastKeepAliveTimedOut = true
+      const pendingAgents = this.subagents.registry.list().length
+      const pendingNodes = this.subagents.graph?.pendingCount() ?? 0
+      this._safeEmit('run.keep_alive.timeout', {
+        pendingAgents, pendingNodes, waitedMs: performance.now() - startedAt,
+      })
+      this.enqueueMessage({
+        role: 'user',
+        content: `<agent-notification>还有 ${pendingAgents} 个 agent、${pendingNodes} 个图节点未完成，`
+          + `但已等待超过 ${this.subagents.keepAliveTimeoutMs}ms。请收尾：说明哪些工作仍在进行，`
+          + '或用 agent_cancel 取消它们。</agent-notification>',
+      })
+    }
+    return outcome
+  }
+
+  /**
    * `load_mcp_server` 元工具主体：在对话进行中加载一个 MCP 服务器，把它的工具
    * 加入 Tool_Registry。所有失败路径均返回**描述性字符串**（不抛异常给 LLM，
    * 与既有工具执行 catch 分支一致），使 LLM 能读到错误并继续推理。
@@ -1669,6 +1739,10 @@ export class Agent {
         // finish_reason === 'length' 且无工具调用：文本被截断，直接返回已有内容
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
+          // keep-alive：还有 subagent / 图节点没完事就不收尾，等它们的结果回来
+          // 再让模型继续决策。轮次仍受 maxRounds 约束。
+          const outcome = await this._keepAliveOnce({ signal })
+          if (outcome !== 'idle') continue
           this.lastStopReason = 'completed'
           return textContent
         }
@@ -1880,6 +1954,10 @@ export class Agent {
 
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
+          // 同 `_reactLoop`。续轮时**不吐 done**，注入的内容也不作为 delta 吐给
+          // 消费方 —— 它是喂给模型的上下文，不是模型说的话。
+          const outcome = await this._keepAliveOnce({ signal })
+          if (outcome !== 'idle') continue
           this.lastStopReason = 'completed'
           yield { type: 'done', content: textContent, stopReason: 'completed' }
           return

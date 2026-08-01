@@ -28,6 +28,8 @@ export function createSubagentRuntime({
   retainCompleted = 20,
   a2a = {},
   ask: askOpts = {},
+  keepAlive = true,
+  keepAliveTimeoutMs = 600000,
   createAgent,
 } = {}) {
   for (const type of types) registerAgentType(type)
@@ -74,6 +76,9 @@ export function createSubagentRuntime({
         agentId: handle.agentId, agentName: handle.name, parentAgentId: handle.parentAgentId,
         from, to,
       })
+      // 只在真的迁移成功之后唤醒 keep-alive —— 上面那些 return 都是"什么也没
+      // 发生"，为它们叫醒主 agent 等于白烧一轮 LLM 调用。
+      runtime._signalEvent()
     },
     onQuestion: (question, meta) => parent?.hooks?.onAskUser?.(question, meta),
   })
@@ -89,6 +94,13 @@ export function createSubagentRuntime({
 
   /** @type {Set<Promise<unknown>>} 在跑的后台任务 */
   const inflight = new Set()
+
+  /**
+   * keep-alive 的等待方。任何"后台状态往前动了一步"的时刻都要唤醒它们，否则
+   * 一个已经拿到结果的主 agent 会继续干等到超时。
+   * @type {Array<(outcome: string) => void>}
+   */
+  const waiters = []
 
   /**
    * 依赖图。两个回调就是"声明 ≠ 创建"落地的地方：
@@ -115,6 +127,7 @@ export function createSubagentRuntime({
           + '现在决定它到底该做什么：用 graph_start 给出最终的 prompt 契约来启动它，'
           + '或用 agent_cancel 放弃它。\n</graph-node-ready>',
       })
+      runtime._signalEvent()
     },
     onAutoStart: (node) => { void runtime._startNode(node, { background: true }) },
   })
@@ -302,6 +315,8 @@ export function createSubagentRuntime({
         role: 'user',
         content: `<agent-notification agent="${handle.name}" state="${handle.state}">\n${result}\n</agent-notification>`,
       })
+      // 主 agent 可能正卡在 keep-alive 的等待里 —— 通知入队之后立刻叫醒它。
+      runtime._signalEvent()
     },
 
     /**
@@ -430,6 +445,55 @@ export function createSubagentRuntime({
      */
     hasInFlight() {
       return inflight.size > 0 || registry.list().length > 0 || graph.hasInFlight()
+    },
+
+    /** keep-alive 总开关与单次等待上限（`Agent._keepAliveOnce` 读它们）。 */
+    keepAlive: keepAlive !== false,
+    keepAliveTimeoutMs,
+
+    /**
+     * 唤醒全部 keep-alive 等待方。后台状态每往前动一步就调它一次。
+     * 没人在等时是个无副作用的空操作。
+     */
+    _signalEvent() {
+      for (const resolve of waiters.splice(0, waiters.length)) resolve('event')
+    },
+
+    /**
+     * 等下一个 subagent 事件。
+     *
+     * **注册等待方是同步的**（Promise executor 同步执行），所以调用方在
+     * `hasInFlight()` 与本调用之间不会漏掉唤醒 —— 中间没有 await。
+     *
+     * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+     * @returns {Promise<'event'|'timeout'|'aborted'>}
+     */
+    nextEvent({ signal, timeoutMs = keepAliveTimeoutMs } = {}) {
+      if (signal?.aborted) return Promise.resolve('aborted')
+      return new Promise((resolve) => {
+        let settled = false
+        const onAbort = () => finish('aborted')
+        const finish = (outcome) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          // abort 监听器**必须显式摘掉**：`{ once: true }` 只在真的 abort 时自摘，
+          // 而 keep-alive 每轮都等一次、用的是调用方那同一个 signal —— 走
+          // event / timeout 收尾的监听器会一路堆到 MaxListenersExceededWarning。
+          signal?.removeEventListener('abort', onAbort)
+          const idx = waiters.indexOf(wake)
+          if (idx >= 0) waiters.splice(idx, 1)
+          resolve(outcome)
+        }
+        const wake = () => finish('event')
+        // **不 unref 这个定时器。** 它是这次等待唯一的兜底：event loop 上没有
+        // 别的 ref 时，unref 掉的定时器不会把进程唤回来跑它 —— 于是"最多等
+        // keepAliveTimeoutMs"变成"这个 Promise 永不 settle，chat() 挂死"。它
+        // 的寿命只有一次等待，且 `finish()` 每条路径都 clearTimeout。
+        const timer = setTimeout(() => finish('timeout'), timeoutMs)
+        signal?.addEventListener('abort', onAbort, { once: true })
+        waiters.push(wake)
+      })
     },
 
     /** 等全部后台任务 settle。测试与 closeSubagents 用。 */
