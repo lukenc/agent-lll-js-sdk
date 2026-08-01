@@ -5,7 +5,7 @@ import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
 import { SubagentRunner, classifyFailure, RETRYABLE_KINDS, cancelHandle } from './runner.js'
 import { resolveModelAliases } from './models.js'
-import { getAgentType } from './types.js'
+import { getAgentType, registerAgentType, resetAgentTypes } from './types.js'
 
 const parent = {
   _providerName: 'openai',
@@ -50,18 +50,18 @@ function fakeAgentFactory(script) {
   return factory
 }
 
-function makeRunner(script, opts = {}) {
+function makeRunner(script, opts = {}, parentOverride = parent) {
   const sharedHistory = new RuntimeHistory()
   const registry = new AgentRegistry({ maxConcurrent: 4 })
   const artifacts = new ArtifactTrack({ sharedHistory })
   const events = []
   const createAgent = fakeAgentFactory(script)
   const runner = new SubagentRunner({
-    parent, registry, artifacts, sharedHistory,
-    aliases: resolveModelAliases(parent, undefined),
+    parent: parentOverride, registry, artifacts, sharedHistory,
+    aliases: resolveModelAliases(parentOverride, undefined),
     // backoffMs: 0 —— 真实指数退避会让这个文件多睡 12 秒。退避策略本身是可注入的
     // 配置项，测试关心的是"重试发生了几次"，不是"睡了多久"。
-    opts: { retry: { maxAttempts: 3, attemptTimeoutMs: 5000, backoffMs: 0 }, maxDepth: 2, ...opts },
+    opts: { retry: { maxAttempts: 3, backoffMs: 0 }, maxDepth: 2, ...opts },
     emit: (type, payload) => events.push({ type, payload }),
     createAgent,
   })
@@ -126,6 +126,51 @@ test('tools: "*" 继承父工具集但剔除 agent（canSpawn 为 false）', asy
   const names = createAgent.calls[0].tools.map(t => t.name)
   assert.ok(names.includes('read_file'))
   assert.ok(!names.includes('agent'), 'canSpawn=false 的类型不应拿到 agent 工具')
+})
+
+test('tools: "*" 且 canSpawn 为 true 时保留 spawn 工具', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'spawner', description: 'd', systemPrompt: 's', canSpawn: true })
+  const { runner, registry, createAgent } = makeRunner(['ok'])
+  await runner.run(makeHandle(registry, { type: 'spawner' }), { prompt: 'p' })
+  const names = createAgent.calls[0].tools.map(t => t.name)
+  assert.ok(names.includes('agent'), 'canSpawn=true 的类型应该保留 agent 工具')
+  resetAgentTypes()
+})
+
+// --- floor tools（followup 回归：显式 tools 数组不该关掉基础设施工具） -----
+
+test('floor tools：显式窄数组仍然带上 artifact_write / history_search 等基础设施工具', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'narrow', description: 'd', systemPrompt: 's', tools: ['read_file'] })
+  const floorParent = {
+    ...parent,
+    tools: [
+      ...parent.tools,
+      { name: 'artifact_write', description: 'a', parameters: {}, execute: async () => 'x' },
+      { name: 'history_search', description: 'h', parameters: {}, execute: async () => 'x' },
+      { name: 'send_message', description: 'm', parameters: {}, execute: async () => 'x' },
+    ],
+  }
+  const { runner, registry, createAgent } = makeRunner(['ok'], {}, floorParent)
+  await runner.run(makeHandle(registry, { type: 'narrow' }), { prompt: 'p' })
+  const names = createAgent.calls[0].tools.map(t => t.name)
+  assert.ok(names.includes('read_file'), '数组里显式点名的工具要在')
+  assert.ok(names.includes('artifact_write'), 'floor 工具不该被窄数组关掉')
+  assert.ok(names.includes('history_search'), 'floor 工具不该被窄数组关掉')
+  assert.ok(names.includes('send_message'), 'floor 工具不该被窄数组关掉')
+  assert.ok(!names.includes('write_file'), '没点名且不是 floor 工具的仍应被过滤掉')
+  resetAgentTypes()
+})
+
+test('floor tools：parent 本身没有的 floor 工具（如 ask_user）不会被凭空生造出来，也不报错', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'narrow', description: 'd', systemPrompt: 's', tools: ['read_file'] })
+  const { runner, registry, createAgent } = makeRunner(['ok'])
+  await runner.run(makeHandle(registry, { type: 'narrow' }), { prompt: 'p' })
+  const names = createAgent.calls[0].tools.map(t => t.name)
+  assert.ok(!names.includes('ask_user'), 'parent 没有的 floor 工具不能凭空出现')
+  resetAgentTypes()
 })
 
 test('可重试失败：重试到成功，每次都是全新实例', async () => {

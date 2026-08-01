@@ -30,6 +30,27 @@ export const RETRYABLE_KINDS = new Set(['rate_limited', 'llm_error', 'network', 
 /** 子 agent 永远拿不到的元工具（除非其类型 canSpawn）。 */
 const SPAWN_TOOLS = new Set(['agent', 'agent_graph', 'graph_start'])
 
+/**
+ * 无论 `Agent_Type.tools` 怎么写，子 agent 都会保留的基础设施工具 ——
+ * `tools` 这个字段回答的是"这个类型能干哪些*活*"，不是"它可不可以记录自己
+ * 干了什么、搜历史、或者向用户求助"。一个类型写 `tools: ['read_file']` 的
+ * 意思是"这个 agent 只读文件"，不是"它也不准写产物、搜历史、问用户"——
+ * 后面这几件事是框架自身运转的一部分，不该被任务工具的白名单连带关掉。
+ *
+ * 产物轨（`artifact_write` / `artifact_list`）尤其关键：它是这套系统跨 agent
+ * 安全的**主方案**（浏览器环境既没有 git worktree 也没有 `shell_exec`），一个
+ * 窄类型如果因为没在 `tools` 里点名就悄悄丢了它，等于最后一道护栏被自己的
+ * 配置拆掉。
+ *
+ * 与 `tool-filter.js` 的 `BASE_TOOLS`（commit `20617d8`）同一思路：`ToolFilter`
+ * 对任何意图结果都恒定保留 `BASE_TOOLS`；这里对任何 `Agent_Type.tools` 都恒定
+ * 保留 `FLOOR_TOOLS`。**不包含** spawn 工具 —— 能不能再往下派 agent 由
+ * `canSpawn` 单独把关，floor 不该替它做主。
+ */
+const FLOOR_TOOLS = new Set([
+  'artifact_write', 'artifact_list', 'history_search', 'history_get', 'send_message', 'ask_user',
+])
+
 export function classifyFailure(err) {
   if (!err) return 'tool_error'
   // _runOnce 抛的 MaxRoundsError 自带分类，优先采信。
@@ -121,9 +142,14 @@ export class SubagentRunner {
     const type = getAgentType(handle.type)
     const parent = this.parent
 
+    // 显式数组这一支是 floor 生效的地方：`type.tools` 只列出*任务*工具，
+    // `FLOOR_TOOLS` 里的基础设施工具即使没被点名也留在继承结果里（前提是
+    // parent 真的有——floor 是与 parent.tools 的交集，凭空造不出一个 parent
+    // 没提供的工具，比如 parent 没接 `hooks.onAskUser` 时 `ask_user` 压根
+    // 不在 parent.tools 里，这里也就不会替它生造一个）。
     const inherited = type.tools === '*'
       ? parent.tools
-      : parent.tools.filter(t => type.tools.includes(t.name))
+      : parent.tools.filter(t => type.tools.includes(t.name) || FLOOR_TOOLS.has(t.name))
     const tools = type.canSpawn ? [...inherited] : inherited.filter(t => !SPAWN_TOOLS.has(t.name))
 
     const contract = renderContract({
