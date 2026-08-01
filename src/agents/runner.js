@@ -27,8 +27,15 @@ import { SlidingWindowMemory } from '../memory.js'
 /** 可重试的失败类型。其余重跑多半同样结果，纯烧 token。 */
 export const RETRYABLE_KINDS = new Set(['rate_limited', 'llm_error', 'network', 'timeout'])
 
-/** 子 agent 永远拿不到的元工具（除非其类型 canSpawn）。 */
-const SPAWN_TOOLS = new Set(['agent', 'agent_graph', 'graph_start'])
+/**
+ * 子 agent 永远拿不到的元工具（除非其类型 canSpawn）。
+ *
+ * 图的生命周期工具（`graph_close` / `graph_reactivate`）也在内：它们作用于**编排者
+ * 的**图 —— 让一个子 agent 关掉或重跑父 agent 正在编排的任务，是它没有依据做的决定。
+ */
+const SPAWN_TOOLS = new Set([
+  'agent', 'agent_graph', 'graph_start', 'graph_close', 'graph_reactivate',
+])
 
 /**
  * 无论 `Agent_Type.tools` 怎么写，子 agent 都会保留的基础设施工具 ——

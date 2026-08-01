@@ -9,7 +9,14 @@
  *    spec §11），所以两个之间没有依赖路径的节点必然并行跑在同一个目录里。
  *    `depends_on` 因此不是调度提示，是安全边界——这段文字是模型唯一能读到的
  *    约束来源，必须把这一点讲透（spec §5.4「依赖声明是安全边界，不是调度提示」）。
- * 3. `renderContract` —— 把入参渲染成子 agent 的首条 user 消息。
+ *    它还要讲"一张图 = 一个任务"与弃图协议的入口。
+ * 3. `GRAPH_CLOSE_DESCRIPTION` / `GRAPH_REACTIVATE_DESCRIPTION` —— 生命周期那两个
+ *    工具的描述。这两段同样是**机制的一部分而不是文档**：
+ *    - 弃图协议（话题变了就是任务结束的信号；关一张仍有未完成节点的图之前必须先
+ *      用 `ask_user` 问用户）只能是 prompt 级的 —— 框架判断不出任务有没有结束，
+ *      而后果（取消别人跑了一半的活）不该由模型独断。
+ *    - 失效范围由模型决定，所以"不一并激活的下游会拿着过期认知继续跑"必须写给它。
+ * 4. `renderContract` —— 把入参渲染成子 agent 的首条 user 消息。
  *
  * 术语（全文严格区分）：
  *   入参 `description` = 3-8 词短标签，只用于列表显示 / 命名 / 日志，不含任务内容。
@@ -60,7 +67,42 @@ Graph nodes share one working directory. There is no per-node isolation under it
 2. **Declare depends_on whenever a node reads or writes anything an earlier node produced or touched.** File overlap is itself a dependency, even when the two tasks look unrelated at the business-logic level.
 3. **When unsure, add the edge.** A needless edge only costs parallelism — wall-clock time. A missing edge costs correctness and does not error. These costs are not symmetric, so default to serial.
 4. **But do not invent ordering that isn't real.** The test is whether a genuine read/write overlap exists between two nodes, not whether an ordering feels tidier. Chain everything and the DAG degenerates into sequential execution, which defeats the reason to use one. A concrete smell: if every node depends only on the one declared immediately before it, the graph is a straight chain — that shape is what over-declaring looks like from the inside, so re-check each of those edges against the overlap test rather than assume the shape is fine because it validates. A chain is not automatically wrong: when the work really is sequential this tool still earns its keep, since the confirm gate still hands each node its upstream's actual results before you write its final prompt.
-5. **depends_on can only name nodes already declared** — in this call or an earlier one. A node cannot depend on one declared later; declare producers before their consumers.`
+5. **depends_on can only name nodes already declared** — in this call or an earlier one. A node cannot depend on one declared later; declare producers before their consumers.
+
+## One graph is one task
+
+The graph you declare into tracks one task, and node_id only has to be unique within it. Keep adding to the same graph for as long as you are on the same task. When the topic changes, that is the signal the previous task ended: close its graph with graph_close — asking the user first if it still has unfinished nodes, see that tool — and declare the new task's nodes into a fresh graph. Nothing else can make that call: whether a new message continues the current task or starts a different one is a judgement only you can make.`
+
+export const GRAPH_CLOSE_DESCRIPTION = `Close a graph, once the task it tracks is over. A closed graph takes no new nodes; you can still inspect it (agent_status with graph_id "all") and still reactivate its nodes later with graph_reactivate.
+
+## A topic change is the signal that the task ended
+
+The framework cannot detect that a task is finished — whether the user's new message continues the current task or starts a different one is semantic judgement, and only you can make it. When the topic changes, treat the previous task as ended and close its graph, so the new task gets its own node_id namespace and its own status listing instead of accumulating in a graph about something else.
+
+## Ask the user before closing a graph that still has unfinished nodes
+
+If any node has not reached a terminal state — blocked, awaiting_confirm, queued, running, or waiting_input — do NOT decide on your own. Call ask_user first: name those nodes and ask whether to wait for them, cancel them, or leave them running. Then call graph_close with the disposition the user chose. Cancelling work that is halfway done is not yours to decide silently, and the cost of guessing wrong is unrecoverable — the agent stops mid-task and its partial work is lost. You can ask about one graph while other agents keep working: questions are routed per agent and may be answered in any order.
+
+- \`cancel_outstanding\` — every node that has not reached a terminal state is cancelled, and whatever agent is running for it is stopped (including one that is itself blocked on a question).
+- \`keep_running\` — the graph is closed to new nodes, but agents already in flight keep going and you will still be notified as they finish.
+
+Closing the graph you are working in leaves you with no active graph, so your next agent_graph call without a graph_id starts a fresh one.`
+
+export const GRAPH_REACTIVATE_DESCRIPTION = `Send finished graph nodes back to be re-run, because what they were built on has changed. Use this when new information — a correction from the user, a changed requirement, a fixed upstream — invalidates work a node already did.
+
+## Reactivating a node declares its output stale
+
+A finished node's artifacts are a cached result. Reactivating the node says that cache is invalid: the node returns to waiting on its dependencies and you give it a fresh contract with graph_start (its old prompt was written for inputs that no longer hold).
+
+Anything downstream that consumed those artifacts is now standing on knowledge that is out of date, and **the framework does not reactivate it for you** — the invalidation scope is your decision, so a node you leave alone keeps its old result, and every later step built on that result keeps running from the stale version. That failure is silent: nothing errors, the graph just reports success over an answer that is no longer true.
+
+So name every node that has to re-run, not only the one the user pointed at. The result of this call lists what is downstream of your selection, which of those read the artifacts you just invalidated, and which of those you did not name. Read that list and decide about each one — leaving a node out is a decision that its work still holds, and nothing will raise it again.
+
+## Notes
+
+- Only a node in a terminal state (succeeded / failed / cancelled / skipped) can be reactivated. A node still running is not stale — use agent_cancel if you want it to stop.
+- A closed graph may be reactivated: it reopens and becomes the graph you are working in.
+- Reactivating does not delete anything from the artifact track. The old records stay, so the re-run's output can be compared against them.`
 
 /**
  * 渲染子 agent 的首条 user 消息。确定性：同样入参恒得同样文本。

@@ -5,7 +5,7 @@
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
 import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
-import { AgentGraph } from './graph.js'
+import { AgentGraph, GRAPH_TERMINAL_STATES } from './graph.js'
 import { createWorktree } from './isolation.js'
 import { resolveModelAliases, resolveModel } from './models.js'
 import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
@@ -213,30 +213,158 @@ export function createSubagentRuntime({
     },
 
     /**
-     * 把一张图标成 closed。**只是容器层的标记**：closed 图仍查得到状态、里头在飞
-     * 的节点仍取消得掉（解析路径 `_lookupGraph` / `_resolveGraph` 因此对状态不设
-     * 限），变化只有两点 —— 不再接受新的声明，以及成为 FIFO 淘汰的候选。面向模型
-     * 的生命周期与放弃协议不在这一层。
+     * 把一张图标成 closed，并按 `disposition` 处理它里头还没干完的节点。
+     *
+     * closed 是**容器层的标记**：closed 图仍查得到状态、里头在飞的节点仍取消得掉
+     * （解析路径 `_lookupGraph` / `_resolveGraph` 因此对状态不设限），也仍然可以被
+     * `reactivateNodes` 重新打开。变化只有两点 —— 不再接受新的声明，以及成为 FIFO
+     * 淘汰的候选。
+     *
+     * **什么时候该关，只有模型判断得出来** —— 框架分不清"新消息是同一个任务的续集"
+     * 还是"另一个任务"。而关一张仍有未完成节点的图之前要先问用户，同样只能写在
+     * `graph_close` 的 description 里。这一层只执行拿到的决定。
      *
      * @param {string|null} [graphId] 省略时关活跃图。**不会像 `_resolveGraph`
      *        那样顺手新开一张** —— 建一张空图只为了立刻关掉它毫无意义。
-     * @returns {{ ok: true, entry: GraphEntry } | { ok: false, reason: string }}
+     * @param {{ reason?: string|null, disposition?: 'keep_running'|'cancel_outstanding'|null }} [opts]
+     *        `keep_running`（宿主省略时的默认）只标记，在飞的 agent 继续跑，
+     *        `hasInFlight()` 仍算它们；`cancel_outstanding` 把每个未终态节点走一遍
+     *        `_cancelNode`（连它挂在 `ask_user` 上的提问一起结算）。
+     * @returns {{ ok: true, entry: GraphEntry, cancelled: string[], stoppedAgents: number,
+     *   outstanding: string[] } | { ok: false, reason: string }}
      */
-    closeGraph(graphId = null, { reason = null } = {}) {
+    closeGraph(graphId = null, { reason = null, disposition = 'keep_running' } = {}) {
+      if (disposition !== 'keep_running' && disposition !== 'cancel_outstanding') {
+        return {
+          ok: false,
+          reason: `unknown disposition ${JSON.stringify(disposition ?? null)}. Pass `
+            + '"cancel_outstanding" to stop every node that has not finished, or "keep_running" to '
+            + 'close the graph and let the agents already in flight run to completion.',
+        }
+      }
       const found = runtime._lookupGraph(graphId)
       if (!found.ok) return found
       const { entry } = found
       if (entry.state === 'closed') {
         return { ok: false, reason: `graph "${entry.graphId}" is already closed` }
       }
+      // 先处置节点再标 closed：`_cancelNode` 会向宿主投递取消（事件、被取消 agent
+      // 的收尾），让那些事发生在一张还叫得出名字的 open 图上更好读。
+      const cancelled = []
+      let stoppedAgents = 0
+      if (disposition === 'cancel_outstanding') {
+        for (const nodeId of [...entry.graph.nodes.keys()]) {
+          const out = runtime._cancelNode(nodeId, reason ?? 'graph closed', { graphId: entry.graphId })
+          if (!out.ok) continue
+          cancelled.push(nodeId)
+          // 节点数不等于 agent 数：blocked / awaiting_confirm 的节点压根没起 agent。
+          if (out.agentStopped) stoppedAgents += 1
+        }
+      }
+      const outstanding = [...entry.graph.nodes.values()]
+        .filter(node => !GRAPH_TERMINAL_STATES.has(node.state))
+        .map(node => node.nodeId)
+
       entry.state = 'closed'
       entry.closedAt = Date.now()
       // 关掉活跃图之后就没有活跃图了 —— 下一次不带 graph_id 的声明会新开一张，
       // 而不是继续往一张已经关掉、随时会被淘汰的图里塞节点。
       if (runtime.activeGraphId === entry.graphId) runtime.activeGraphId = null
-      emit('graph.closed', { graphId: entry.graphId, label: entry.label, reason })
+      emit('graph.closed', {
+        graphId: entry.graphId, label: entry.label, reason, disposition,
+        cancelled: cancelled.length, stoppedAgents, outstanding: outstanding.length,
+      })
       runtime._evictClosedGraphs()
-      return { ok: true, entry }
+      return { ok: true, entry, cancelled, stoppedAgents, outstanding }
+    },
+
+    /**
+     * 重新激活一批已终态节点（缓存失效）。**已关闭的图也可以** —— 这正是用例：
+     * 任务收尾之后又来了一个局部修改，正好命中一个已完成节点干过的活。激活会把那张
+     * 图重新置为 open 并成为在用的那张（接下来的 `graph_start` 该落在它上面）。
+     *
+     * 返回结构化报告，渲染在 `tools.js`：**框架不自动扩散到下游，但必须把模型漏掉的
+     * 东西摆到它面前**。模型手工挑节点会漏 —— 它得靠记忆推断"谁消费过这个节点的
+     * 产物"，而它的上下文可能已被压缩过；漏一个下游，那个下游就拿着过期认知继续跑，
+     * 而且不报任何错。
+     *
+     * `downstream[].consumedKeys` 算的是"这个节点的契约 inputs 里出现过被激活节点的
+     * 产物 key"。判据是 `_startNode` 那份实现：一个节点拿到的 inputs 恰好是它**直接
+     * 上游**已登记的产物，所以"直接依赖 + 那个上游的产物 key"就是它当初读到的东西。
+     * 产物 key 必须在 `graph.reactivate` **之前**取 —— 激活会清掉 `agentId`，而产物
+     * 是按 agentId 记账的。
+     *
+     * @param {{ graphId?: string|null, nodeIds?: string[]|null, reason?: string|null }} [opts]
+     * @returns {{ ok: true, entry: GraphEntry, reactivated: Array<{ nodeId: string, generation: number }>,
+     *   skipped: Array<{ nodeId: string, reason: string }>, reopened: boolean,
+     *   staleKeys: string[], downstream: Array<object> } | { ok: false, reason: string }}
+     */
+    reactivateNodes({ graphId = null, nodeIds = null, reason = null } = {}) {
+      if (!Array.isArray(nodeIds) || nodeIds.length === 0
+        || nodeIds.some(id => typeof id !== 'string' || id.trim() === '')) {
+        return {
+          ok: false,
+          reason: '`node_ids` must be a non-empty array of node ids — the nodes whose finished work '
+            + 'is now out of date.',
+        }
+      }
+      // 只查不建：激活打的是已经声明过的节点，凭它凭空造一张空图毫无意义。
+      const found = runtime._lookupGraph(graphId)
+      if (!found.ok) return found
+      const { entry } = found
+
+      const requested = [...new Set(nodeIds.map(id => id.trim()))]
+      /** @type {Array<{ nodeId: string, reason: string }>} */
+      const skipped = []
+      const present = []
+      for (const nodeId of requested) {
+        // 多图之后 node_id 可以跨图重名，"不在这张图里"要点名到底哪张图有它 ——
+        // `graph.reactivate` 自己只会说 not found，模型没法据此纠正。
+        if (entry.graph.nodes.has(nodeId)) present.push(nodeId)
+        else skipped.push({ nodeId, reason: runtime._nodeNotHereReason(nodeId, entry) })
+      }
+
+      /** @type {Map<string, string[]>} nodeId → 它登记过的产物 key（激活前取） */
+      const keysByNode = new Map()
+      for (const nodeId of present) {
+        const agentId = entry.graph.get(nodeId)?.agentId
+        keysByNode.set(nodeId, agentId
+          ? [...new Set(artifacts.list({ agentId }).map(r => r.key))]
+          : [])
+      }
+
+      let outcome = { reactivated: [], skipped: [] }
+      if (present.length > 0) outcome = entry.graph.reactivate(present)
+      skipped.push(...outcome.skipped)
+      const seeds = new Set(outcome.reactivated)
+
+      let reopened = false
+      if (seeds.size > 0) {
+        if (entry.state === 'closed') {
+          entry.state = 'open'
+          entry.closedAt = null
+          reopened = true
+          emit('graph.reopened', { graphId: entry.graphId, label: entry.label, reason })
+        }
+        // 激活就是"这张图上又有活了"，跟一次成功的声明同一性质，所以跟着切活跃图
+        // —— 接下来那句 `graph_start` 不带 graph_id 时该落在这张图上。
+        runtime.activeGraphId = entry.graphId
+        emit('graph.reactivated', {
+          graphId: entry.graphId, nodeIds: [...seeds], reason, reopened,
+        })
+      }
+
+      return {
+        ok: true,
+        entry,
+        reopened,
+        staleKeys: [...new Set([...seeds].flatMap(id => keysByNode.get(id) ?? []))],
+        reactivated: [...seeds].map(nodeId => ({
+          nodeId, generation: entry.graph.get(nodeId)?.generation ?? 0,
+        })),
+        skipped,
+        downstream: describeDownstream(entry.graph, seeds, keysByNode),
+      }
     },
 
     /**
@@ -482,6 +610,14 @@ export function createSubagentRuntime({
       let handle = null
 
       /**
+       * 这一轮的 generation，**在启动时就捕获**。两次回报（`onHandle` 的 running 与
+       * `finish` 的终态）都带上它，图那边对不上就丢弃 —— 节点若在这中间被
+       * `reactivate` 送回去重跑，这一轮的回报就属于上一个 generation，采信它等于把
+       * 陈旧结果复活、并据此放行本该重跑的下游。见 `graph.onAgentSettled`。
+       */
+      const generation = node.generation
+
+      /**
        * 把终态回报给图。**以 handle 为准，不靠结果字符串猜** —— 渲染出来的
        * `[agent:x cancelled]` 里没有 ' failed]'，猜的话一次主动取消会被读成
        * succeeded，把下游从一条主 agent 已经放弃的分支上放出来。handle 压根没
@@ -490,7 +626,9 @@ export function createSubagentRuntime({
       const settle = (result) => {
         const status = handle?.result?.status ?? (handle?.state === 'cancelled' ? 'cancelled' : null)
         const state = status === 'succeeded' || status === 'cancelled' ? status : 'failed'
-        graph.onAgentSettled({ nodeId: node.nodeId, state, agentId: handle?.agentId ?? null, result })
+        graph.onAgentSettled({
+          nodeId: node.nodeId, state, agentId: handle?.agentId ?? null, result, generation,
+        })
       }
 
       const spawned = runtime.spawn({
@@ -509,7 +647,7 @@ export function createSubagentRuntime({
           // **趁早**回报 running（这里还在 spawn 的同步段里）：节点若停在 queued
           // 而回调随后抛出，图只能按 launch_failed 处理 —— 而 agent 其实已经起
           // 飞了，会自己走到终态。见 graph.js `onAutoStart` 那段注释。
-          graph.onAgentSettled({ nodeId: node.nodeId, state: 'running', agentId: h.agentId })
+          graph.onAgentSettled({ nodeId: node.nodeId, state: 'running', agentId: h.agentId, generation })
         },
       })
 
@@ -551,7 +689,10 @@ export function createSubagentRuntime({
      * @param {string} nodeId
      * @param {string} reason
      * @param {{ graphId?: string|null }} [opts] 省略 graphId 时用活跃图
-     * @returns {{ ok: boolean, reason?: string }}
+     * @returns {{ ok: boolean, reason?: string, agentId?: string|null, previousState?: string,
+     *   agentStopped?: boolean }} `agentStopped` = 这次取消是否真的停掉了一个在跑的
+     *   agent（节点上没挂 agent、或它已经自己走到终态时为 false）—— 调用方要向模型
+     *   汇报"停了几个"时不能拿节点数当 agent 数。
      */
     _cancelNode(nodeId, reason, { graphId = null } = {}) {
       const found = runtime._lookupGraph(graphId)
@@ -565,8 +706,8 @@ export function createSubagentRuntime({
       const cancelled = entry.graph.cancel(nodeId, reason)
       if (!cancelled.ok) return cancelled
       const handle = cancelled.agentId ? registry.get(cancelled.agentId) : null
-      if (handle) cancelHandle(handle, { reason, emit, ask })
-      return cancelled
+      const agentStopped = handle ? cancelHandle(handle, { reason, emit, ask }) : false
+      return { ...cancelled, agentStopped }
     },
 
     /**
@@ -732,6 +873,21 @@ export function createSubagentRuntime({
     },
 
     /**
+     * 全部图里还没走到终态的节点数，**含 closed 图**。
+     *
+     * 跨图的理由与 `_anyGraph` 一样，但这个数字的用途不同：它是**告知模型**用的
+     * （keep-alive 超时时那句"还有 N 个 agent、M 个图节点未完成，请收尾"，以及
+     * `run.keep_alive.timeout` 事件）。只数活跃图的话，未完成节点落在非活跃图里时
+     * 模型会在它决定要不要停下来的那一刻被告知"0 个图节点未完成"—— 决策路径
+     * （`hasInFlight()`）本来是对的，错的只是告知，而模型是照告知行事的。
+     */
+    pendingNodeCount() {
+      let n = 0
+      for (const entry of graphs.values()) n += entry.graph.pendingCount()
+      return n
+    },
+
+    /**
      * 渲染图状态给 LLM / 人看。**默认只渲染活跃图** —— 把全部图都摊开等于把
      * 无界增长从节点级搬到图级，那正是多图容器要收掉的东西。`graphId: 'all'`
      * 是显式的全量出口（含 closed）。
@@ -852,6 +1008,54 @@ export function createSubagentRuntime({
 
   runtime.tools = createSubagentTools(runtime)
   return runtime
+}
+
+/**
+ * 被激活节点的**拓扑下游**，逐个标注它当初有没有读到被宣告过期的产物。
+ *
+ * 不动点遍历而不是一次插入序扫描：今天的依赖只能指向更早声明的节点（`declare` 的
+ * 未知依赖检查保证了这点），扫一遍其实就够；不动点不依赖那个前提，哪天依赖可改写它
+ * 仍然对。
+ *
+ * `consumedKeys` 只算**直接依赖**：一个节点的契约 inputs 恰好是它直接上游已登记的
+ * 产物（见 `_startNode`），再往下的节点读到的是中间那个节点转述过的结论 —— 标成
+ * `direct: false` 而不是硬编一份它其实没读过的 key，是为了让模型看到的东西跟实际
+ * 发生过的事情对得上。
+ *
+ * @param {AgentGraph} graph
+ * @param {Set<string>} seeds 本次真的被激活的节点
+ * @param {Map<string, string[]>} keysByNode 激活前取的 nodeId → 产物 key
+ * @returns {Array<{ nodeId: string, state: string, direct: boolean, reactivated: boolean,
+ *   consumedKeys: string[], via: string[] }>}
+ */
+function describeDownstream(graph, seeds, keysByNode) {
+  if (seeds.size === 0) return []
+  const downstream = new Set()
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const [nodeId, node] of graph.nodes) {
+      if (downstream.has(nodeId)) continue
+      if (node.dependsOn.some(dep => seeds.has(dep) || downstream.has(dep))) {
+        downstream.add(nodeId)
+        grew = true
+      }
+    }
+  }
+  const rows = []
+  for (const [nodeId, node] of graph.nodes) {
+    if (!downstream.has(nodeId)) continue
+    const fromSeeds = node.dependsOn.filter(dep => seeds.has(dep))
+    rows.push({
+      nodeId,
+      state: node.state,
+      direct: fromSeeds.length > 0,
+      reactivated: seeds.has(nodeId),
+      consumedKeys: [...new Set(fromSeeds.flatMap(dep => keysByNode.get(dep) ?? []))],
+      via: node.dependsOn.filter(dep => downstream.has(dep)),
+    })
+  }
+  return rows
 }
 
 /**

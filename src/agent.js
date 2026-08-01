@@ -1447,7 +1447,10 @@ export class Agent {
     if (outcome === 'timeout') {
       this.lastKeepAliveTimedOut = true
       const pendingAgents = this.subagents.registry.list().length
-      const pendingNodes = this.subagents.graph?.pendingCount() ?? 0
+      // **跨全部图**，不是活跃图那一张：这个数字进的是"请收尾"那句提示，而模型是
+      // 照告知行事的 —— 未完成节点落在非活跃图里时告诉它"0 个图节点未完成"，正好
+      // 在它决定要不要停下来的那一刻给了它错的数。
+      const pendingNodes = this.subagents.pendingNodeCount()
       this._safeEmit('run.keep_alive.timeout', {
         pendingAgents, pendingNodes, waitedMs: performance.now() - startedAt,
       })

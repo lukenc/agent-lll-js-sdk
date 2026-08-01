@@ -2,14 +2,17 @@
  * subagent 系统的元工具。全部遵循本仓库的**软失败**风格：入参非法、类型未注册、
  * 目标不存在等情况返回说明字符串让模型自行纠正，不 throw。
  */
-import { AGENT_TOOL_DESCRIPTION, AGENT_GRAPH_DESCRIPTION } from './contract.js'
+import {
+  AGENT_TOOL_DESCRIPTION, AGENT_GRAPH_DESCRIPTION,
+  GRAPH_CLOSE_DESCRIPTION, GRAPH_REACTIVATE_DESCRIPTION,
+} from './contract.js'
 import { modelEnum } from './models.js'
 import { searchHistory, getHistoryEvent } from './history-search.js'
 import { cancelHandle } from './runner.js'
 
 export const SUBAGENT_TOOL_NAMES = [
   'agent', 'agent_status', 'agent_cancel',
-  'agent_graph', 'graph_start',
+  'agent_graph', 'graph_start', 'graph_close', 'graph_reactivate',
   'send_message',
   'artifact_write', 'artifact_list',
   'history_search', 'history_get',
@@ -276,6 +279,96 @@ export function createSubagentTools(runtime) {
     },
 
     {
+      name: 'graph_close',
+      description: GRAPH_CLOSE_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          graph_id: {
+            type: 'string',
+            description: 'Which graph to close. Defaults to the one you are working in.',
+          },
+          disposition: {
+            type: 'string',
+            enum: ['cancel_outstanding', 'keep_running'],
+            description: 'What to do with nodes that have not finished. If any node is still '
+              + 'outstanding, ask the user which of these two to use before you call this.',
+          },
+          reason: { type: 'string', description: 'Why the task is being closed out' },
+        },
+        required: ['disposition'],
+      },
+      execute: async ({ graph_id: graphId, disposition, reason } = {}) => {
+        // `disposition ?? null`，不是原样透传：`closeGraph` 的入参默认值是
+        // `keep_running`（宿主直接调 `closeGraph(id)` 时"只标记"是对的），而
+        // `undefined` 会命中那个默认值 —— 模型漏填这个必填项就会静默关掉一张图，
+        // 连它有没有未完成节点都没被摆到它面前。传 `null` 绕开默认值，让
+        // `closeGraph` 那一条校验（列出两个可选值）成为唯一的出处。
+        const closed = runtime.closeGraph(graphId ?? null, {
+          reason: reason ?? null, disposition: disposition ?? null,
+        })
+        if (!closed.ok) return `Error: ${closed.reason}`
+        const { entry, cancelled, stoppedAgents, outstanding } = closed
+        const label = entry.label ? ` ${JSON.stringify(entry.label)}` : ''
+        const lines = [`graph ${entry.graphId}${label} closed (${disposition}${reason ? `: ${reason}` : ''}).`]
+        if (disposition === 'cancel_outstanding') {
+          // 节点数不当 agent 数报：blocked / awaiting_confirm 的节点压根没起 agent，
+          // 说"agent 都停了"会让模型向用户转述一件没发生的事。
+          lines.push(cancelled.length > 0
+            ? `Cancelled ${cancelled.length} unfinished node(s): ${cancelled.join(', ')}`
+              + `${stoppedAgents > 0 ? ` — ${stoppedAgents} running agent(s) stopped.` : '; none of them had an agent running.'}`
+            : 'Nothing was outstanding — no node had to be cancelled.')
+        } else if (outstanding.length > 0) {
+          lines.push(`${outstanding.length} node(s) left running: ${outstanding.join(', ')}. `
+            + 'You will still be notified as they finish, and they still count as work in flight.')
+        }
+        lines.push('You have no active graph now: your next agent_graph call without a graph_id '
+          + 'starts a fresh one.')
+        // `closeGraph` 末尾会跑一次 FIFO 淘汰，超出 `retainClosedGraphs` 时这张图可能
+        // 当场就被整张淘汰了 —— 那时候告诉模型"还查得到"就是假话。
+        if (runtime.graphs.has(entry.graphId)) {
+          lines.push('This graph can still be inspected with agent_status graph_id "all", and its '
+            + 'nodes can still be reactivated.')
+        } else {
+          lines.push('This graph has been dropped from the status listing (only the most recent '
+            + `closed graphs are kept), so ${entry.graphId} can no longer be inspected or reactivated.`)
+        }
+        return lines.join('\n')
+      },
+    },
+
+    {
+      name: 'graph_reactivate',
+      description: GRAPH_REACTIVATE_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          graph_id: {
+            type: 'string',
+            description: 'Which graph the nodes belong to. Defaults to the one you are working in; '
+              + 'a closed graph reopens when you reactivate a node in it.',
+          },
+          node_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Every node whose finished work is now out of date — not only the one the '
+              + 'user pointed at. Nodes not listed here keep their old results.',
+          },
+          reason: { type: 'string', description: 'What changed, and why this work is now stale' },
+        },
+        required: ['node_ids'],
+      },
+      execute: async ({ graph_id: graphId, node_ids: nodeIds, reason } = {}) => {
+        const out = runtime.reactivateNodes({ graphId, nodeIds, reason: reason ?? null })
+        if (!out.ok) return `Error: ${out.reason}`
+        if (out.reactivated.length === 0) {
+          return `Error: nothing was reactivated.\n${renderSkipped(out.skipped)}`
+        }
+        return renderReactivation(out)
+      },
+    },
+
+    {
       name: 'send_message',
       description: 'Send a message to another agent. The message does not interrupt what that agent is '
         + 'doing — it lands in its context at its next round boundary. Sending to an agent that already '
@@ -415,6 +508,57 @@ export function createSubagentTools(runtime) {
       },
     },
   ]
+}
+
+/** 被拒的节点逐条给理由 —— 模型只能靠这些话自我纠正。 */
+function renderSkipped(skipped) {
+  return skipped.map(s => `- ${s.reason}`).join('\n')
+}
+
+/**
+ * 一次激活的返回值。**这段渲染本身是机制**：失效范围由模型决定，而模型手工挑节点
+ * 会漏（它得靠记忆推断"谁消费过这份产物"，而它的上下文可能已被压缩过）。所以这里
+ * 必须把它漏掉的摆出来，而且要让"没列进来"读起来是一个待确认的选择，不是一句可以
+ * skim 过去的提示 —— 漏一个下游，那个下游就拿着过期认知继续跑，而且不报任何错。
+ */
+function renderReactivation({ entry, reactivated, skipped, reopened, staleKeys, downstream }) {
+  const names = reactivated.map(r => `${r.nodeId} (generation ${r.generation})`).join(', ')
+  const lines = [`reactivated ${reactivated.length} node(s) in graph ${entry.graphId}: ${names}.`]
+  if (reopened) lines.push('That graph was closed; it is open again.')
+  lines.push(`Graph ${entry.graphId} is now the one you are working in. Each reactivated node is back `
+    + 'to waiting on its dependencies — give it a new contract with graph_start once it is ready.')
+  if (skipped.length > 0) lines.push('', 'Not reactivated (unchanged):', renderSkipped(skipped))
+
+  lines.push('', staleKeys.length > 0
+    ? `Artifacts you just declared stale: ${staleKeys.join(', ')}.`
+    : 'The reactivated nodes recorded no artifacts, so consumption cannot be checked key by key — '
+      + 'treat every node below as a possible consumer.')
+
+  if (downstream.length === 0) {
+    lines.push('Nothing downstream: no other node depends on what you reactivated, so the '
+      + 'invalidation stops here.')
+    return lines.join('\n')
+  }
+
+  lines.push('', `Downstream of your selection — ${downstream.length} node(s):`)
+  for (const row of downstream) {
+    const what = row.consumedKeys.length > 0
+      ? `read ${row.consumedKeys.join(', ')}`
+      : (row.direct ? 'depends on a reactivated node' : `further downstream (via ${row.via.join(', ')})`)
+    lines.push(`- ${row.nodeId} [${row.state}] ${what} — `
+      + (row.reactivated ? 'reactivated in this call' : 'NOT reactivated'))
+  }
+
+  const left = downstream.filter(row => !row.reactivated).map(row => row.nodeId)
+  if (left.length === 0) {
+    lines.push('', 'Every downstream node is in this call, so nothing is left holding a stale result.')
+    return lines.join('\n')
+  }
+  lines.push('', `Still to decide — not reactivated: ${left.join(', ')}. `
+    + 'Each of those still holds a result produced from what you just declared out of date. '
+    + 'Leaving one out is a decision that its work still holds despite the change; if that is not '
+    + 'what you mean, call graph_reactivate again with those node_ids. Nothing else will raise this.')
+  return lines.join('\n')
 }
 
 /**
