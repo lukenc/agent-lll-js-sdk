@@ -48,8 +48,12 @@ export const GRAPH_PENDING_STATES = new Set([
  * 真的有 agent 在飞的状态 —— `GRAPH_PENDING_STATES` 减去"等主 agent 动手"的
  * 那两个。blocked / awaiting_confirm 的节点不占运行时资源，也不会自己产生任何
  * 事件：把它们算成"还有活"，任何等事件的调用方（keep-alive）都会干等到超时。
+ *
+ * 导出它是因为 `runtime.closeGraph` 需要按同一份状态集合把 `keep_running` 报告
+ * 里的"真在飞"和"等主 agent 自己动手"分开 —— 手抄一份第二个状态列表就是当初
+ * 那个 5-vs-6 `BASE_TOOLS` 漂移复现一次，宁可导出复用。
  */
-const GRAPH_IN_FLIGHT_STATES = new Set(['queued', 'running', 'waiting_input'])
+export const GRAPH_IN_FLIGHT_STATES = new Set(['queued', 'running', 'waiting_input'])
 
 /** 调用方可以回报的 agent 状态（`onAgentSettled` 的 state 入参）。 */
 const REPORTABLE_STATES = new Set([

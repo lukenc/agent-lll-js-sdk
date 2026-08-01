@@ -225,6 +225,7 @@ export class Agent {
    *   `Agent_Type.maxAttempts` > 3；`backoffMs` 为退避基数（默认 `min(2^attempt·1000, 8000)`）
    * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
    * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
+   * @param {number} [opts.subagents.retainClosedGraphs=5] - 保留多少张已关闭的图（FIFO 淘汰，在飞节点的图不淘汰）
    * @param {object} [opts.subagents.a2a] - A2A 配置。`transport` 默认 'local'（进程内投递）；
    *   其余字段原样交给 transport 工厂（见 `registerA2ATransport`）
    * @param {object} [opts.subagents.ask] - 提问路由配置

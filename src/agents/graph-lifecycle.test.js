@@ -195,9 +195,61 @@ test('graph_close keep_running 关图但在飞的 agent 继续跑，hasInFlight(
   assert.strictEqual(entry.graph.get('n1').state, 'running', 'keep_running 不动节点')
   assert.strictEqual(rt.hasInFlight(), true,
     '一个在飞的 agent 不因为它所属的图被关掉就停止存在')
+  assert.ok(out.includes('in flight'), `真在飞的节点要这么说：${out}`)
+  assert.ok(/keep running|completion notices/.test(out), `要说清楚它的 agent 还在跑：${out}`)
 
   await release()
   assert.strictEqual(entry.graph.get('n1').state, 'succeeded', '它自己走到终态，结果照样有人接')
+})
+
+test('graph_close keep_running 面对只有 awaiting_confirm / blocked 的图，不能说它们在飞或会被通知', async () => {
+  // 回归：defect 1 —— outstanding 只按"非终态"分类，把 blocked / awaiting_confirm
+  // 也算进"left running ... will still be notified ... work in flight"，而这三句话
+  // 对它们全是假的：agentId 是 null（agents/handle.js），hasInFlight() 不算它们
+  // （graph.js GRAPH_IN_FLIGHT_STATES），awaiting_confirm 是在等模型自己调
+  // graph_start，不是在等事件；blocked 等的上游现在可能永远不会跑完。
+  const { rt, tool } = makeRuntime()
+  await tool('agent_graph').execute({ nodes: [n('n1'), n('n2', ['n1'])] })
+  const entry = rt.graphs.get(rt.activeGraphId)
+  assert.strictEqual(entry.graph.get('n1').state, 'awaiting_confirm', '前提：n1 没有依赖，声明后直接就绪')
+  assert.strictEqual(entry.graph.get('n2').state, 'blocked', '前提：n2 依赖 n1，n1 还没跑完')
+  assert.strictEqual(rt.hasInFlight(), false, '前提：这张图里没有真在飞的 agent')
+
+  const out = await tool('graph_close').execute({ graph_id: entry.graphId, disposition: 'keep_running' })
+
+  assert.ok(!out.startsWith('Error:'), out)
+  assert.ok(!/left running/i.test(out), `没有节点在跑，不能这么说：${out}`)
+  assert.ok(!/will still be notified/i.test(out), `没有事件会来，不能这么说：${out}`)
+  assert.ok(!/\bin flight\b/i.test(out), `hasInFlight() 不算它们，不能这么说：${out}`)
+  assert.ok(out.includes('n1') && out.includes('awaiting_confirm'),
+    `awaiting_confirm 节点要点名，且要说清楚在等模型自己调 graph_start：${out}`)
+  assert.ok(out.includes('n2') && out.includes('blocked'),
+    `blocked 节点要点名，且要说清楚在等上游：${out}`)
+})
+
+test('graph_close keep_running 混合场景下，真在飞 / awaiting_confirm / blocked 三组分别报告', async () => {
+  const { rt, tool, release } = makeRuntime({ gate: true })
+  await tool('agent_graph').execute({ nodes: [n('n1'), n('n2'), n('n3', ['n2'])] })
+  const entry = rt.graphs.get(rt.activeGraphId)
+  await tool('graph_start').execute({ node_id: 'n1', prompt: 'p' })
+  assert.strictEqual(entry.graph.get('n1').state, 'running')
+  assert.strictEqual(entry.graph.get('n2').state, 'awaiting_confirm')
+  assert.strictEqual(entry.graph.get('n3').state, 'blocked')
+
+  const out = await tool('graph_close').execute({ graph_id: entry.graphId, disposition: 'keep_running' })
+
+  assert.ok(!out.startsWith('Error:'), out)
+  const inFlightLine = out.split('\n').find(l => l.includes('n1'))
+  const confirmLine = out.split('\n').find(l => l.includes('n2'))
+  const blockedLine = out.split('\n').find(l => l.includes('n3'))
+  assert.ok(inFlightLine && /in flight/i.test(inFlightLine), `n1 那一行要说它在飞：${out}`)
+  assert.ok(confirmLine && confirmLine !== inFlightLine && /awaiting_confirm/.test(confirmLine),
+    `n2 要单独一行，且不能混进"在飞"那句：${out}`)
+  assert.ok(blockedLine && blockedLine !== inFlightLine && blockedLine !== confirmLine
+    && /blocked/.test(blockedLine), `n3 要单独一行，且不能混进另外两句：${out}`)
+  assert.ok(!/left running/i.test(out), `旧措辞不能残留：${out}`)
+
+  await release()
 })
 
 test('关掉活跃图后，下一次不带 graph_id 的 agent_graph 新建一张', async () => {
