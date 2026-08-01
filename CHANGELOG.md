@@ -6,6 +6,23 @@
 
 ### 新增
 
+- **Subagent keep-alive**（`opts.subagents.keepAlive`，默认开启）：还有后台
+  subagent 或图节点在飞时，模型给出的"无工具调用的最终回答"不再立刻收尾本轮，
+  而是等下一个 subagent 事件回来、把结果带进上下文让模型继续决策。补的是这个
+  洞：编排者派出三个后台 agent 并说"我等它们回来"，ReAct 循环却在这句话之后
+  立即返回，结果回来时已经没人读了。轮次仍受 `maxRounds` 约束。
+  - `opts.subagents.keepAliveTimeoutMs`（默认 `600000`）——单次等待上限。
+  - `Agent#lastKeepAliveTimedOut`（boolean）——最近一次运行是否在还有后台工作
+    未完成时放弃了等待。**每轮对话最多超时一次**：超时后会给模型留一条"收尾或
+    `agent_cancel`"的提示，此后的最终回答直接收尾，不再重复等待。
+  - 新增事件 `run.keep_alive.timeout`，payload
+    `{ pendingAgents, pendingNodes, waitedMs }`。
+  - `keepAlive: false` 可完全关闭该等待，恢复"最终回答一律立刻收尾"的旧行为；
+    未配置 `opts.subagents` 时行为与旧版本逐字节一致。
+  - **`Agent#lastStopReason` 的取值集合未扩张**（仍为 `null` | `'completed'` |
+    `'max_rounds'`，跨包契约）——keep-alive 超时经上面那面独立的旗子与事件浮出，
+    不新增枚举值，现有消费方无需改动。
+
 - **Skill 系统**（`src/skills/`）：兼容 Claude Code 格式的 skill 包（`SKILL.md` +
   `scripts/` / `references/` 等捆绑文件），可从本地目录或 HTTP manifest 加载。
   Level 1 清单自动注入 system prompt，内置 `skill` 元工具按需注入正文（Level 2），
