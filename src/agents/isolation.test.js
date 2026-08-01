@@ -202,7 +202,7 @@ test('spawn 建出 worktree，把工作目录同时写进契约与 ctx.cwd，收
 
   const handle = rt.registry.list({ includeFinished: true })[0]
   assert.strictEqual(handle.isolation.mode, 'worktree')
-  assert.strictEqual(handle.isolation.path, '/repo/.worktrees/agent-' + handle.agentId)
+  assert.strictEqual(handle.isolation.path, `/repo/.worktrees/agent-${handle.agentId}`)
   assert.strictEqual(handle.isolation.branch, `subagent/${handle.agentId}`)
   // 两条**都是通告，不是保证**：框架不改写工具入参，主机工具认不认 cwd 由主机定。
   assert.ok(seen.contract.includes(handle.isolation.path))
@@ -240,6 +240,29 @@ test('worktree 建不出来 → 软失败字符串 + handle 取消，绝不起 a
   const handle = rt.registry.list({ includeFinished: true })[0]
   assert.strictEqual(handle.state, 'cancelled')
   assert.strictEqual(handle.isolation, null)
+  // 这条路径新增了一个 emit 与一段回给模型的文本，两处都不能捎上凭据。
+  assert.ok(!`${out}${JSON.stringify(rt.parent._events)}`.includes('sk-main'))
+})
+
+test('失败的子 agent 留下的改动同样上报（不只是成功的那条路径）', async () => {
+  const exec = fakeExec({ ...okRepo, 'git status': { stdout: ' M a.js\n', code: 0 } })
+  const parent = fakeParent()
+  const rt = createSubagentRuntime({
+    parent,
+    retry: { maxAttempts: 1 },
+    isolation: { exec },
+    createAgent: () => ({
+      lastStopReason: null,
+      on() { return this }, off() { return this },
+      async chat() { throw new Error('boom') },
+    }),
+  })
+  const out = await rt.spawn({
+    description: 'x', prompt: '干活', background: false, isolation: { mode: 'worktree' },
+  })
+  assert.match(out, /^\[agent:general-purpose-1 failed\]/m)
+  assert.match(out, /--- worktree ---/)
+  assert.match(out, /changed=1 files/)
 })
 
 test('不带 isolation 时一行 git 都不跑', async () => {
