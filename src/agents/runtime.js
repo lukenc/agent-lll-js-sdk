@@ -127,6 +127,7 @@ export function createSubagentRuntime({
           + '现在决定它到底该做什么：用 graph_start 给出最终的 prompt 契约来启动它，'
           + '或用 agent_cancel 放弃它。\n</graph-node-ready>',
       })
+      // 同 `_onBackgroundSettled`：通知入队后叫醒可能在等的主 agent。
       runtime._signalEvent()
     },
     onAutoStart: (node) => { void runtime._startNode(node, { background: true }) },
@@ -448,7 +449,7 @@ export function createSubagentRuntime({
     },
 
     /** keep-alive 总开关与单次等待上限（`Agent._keepAliveOnce` 读它们）。 */
-    keepAlive: keepAlive !== false,
+    keepAlive,
     keepAliveTimeoutMs,
 
     /**

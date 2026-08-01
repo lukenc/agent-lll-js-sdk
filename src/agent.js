@@ -230,6 +230,12 @@ export class Agent {
    * @param {number|null} [opts.subagents.ask.timeoutMs=null] - 单个提问的等待上限；
    *   null = 永不超时（与旧 `onAskUser` 行为一致）。到点后提问方拿到一段"用户未回答"的
    *   说明而不是继续挂着
+   * @param {boolean} [opts.subagents.keepAlive=true] - 还有后台 agent / 图节点在飞时，
+   *   模型给出的"最终回答"不收尾本轮，而是等它们的结果回来再让模型继续决策。
+   *   false = 关掉这个等待，最终回答一律立刻收尾（旧行为）
+   * @param {number} [opts.subagents.keepAliveTimeoutMs=600000] - 单次 keep-alive 等待的上限。
+   *   到点后置 `lastKeepAliveTimedOut`、发 `run.keep_alive.timeout`，并给模型留一条
+   *   "收尾或 agent_cancel"的提示；**每轮对话最多超时一次**，此后最终回答直接收尾
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -1400,7 +1406,7 @@ export class Agent {
    * keep-alive 的一次等待 —— ReAct 循环在"模型给了最终回答、没有工具调用"时调它，
    * 决定这一轮到底能不能收尾。
    *
-   * 四种去向：
+   * 五种去向：
    *   - `'injected'` —— 有待注入消息，直接进下一轮把它读了；
    *   - `'event'` —— 被 subagent 事件唤醒（通常伴随一条刚入队的通知）；
    *   - `'timeout'` —— 等到上限还没动静，已置旗子 + 发事件 + 给模型留话；
@@ -1413,7 +1419,7 @@ export class Agent {
    * @returns {Promise<'injected'|'event'|'timeout'|'aborted'|'idle'>}
    */
   async _keepAliveOnce({ signal } = {}) {
-    if (!this.subagents || this.subagents.keepAlive === false) return 'idle'
+    if (!this.subagents || !this.subagents.keepAlive) return 'idle'
 
     // (1) 待注入消息**先于**任何在飞判断。后台 agent 已经跑完时没有任何东西在
     // 飞，但它的完成通知还在队列里没被读 —— 先判在飞就会 return 'idle'、本轮
