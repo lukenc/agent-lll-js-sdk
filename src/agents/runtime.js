@@ -355,6 +355,11 @@ export function createSubagentRuntime({
         for (const env of mailbox.drain('main')) {
           parent.enqueueMessage({ role: 'user', content: mailbox.formatForInjection(env) })
         }
+        // 主 agent 可能正停在 keep-alive 的 `nextEvent()` 里。不叫醒它，这封信要
+        // 等满一个 keepAliveTimeoutMs（默认 10 分钟）才被读到 —— 而 keep-alive
+        // 每轮对话只等一次，那一停之后这轮就收尾了。子 agent 跑到一半回头找父
+        // agent 要个决策，正是 A2A 存在的理由。
+        runtime._signalEvent()
         return 'delivered to main; it will read this at its next round boundary.'
       }
 
@@ -453,8 +458,19 @@ export function createSubagentRuntime({
     keepAliveTimeoutMs,
 
     /**
-     * 唤醒全部 keep-alive 等待方。后台状态每往前动一步就调它一次。
-     * 没人在等时是个无副作用的空操作。
+     * 唤醒全部 keep-alive 等待方。没人在等时是个无副作用的空操作。
+     *
+     * **规则：任何把消息排进 `parent.enqueueMessage` 的路径，末尾都要调它。**
+     * 判据是"这一步会让主 agent 想重新决策吗" —— 会就得叫醒它，漏调的代价是主
+     * agent 干等满一个 `keepAliveTimeoutMs`（默认 10 分钟）才发现事情早变了。
+     * 今天的四个投递点：`onReadyNode`、`_onBackgroundSettled`、`sendMessage` 的
+     * `to: 'main'` 分支（三个都调了），以及 `Agent._keepAliveOnce` 自己的超时提示
+     * ——那条是主 agent 写给自己的，它此刻正好刚从等待里出来，没有等待方可叫。
+     *
+     * `SubagentRunner._deliverMail` 排的是**子 agent**的队列，不是 parent 的：
+     * 子 agent 由 `buildChildOptions` 构造，那里不传 `subagents`，所以整棵树只有
+     * 这一个 runtime、一份 `waiters` —— 子 agent 永远不会停在 keep-alive 里。哪天
+     * 子 agent 也有了自己的 runtime，那里就得补一个 `child.subagents?._signalEvent()`。
      */
     _signalEvent() {
       for (const resolve of waiters.splice(0, waiters.length)) resolve('event')

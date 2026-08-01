@@ -153,6 +153,37 @@ test('keep-alive 被后台完成通知唤醒后返回 event', async () => {
   assert.strictEqual(agent._pendingInjections.length, 1, '完成通知已入队，等轮边界排空')
 })
 
+test('subagent 给 main 发消息能立刻叫醒停在 keep-alive 里的父 agent', async () => {
+  // 回归：`sendMessage` 的 to:'main' 分支只 enqueue、不 `_signalEvent()` —— 父
+  // agent 会在 nextEvent 里一直停到超时（生产默认 10 分钟）才读到这条信。而
+  // keep-alive 每轮对话只等一次，那一停之后这轮就收尾了。子 agent 跑到一半回头
+  // 找父 agent 要个决策，正是 A2A 存在的理由，却拿到了全系统最差的延迟。
+  const agent = new Agent({ ...baseOpts, subagents: { keepAliveTimeoutMs: 3000 } })
+  const rt = agent.subagents
+  const child = rt.registry
+    .create({ type: 'general-purpose', description: '在跑', depth: 1, model: null })
+  child.transition('queued').transition('running')
+
+  const startedAt = performance.now()
+  const waiting = agent._keepAliveOnce()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.strictEqual(agent._pendingInjections.length, 0, '前置条件：父 agent 确实停在等待里')
+
+  const sendMessage = rt.tools.find(t => t.name === 'send_message')
+  const ack = await sendMessage.execute(
+    { to: 'main', message: '第二个仓库要不要一起查？' },
+    { agentId: child.agentId, agentName: child.name },
+  )
+  assert.match(ack, /delivered to main/)
+
+  // 超时是 3000ms，断言的是**取值**与"远早于超时" —— 靠超时是过不了的。
+  assert.strictEqual(await waiting, 'event', '必须是被这条消息唤醒')
+  const elapsed = performance.now() - startedAt
+  assert.ok(elapsed < 1000, `应当立刻唤醒，实际等了 ${Math.round(elapsed)}ms`)
+  assert.strictEqual(agent._pendingInjections.length, 1)
+  assert.match(agent._pendingInjections[0].content, /第二个仓库/)
+})
+
 test('keep-alive 超时置 lastKeepAliveTimedOut 且 lastStopReason 仍是 completed', async () => {
   const agent = new Agent({ ...baseOpts, subagents: { keepAliveTimeoutMs: 10 } })
   const events = []
