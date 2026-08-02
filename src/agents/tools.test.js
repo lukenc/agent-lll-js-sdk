@@ -117,10 +117,45 @@ test('缺 prompt 时软失败而非抛异常', async () => {
   assert.ok(/prompt/i.test(out))
 })
 
-test('agent_status 列出活跃 agent 与并发占用', async () => {
-  const rt = makeRuntime(fakeParent())
-  const out = await byName(rt.tools, 'agent_status').execute({})
-  assert.ok(out.includes('no active agents') || out.includes('0'))
+test('agent_status 列出在跑的 agent；已完成的默认不列，include_finished 才出现', async () => {
+  const parent = fakeParent()
+  /** @type {Array<(value: string) => void>} */
+  const gates = []
+  const rt = createSubagentRuntime({
+    parent,
+    createAgent: () => ({
+      lastStopReason: null,
+      on() { return this }, off() { return this },
+      getLastRunMetrics: () => ({ totalRounds: 1, totalLlmCalls: 1, totalToolCalls: 0, usage: {}, wallClockMs: 1 }),
+      // 挂起到 `release()`，这样"agent 正在飞"这个中间态才观察得到 —— 不挂起的话
+      // 子 agent 在断言之前就已经终态了，这条测试就退化成只在查空列表。
+      chat(_contract, { signal } = {}) {
+        return new Promise((resolve, reject) => {
+          gates.push(resolve)
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      },
+    }),
+  })
+  const status = byName(rt.tools, 'agent_status')
+  assert.strictEqual(await status.execute({}), 'no active agents (0 running, 0 queued)')
+
+  const started = await byName(rt.tools, 'agent').execute({ description: 'dig into auth', prompt: 'p' })
+  assert.match(started, /started/)
+  await new Promise(resolve => setImmediate(resolve))
+
+  const running = await status.execute({})
+  assert.match(running, /^1 agent\(s\):/m)
+  assert.match(running, /general-purpose-1 \[running\] type=general-purpose/)
+  assert.ok(running.includes('dig into auth'), '列表要带上任务标签，否则模型分不清是哪一个')
+
+  for (const resolve of gates.splice(0)) resolve('报告')
+  await rt.drain()
+
+  assert.strictEqual(await status.execute({}), 'no active agents (0 running, 0 queued)',
+    '终态 agent 默认不该继续占着"活跃"列表')
+  assert.match(await status.execute({ include_finished: true }),
+    /general-purpose-1 \[succeeded\]/)
 })
 
 test('agent_cancel 未知 id 软失败', async () => {
