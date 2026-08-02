@@ -222,3 +222,42 @@ test('closeSubagents 真的中止在跑的后台 subagent（不只是打个 canc
   assert.strictEqual(handle.result?.failureKind, 'aborted',
     '中止收尾应记为 aborted，而不是 illegal-transition 造成的 tool_error')
 })
+
+test('reset() 后拆除产生的取消通知不会漏进新会话', async () => {
+  const { agent } = await spawnBlockingSubagent()
+
+  agent.reset()
+  assert.strictEqual(agent._pendingInjections.length, 0, 'reset() 当场就该是空的')
+
+  // 拆除是 fire-and-forget 的：`closeSubagents()` 在 reset() 之后的微任务里才跑，
+  // 它取消掉的 subagent settle 时会走 `_onBackgroundSettled` 再入队一次 —— 那条
+  // `<agent-notification state="cancelled">` 属于上一个会话，新会话的第 1 轮不该
+  // 被告知一个它从没派过的 agent。
+  await closeOrHang(agent)
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.deepStrictEqual(agent._pendingInjections, [],
+    `拆除产生的通知漏进了新会话：${JSON.stringify(agent._pendingInjections)}`)
+})
+
+test('reset() 之后新会话派的后台 agent 仍然会通知（闸门不是永久关死）', async () => {
+  const { agent } = await spawnBlockingSubagent()
+  agent.reset()
+  await closeOrHang(agent)
+  await new Promise(resolve => setImmediate(resolve))
+
+  // 新会话：一个立刻结束的 subagent，它的完成通知必须照常入队。
+  agent.subagents.createAgent = () => ({
+    lastStopReason: null, on() { return this }, off() { return this },
+    getLastRunMetrics: () => ({ totalRounds: 1, totalLlmCalls: 1, totalToolCalls: 0, usage: {}, wallClockMs: 1 }),
+    async chat() { return '干完了' },
+  })
+  agent.subagents.runner.createAgent = agent.subagents.createAgent
+  const spawnTool = agent.getTools().find(t => t.name === 'agent')
+  await spawnTool.execute({ description: 'quick job', prompt: 'p' }, { ...agent._toolContextExtra })
+  await agent.subagents.drain()
+
+  assert.strictEqual(agent._pendingInjections.length, 1,
+    '新会话自己派的 agent 的完成通知必须照常送达')
+  assert.match(agent._pendingInjections[0].content, /agent-notification/)
+})

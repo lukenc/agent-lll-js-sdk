@@ -621,6 +621,12 @@ export class Agent {
     // 挂 `.catch` 而不是裸 `void`：`close()` 里的 `transition()` 若抛异常，裸
     // fire-and-forget 会变成未处理的 rejection（Node 默认直接结束进程）。
     if (this.subagents) {
+      // 闸门必须**同步**落下：`_pendingInjections` 上面已经清空了，但拆除是异步的，
+      // 被取消的 subagent 要在之后才 settle —— 它那条 `<agent-notification
+      // state="cancelled">` 会排在清空之后入队，新会话的第 1 轮于是被告知一个它从
+      // 没派过的 agent。`beginClose()` 把此刻已存在的 handle 的通知作废（之后新派
+      // 的不受影响），因此这个缺口里不管谁 settle 都进不来。
+      this.subagents.beginClose()
       Promise.resolve()
         .then(() => this.closeSubagents())
         .catch(() => {

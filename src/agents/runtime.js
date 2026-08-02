@@ -135,6 +135,20 @@ export function createSubagentRuntime({
   const inflight = new Set()
 
   /**
+   * 会话代号。`beginClose()` 递增它，`spawn()` 给每个 handle 盖上当时的代号。
+   *
+   * 存在的理由：`Agent.reset()` 同步清空 `_pendingInjections`，但拆除（
+   * `closeSubagents()` → `close()`）是 fire-and-forget 的，被取消的 subagent 要在
+   * 那之后才 settle —— 它那条 `<agent-notification state="cancelled">` 于是**排在
+   * 清空之后**入队，新会话的第 1 轮就被告知一个它从没派过的 agent 被取消了。
+   *
+   * 用代号而不是一个"正在关闭"的布尔量：`close()` 之后 runtime 仍然可用（reset()
+   * 不置空 `this.subagents`），一个关死的闸门会让新会话自己派的 agent 永远收不到
+   * 完成通知。代号只作废**拆除那一刻已经存在的**那批 handle。
+   */
+  let notifyEpoch = 0
+
+  /**
    * keep-alive 的等待方。任何"后台状态往前动了一步"的时刻都要唤醒它们，否则
    * 一个已经拿到结果的主 agent 会继续干等到超时。
    * @type {Array<(outcome: string) => void>}
@@ -526,6 +540,8 @@ export function createSubagentRuntime({
         type: typeName, description, parentAgentId, depth, nodeId,
         model: resolved, isolation: null,
       })
+      // 盖上当前会话代号：拆除之后它 settle 的通知不该落进下一个会话（见 notifyEpoch）。
+      handle._notifyEpoch = notifyEpoch
       // 图调度用它把 agentId 回填到节点。
       onHandle?.(handle)
 
@@ -739,11 +755,18 @@ export function createSubagentRuntime({
      * user / system，一条伪造的 assistant 轮会让父模型以为这话是它自己说的。
      */
     _onBackgroundSettled(handle, result) {
-      parent.enqueueMessage?.({
-        role: 'user',
-        content: `<agent-notification agent="${handle.name}" state="${handle.state}">\n${result}\n</agent-notification>`,
-      })
+      // 上一个会话的 handle：通知丢掉，但仍然叫醒可能在等的一方（见下）。
+      // `_notifyEpoch` 为 undefined 的只有 `_startNode` 在 handle 压根没造出来时
+      // 编的那个占位对象 —— 那是启动失败，与拆除无关，照常通知。
+      const stale = handle._notifyEpoch !== undefined && handle._notifyEpoch !== notifyEpoch
+      if (!stale) {
+        parent.enqueueMessage?.({
+          role: 'user',
+          content: `<agent-notification agent="${handle.name}" state="${handle.state}">\n${result}\n</agent-notification>`,
+        })
+      }
       // 主 agent 可能正卡在 keep-alive 的等待里 —— 通知入队之后立刻叫醒它。
+      // 丢掉通知的那条路也要叫醒：它等的是"后台还有没有活"，而这一个刚结束。
       runtime._signalEvent()
     },
 
@@ -999,7 +1022,22 @@ export function createSubagentRuntime({
       while (inflight.size > 0) await Promise.allSettled([...inflight])
     },
 
+    /**
+     * 作废"当前这一代"后台通知。**同步**方法，`close()` 自己会先调它；
+     * `Agent.reset()` 必须**在**调度那次 fire-and-forget 的 `closeSubagents()`
+     * **之前**直接调它 —— 否则 reset 与 close 真正开跑之间的那个微任务缺口里，
+     * 一个刚好 settle 的后台 agent 仍能把通知塞进已经清空的队列。
+     *
+     * 此刻已存在的 handle 的通知从此被丢弃；之后新派的 agent 不受影响。
+     */
+    beginClose() {
+      notifyEpoch += 1
+    },
+
     async close() {
+      // 通知闸门先落（同步）：下面的取消会让一批 agent 在 drain 期间 settle，
+      // 它们的取消通知属于正在拆掉的这个会话。
+      runtime.beginClose()
       // 先取消全部待答提问：阻塞在 `ask_user` 里的 agent 必须先拿到一个结果才能
       // 走完当前这轮，否则下面的 drain() 会等一个永远不会 settle 的 Promise。
       ask.cancelAll('runtime closed')
