@@ -451,3 +451,41 @@ test('formatResult：cancelled 渲染独立于 failed，机器可读头部一致
   assert.ok(!/\bfailed\b/.test(out))
   assert.ok(!out.includes('重试') && !out.includes('重发'), 'cancelled 结果不该包含失败分支那句重试建议')
 })
+
+// --- 工具 ctx 的 nodeId / attempt（N2：文档里写着、实际恒为 null / 1） --------
+
+test('工具 ctx 带上 handle 的 nodeId 与当前 attempt', async () => {
+  const seen = []
+  const record = function () { seen.push({ ...this._toolContextExtra }) }
+  const rateLimited = function () {
+    record.call(this)
+    throw Object.assign(new Error('429'), { status: 429 })
+  }
+  const { runner, registry } = makeRunner([rateLimited, function () { record.call(this); return '好了' }])
+  await runner.run(makeHandle(registry, { nodeId: 'n1' }), { prompt: 'p' })
+
+  assert.strictEqual(seen.length, 2)
+  assert.strictEqual(seen[0].nodeId, 'n1', '图节点起的 agent，产物要能归到节点上')
+  assert.strictEqual(seen[0].attempt, 1)
+  assert.strictEqual(seen[1].attempt, 2, '重试后的产物必须能与上一次的区分开')
+})
+
+test('重试写同一个 key 的产物：两条记录靠 attempt 区分，并渲染进结果', async () => {
+  const write = function () {
+    this._artifacts.write({
+      key: 'report.md', kind: 'text', summary: 's', content: `attempt ${this._toolContextExtra.attempt}`,
+      agentId: this._toolContextExtra.agentId, agentName: this._toolContextExtra.agentName,
+      nodeId: this._toolContextExtra.nodeId, attempt: this._toolContextExtra.attempt,
+    })
+  }
+  const { runner, registry, artifacts } = makeRunner([
+    function () { this._artifacts = artifacts; write.call(this); throw Object.assign(new Error('429'), { status: 429 }) },
+    function () { this._artifacts = artifacts; write.call(this); return '好了' },
+  ])
+  const out = await runner.run(makeHandle(registry, { nodeId: 'n1' }), { prompt: 'p' })
+
+  const rows = artifacts.list({ key: 'report.md' })
+  assert.deepStrictEqual(rows.map(r => r.attempt), [1, 2], '两次尝试的记录必须可区分')
+  assert.deepStrictEqual(rows.map(r => r.nodeId), ['n1', 'n1'])
+  assert.match(out, /attempt=2/, 'formatResult 里 attempt>1 的标注不该是死代码')
+})

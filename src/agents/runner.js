@@ -380,9 +380,16 @@ export class SubagentRunner {
       memory: this._makeChildMemory(handle),
     })
     handle._child = child
+    // `nodeId` / `attempt` 必须在这里给全：`artifact_write` 读的就是它们。少给的
+    // 后果是静默的 —— 每条产物记录都记成 `{ nodeId: null, attempt: 1 }`，图节点的
+    // 归属丢了，而一个重试过的 agent 会为同一个 key 留下两条无法区分的记录（
+    // `formatResult` 与 `artifact_list` 里那句 `attempt > 1` 的标注也就永远不触发）。
+    // `handle.attempt` 由 `run()` 的 `beginAttempt()` 每次尝试前自增，因此这里取到
+    // 的恒是**这一次**尝试的序号。
     child._toolContextExtra = {
       agentId: handle.agentId, agentName: handle.name,
       depth: handle.depth, cwd: handle.isolation?.path ?? null,
+      nodeId: handle.nodeId ?? null, attempt: handle.attempt,
     }
     this._forwardTelemetry(handle, child)
 
