@@ -921,19 +921,26 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 `AGENT_TOOL_DESCRIPTION`（`src/agents/contract.js`）向模型讲清楚。
 
 子 agent 拿到哪些工具由它的 `Agent_Type.tools` 决定：`'*'`（内置
-`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但**始终剔除**五个
-编排工具 `agent` / `agent_graph` / `graph_start` / `graph_close` / `graph_reactivate`，
-除非该类型 `canSpawn: true`（`graph_close` / `graph_reactivate` 在这一组里，是因为
-关掉或重跑**父 agent 正在编排的**那个任务，子 agent 没有依据做这个决定）；给一个名字
-数组则保留数组里点到的工具，**外加一组固定的基础设施工具（floor）**：
-`artifact_write` / `artifact_list` / `history_search` / `history_get` /
+`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但两道剔除是恒定的 ——
+四个图工具 `agent_graph` / `graph_start` / `graph_close` / `graph_reactivate`
+**无条件**剔除（`canSpawn: true` 也不放行），`agent` 则由 `canSpawn` 把关（默认
+`false`，即也剔除）；给一个名字数组则保留数组里点到的工具，**外加一组固定的基础设施
+工具（floor）**：`artifact_write` / `artifact_list` / `history_search` / `history_get` /
 `send_message` / `ask_user` 无论数组里写没写都会带上（与父 agent 实际拥有的工具
 取交集 —— 父 agent 自己都没有的 floor 工具不会被凭空生造出来）。`explorer` 这样
 的窄类型不再需要把这些元工具显式写进 `tools` 数组：一个类型写 `tools:
 ['read_file']` 的意思是"这个 agent 只读文件"，不是"它也不准写产物、搜历史、
 问用户" —— 与 `tool-filter.js` 的 `BASE_TOOLS`（`ToolFilter` 对任何意图过滤结果都
-恒定保留）同一思路。派生新 agent 的能力仍然只由 `canSpawn` 把关，floor **不**
-包含那五个编排工具。
+恒定保留）同一思路。
+
+**`canSpawn: true` 给的是 `agent`，只有 `agent`。** 图工具作用于**编排者那一个**图
+容器：子 agent 拿到的是父 agent 的工具闭包，闭包捕获的是父的 runtime，工具本身没有
+"是谁在调"的概念。放行的后果不是权限宽一点，而是三件静默的错事 —— 子 agent 的
+`agent_graph` 会改写父的活跃图，它的 `graph_close` 能关掉父正在编排的任务，它起的
+节点全记在 `main` 名下；再加上按深度分池的并发槽会自我争抢（一个 depth-1 的子 agent
+调 `graph_start({ run_in_background: false })` 会 await 它自己正占着的那个池）。
+派生新 agent 的能力仍然只由 `canSpawn` 把关，`maxDepth` 与并发分池沿 `agent` 这条路
+照常成立（`agent` 工具自己算 `ctx.depth + 1`）。floor **不**包含这五个编排工具。
 
 ### 后台派发与 keep-alive
 
@@ -1163,6 +1170,10 @@ agent 自己决定猜默认值还是放弃。
 - `policy: 'warn'`（默认）—— 允许写入，返回一句告警指名上一版的归属，并 emit
   `artifact.conflict`；
 - `policy: 'deny'` —— 拒绝写入，返回 owner 与 sha，让模型改 key 或先协调。
+
+这两个值以外的 `policy`（`'DENY'`、拼错的值）在构造时**抛错**，不静默读成 `'warn'` ——
+浏览器里这条轨是唯一的跨 agent 护栏，降级掉它而调用方以为自己开了硬拦截，是这里最坏
+的失败形态。
 
 ```js
 const rows = await agent.getArtifacts()                        // 全部
