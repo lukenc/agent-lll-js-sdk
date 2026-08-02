@@ -28,13 +28,30 @@ import { SlidingWindowMemory } from '../memory.js'
 export const RETRYABLE_KINDS = new Set(['rate_limited', 'llm_error', 'network', 'timeout'])
 
 /**
- * 子 agent 永远拿不到的元工具（除非其类型 canSpawn）。
+ * 派生新 agent 的能力 —— 由 `Agent_Type.canSpawn` 单独把关。
  *
- * 图的生命周期工具（`graph_close` / `graph_reactivate`）也在内：它们作用于**编排者
- * 的**图 —— 让一个子 agent 关掉或重跑父 agent 正在编排的任务，是它没有依据做的决定。
+ * `agent` 工具自己会算 `ctx.depth + 1`（`tools.js`），因此顺着这条路往下派的
+ * agent 是逐层加深的，`maxDepth` 与按深度分池的并发槽都照常成立。
  */
-const SPAWN_TOOLS = new Set([
-  'agent', 'agent_graph', 'graph_start', 'graph_close', 'graph_reactivate',
+export const SPAWN_TOOLS = new Set(['agent'])
+
+/**
+ * 图编排工具 —— **无条件**不下发给任何子 agent，`canSpawn` 也不放行。
+ *
+ * 这四个工具作用于**编排者那一个**图容器：子 agent 拿到的是父 agent 的工具闭包，
+ * 闭包里捕获的是父的 runtime，工具本身没有"是谁在调"的概念。于是一个子 agent 的
+ * `agent_graph` 会改写父的 `activeGraphId`，它的 `graph_close` 能关掉父正在编排的
+ * 任务，它起的节点全被记在 `main` 名下 —— 而 `_startNode` 写死 `depth: 1`，子 agent
+ * 经由图起的孙 agent 会跟它自己抢同一个深度的并发池：一个 depth-1 的子 agent 调
+ * `graph_start({ run_in_background: false })` 会 await 它自己正占着的那个池，默认
+ * `maxConcurrent: 4` 下四个这样的子 agent 就把池坐死了 —— 而按深度分池本来正是为了
+ * 让这种死锁不可能发生。
+ *
+ * 关掉或重跑**父 agent 正在编排的**那个任务，本来就不是子 agent 有依据做的决定；
+ * 这里只是把那条一直写在注释里的规则真正执行到位。
+ */
+export const GRAPH_TOOLS = new Set([
+  'agent_graph', 'graph_start', 'graph_close', 'graph_reactivate',
 ])
 
 /**
@@ -51,10 +68,10 @@ const SPAWN_TOOLS = new Set([
  *
  * 与 `tool-filter.js` 的 `BASE_TOOLS`（commit `20617d8`）同一思路：`ToolFilter`
  * 对任何意图结果都恒定保留 `BASE_TOOLS`；这里对任何 `Agent_Type.tools` 都恒定
- * 保留 `FLOOR_TOOLS`。**不包含** spawn 工具 —— 能不能再往下派 agent 由
- * `canSpawn` 单独把关，floor 不该替它做主。
+ * 保留 `FLOOR_TOOLS`。**不包含**编排工具 —— 能不能再往下派 agent 由 `canSpawn`
+ * 单独把关，图工具则谁都拿不到，floor 不该替这两条把关做主。
  */
-const FLOOR_TOOLS = new Set([
+export const FLOOR_TOOLS = new Set([
   'artifact_write', 'artifact_list', 'history_search', 'history_get', 'send_message', 'ask_user',
 ])
 
@@ -157,7 +174,12 @@ export class SubagentRunner {
     const inherited = type.tools === '*'
       ? parent.tools
       : parent.tools.filter(t => type.tools.includes(t.name) || FLOOR_TOOLS.has(t.name))
-    const tools = type.canSpawn ? [...inherited] : inherited.filter(t => !SPAWN_TOOLS.has(t.name))
+    // 两道剔除，把关的东西不同：图工具无条件掉（它们操作的是父 agent 那一个图容器），
+    // `agent` 由 `canSpawn` 决定。
+    const orchestrationFree = inherited.filter(t => !GRAPH_TOOLS.has(t.name))
+    const tools = type.canSpawn
+      ? orchestrationFree
+      : orchestrationFree.filter(t => !SPAWN_TOOLS.has(t.name))
 
     const contract = renderContract({
       description: handle.description,

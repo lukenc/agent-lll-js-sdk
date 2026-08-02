@@ -653,6 +653,15 @@ export function createSubagentRuntime({
         background: false,
         nodeId: node.nodeId,
         inputs: upstream,
+        // **图节点恒为 depth 1、父恒为 main（`parentAgentId` 的默认值），因为只有主
+        // agent 能碰图工具。** `runner.js` 的 `GRAPH_TOOLS` 无条件把四个图工具挡在
+        // 子 agent 的工具集外，`canSpawn` 也不放行，所以这条路上的调用方只可能是主
+        // agent。哪天把图工具重新下发给子 agent，这两个字面量就立刻变成三个错：
+        // `maxDepth` 从图这条路失效、`send_message({ to: 'parent' })` 跳掉一层、
+        // 以及最要命的——一个 depth-1 的子 agent 调 `graph_start({ run_in_background:
+        // false })` 会 await 它自己正占着的那个 depth-1 并发池，默认 maxConcurrent: 4
+        // 下四个这样的子 agent 就把池坐死。那种改动必须同时把调用方的 `ctx.depth` /
+        // `ctx.agentId` 顺着 `_startNode` 透传进来，而不是只放开工具集。
         depth: 1,
         signal,
         onHandle: (h) => {

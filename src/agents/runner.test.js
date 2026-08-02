@@ -3,7 +3,11 @@ import assert from 'node:assert'
 import { RuntimeHistory } from '../runtime-history.js'
 import { AgentRegistry } from './registry.js'
 import { ArtifactTrack } from './artifacts.js'
-import { SubagentRunner, classifyFailure, RETRYABLE_KINDS, cancelHandle } from './runner.js'
+import {
+  SubagentRunner, classifyFailure, RETRYABLE_KINDS, cancelHandle,
+  SPAWN_TOOLS, GRAPH_TOOLS, FLOOR_TOOLS,
+} from './runner.js'
+import { SUBAGENT_TOOL_NAMES } from './tools.js'
 import { resolveModelAliases } from './models.js'
 import { getAgentType, registerAgentType, resetAgentTypes } from './types.js'
 
@@ -171,6 +175,85 @@ test('floor tools：parent 本身没有的 floor 工具（如 ask_user）不会�
   const names = createAgent.calls[0].tools.map(t => t.name)
   assert.ok(!names.includes('ask_user'), 'parent 没有的 floor 工具不能凭空出现')
   resetAgentTypes()
+})
+
+// --- 编排工具永远不下发给子 agent（canSpawn 只管 `agent`） ------------------
+
+/** 一个把五个元工具都带齐的 parent —— 子 agent 拿到什么全看过滤逻辑，不看 parent 缺什么。 */
+const orchestratingParent = {
+  ...parent,
+  tools: [
+    ...parent.tools,
+    ...['agent_graph', 'graph_start', 'graph_close', 'graph_reactivate',
+      'artifact_write', 'artifact_list', 'history_search', 'history_get', 'send_message', 'ask_user']
+      .map(name => ({ name, description: name, parameters: {}, execute: async () => 'x' })),
+  ],
+}
+
+test('canSpawn: true 只给 agent，四个图工具一个都不给', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'spawner', description: 'd', systemPrompt: 's', canSpawn: true })
+  const { runner, registry, createAgent } = makeRunner(['ok'], {}, orchestratingParent)
+  await runner.run(makeHandle(registry, { type: 'spawner' }), { prompt: 'p' })
+  const names = createAgent.calls[0].tools.map(t => t.name)
+  assert.ok(names.includes('agent'), 'canSpawn=true 就是"可以再往下派 agent"')
+  for (const graphTool of GRAPH_TOOLS) {
+    assert.ok(!names.includes(graphTool),
+      `图工具 ${graphTool} 作用于父 agent 的图容器，子 agent 无论如何拿不到`)
+  }
+  resetAgentTypes()
+})
+
+test('canSpawn: false 五个编排工具一个都不给', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'worker', description: 'd', systemPrompt: 's' })
+  const { runner, registry, createAgent } = makeRunner(['ok'], {}, orchestratingParent)
+  await runner.run(makeHandle(registry, { type: 'worker' }), { prompt: 'p' })
+  const names = createAgent.calls[0].tools.map(t => t.name)
+  for (const orchestrationTool of ['agent', ...GRAPH_TOOLS]) {
+    assert.ok(!names.includes(orchestrationTool), `${orchestrationTool} 不该下发给子 agent`)
+  }
+  resetAgentTypes()
+})
+
+test('图工具的剔除不牵连 floor 工具（canSpawn 两种取值都是）', async () => {
+  resetAgentTypes()
+  registerAgentType({ name: 'spawner', description: 'd', systemPrompt: 's', canSpawn: true })
+  registerAgentType({ name: 'worker', description: 'd', systemPrompt: 's' })
+  for (const type of ['spawner', 'worker']) {
+    const { runner, registry, createAgent } = makeRunner(['ok'], {}, orchestratingParent)
+    await runner.run(makeHandle(registry, { type }), { prompt: 'p' })
+    const names = createAgent.calls[0].tools.map(t => t.name)
+    for (const floor of FLOOR_TOOLS) {
+      assert.ok(names.includes(floor), `${type}: floor 工具 ${floor} 不该被编排工具的剔除牵连`)
+    }
+  }
+  resetAgentTypes()
+})
+
+// --- 手抄的工具名清单必须绑回唯一出处（N6：改名要吵，不能静默） --------------
+
+test('SPAWN_TOOLS / GRAPH_TOOLS / FLOOR_TOOLS 与 SUBAGENT_TOOL_NAMES 严格对账', () => {
+  const declared = new Set(SUBAGENT_TOOL_NAMES)
+  // 每个手抄的名字都必须真的是一个元工具 —— `tools.js` 里一次改名若没同步到
+  // 这里，剔除逻辑会静默失效（子 agent 白拿一个 spawn 工具），floor 则会静默
+  // 少一件基础设施工具。两种失败都不报错。
+  for (const name of [...SPAWN_TOOLS, ...GRAPH_TOOLS]) {
+    assert.ok(declared.has(name), `${name} 不在 SUBAGENT_TOOL_NAMES 里 —— 元工具改名了？`)
+  }
+  for (const name of FLOOR_TOOLS) {
+    assert.ok(declared.has(name) || name === 'ask_user',
+      `${name} 既不是元工具也不是 ask_user —— floor 抄错了名字？`)
+  }
+  // 三个集合互斥。
+  assert.strictEqual([...SPAWN_TOOLS].filter(n => GRAPH_TOOLS.has(n)).length, 0)
+  assert.strictEqual([...FLOOR_TOOLS].filter(n => SPAWN_TOOLS.has(n) || GRAPH_TOOLS.has(n)).length, 0)
+  // 并集覆盖到位：新增一个元工具必须在这里做出"给不给子 agent"的决定，
+  // 而不是靠默认继承悄悄下发。
+  const classified = new Set([...SPAWN_TOOLS, ...GRAPH_TOOLS, ...FLOOR_TOOLS])
+  const unclassified = SUBAGENT_TOOL_NAMES.filter(n => !classified.has(n))
+  assert.deepStrictEqual(unclassified.sort(), ['agent_cancel', 'agent_status'],
+    '新增元工具时请在 runner.js 里明确它归哪一类，再更新这条断言')
 })
 
 test('可重试失败：重试到成功，每次都是全新实例', async () => {
