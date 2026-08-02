@@ -103,3 +103,22 @@ test('无 content 时 sha 由 path 派生，bytes 为 null', () => {
   assert.strictEqual(record.sha, fnv1a32('path:docs/x.md'))
   assert.strictEqual(record.bytes, null)
 })
+
+test('非法 policy 抛错，不静默降级成 warn', () => {
+  const shared = new RuntimeHistory()
+  // 产物轨是跨 agent 安全的**主**方案（浏览器里没有 worktree 也没有 shell_exec），
+  // 把 'DENY' / 拼错的值悄悄读成 'warn' 等于把唯一那道护栏降级掉，而调用方以为
+  // 自己开了 deny。与 `types.js` 对非法枚举的处理一致：抛。
+  for (const bad of ['DENY', 'Warn', 'strict', '', 0, true, {}]) {
+    assert.throws(
+      () => new ArtifactTrack({ sharedHistory: shared, policy: bad }),
+      /policy/,
+      `policy ${JSON.stringify(bad)} 应当抛错`,
+    )
+  }
+  // 合法值与省略照旧。
+  assert.strictEqual(new ArtifactTrack({ sharedHistory: shared }).policy, 'warn')
+  assert.strictEqual(new ArtifactTrack({ sharedHistory: shared, policy: 'warn' }).policy, 'warn')
+  assert.strictEqual(new ArtifactTrack({ sharedHistory: shared, policy: 'deny' }).policy, 'deny')
+  assert.strictEqual(new ArtifactTrack({ sharedHistory: shared, policy: undefined }).policy, 'warn')
+})

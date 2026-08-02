@@ -13,6 +13,7 @@
  * agent 安全的实际上限。
  */
 import { utf8ByteLength } from '../telemetry.js'
+import { SubagentError } from './errors.js'
 
 /**
  * FNV-1a 32 位哈希，输出 8 位十六进制。
@@ -37,10 +38,20 @@ let SEQ = 0
 export class ArtifactTrack {
   /**
    * @param {{ sharedHistory: object, policy?: 'warn'|'deny', now?: () => number }} opts
+   * @throws {SubagentError} `policy` 不是 'warn' / 'deny' 时
    */
   constructor({ sharedHistory, policy = 'warn', now = () => Date.now() }) {
+    // 非法值**抛**，不静默读成 'warn'。这条轨是跨 agent 安全的主方案（浏览器里既
+    // 没有 worktree 也没有 shell_exec），把 `'DENY'` 或一个拼错的值降级成 warn，
+    // 等于在调用方以为自己开了硬拦截的时候把唯一那道护栏关掉。与 `types.js` 对
+    // 非法枚举的处理一致 —— 那是配置错误，不是可软失败的运行时输入。
+    if (policy !== 'warn' && policy !== 'deny') {
+      throw new SubagentError(
+        `ArtifactTrack: policy must be "warn" or "deny" (got ${JSON.stringify(policy) ?? typeof policy})`,
+      )
+    }
     this.sharedHistory = sharedHistory
-    this.policy = policy === 'deny' ? 'deny' : 'warn'
+    this.policy = policy
     this._now = now
     /** @type {Map<string, object>} key → 最新记录 */
     this._latest = new Map()
