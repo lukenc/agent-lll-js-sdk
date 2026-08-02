@@ -10,8 +10,9 @@ import { AgentTypeError } from './errors.js'
 export const AGENT_TYPE_NAME_RE = /^[a-z0-9-]{1,64}$/
 
 /**
- * 内置类型。`tools: '*'` 表示继承父工具集（但始终排除 agent / agent_graph /
- * graph_start，除非 canSpawn 为 true）。`model: 'main'` 指向模型别名表里的
+ * 内置类型。`tools: '*'` 表示继承父工具集，但四个图工具（`agent_graph` /
+ * `graph_start` / `graph_close` / `graph_reactivate`）**无条件**剔除，`agent`
+ * 则由 `canSpawn` 把关（默认 false 也剔除）。`model: 'main'` 指向模型别名表里的
  * main 别名。
  */
 export const INITIAL_AGENT_TYPES = Object.freeze([
