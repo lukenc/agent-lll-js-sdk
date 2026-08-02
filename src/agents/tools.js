@@ -309,6 +309,8 @@ export function createSubagentTools(runtime) {
         })
         if (!closed.ok) return `Error: ${closed.reason}`
         const { entry, cancelled, stoppedAgents, outstanding, inFlight, awaitingConfirm, blocked } = closed
+        // 关完之后**实际**还在用的那张图。null = 关的正是活跃图（closeGraph 已清指针）。
+        const activeAfter = runtime.activeGraphId ? runtime.graphs.get(runtime.activeGraphId) : null
         const label = entry.label ? ` ${JSON.stringify(entry.label)}` : ''
         const lines = [`graph ${entry.graphId}${label} closed (${disposition}${reason ? `: ${reason}` : ''}).`]
         if (disposition === 'cancel_outstanding') {
@@ -329,18 +331,31 @@ export function createSubagentTools(runtime) {
               + 'in flight.')
           }
           if (awaitingConfirm.length > 0) {
+            // "这张图不再活跃了"只有在关掉的正是活跃图时才为真 —— `graph_id` 存在的
+            // 意义就是关一张**非**活跃图，那种情况下它从来就不是活跃图。改说一句
+            // 两种情况都成立的话：closed 图永远不是"在用的那张"。
             lines.push(`${awaitingConfirm.length} node(s) awaiting_confirm: ${awaitingConfirm.join(', ')} `
-              + '— no agent is running; they are waiting on your own graph_start. This graph is no '
-              + `longer active, so pass graph_id ${JSON.stringify(entry.graphId)} explicitly, or call `
-              + 'agent_cancel to give up on them.')
+              + '— no agent is running; they are waiting on your own graph_start. A closed graph is '
+              + `never the one you are working in, so pass graph_id ${JSON.stringify(entry.graphId)} `
+              + 'explicitly, or call agent_cancel to give up on them.')
           }
           if (blocked.length > 0) {
             lines.push(`${blocked.length} node(s) blocked: ${blocked.join(', ')} — no agent is running; `
               + 'they are waiting on upstream that has not finished, and may never finish.')
           }
         }
-        lines.push('You have no active graph now: your next agent_graph call without a graph_id '
-          + 'starts a fresh one.')
+        // `closeGraph` 只在关掉的**就是**活跃图时才清 activeGraphId —— 而 `graph_id`
+        // 这个参数的全部意义就是让模型能关一张非活跃图。无条件宣布"你现在没有活跃图
+        // 了"在那条路上是假话，且是会致害的假话：模型照着这句话省掉 graph_id 去声明
+        // 下一个任务的节点，节点会落进那张仍然活跃的图里 —— 两个任务共用一份 node_id
+        // 命名空间与一份状态表，随后一次 graph_close 还会把另一个任务一起关掉。
+        lines.push(activeAfter === null
+          ? 'You have no active graph now: your next agent_graph call without a graph_id '
+            + 'starts a fresh one.'
+          : `The graph you are working in is unchanged — still ${activeAfter.graphId}`
+            + `${activeAfter.label ? ` ${JSON.stringify(activeAfter.label)}` : ''}: an agent_graph `
+            + 'call without a graph_id declares into that one, not into a fresh graph. Pass a '
+            + 'label when the next nodes belong to a different task.')
         // `closeGraph` 末尾会跑一次 FIFO 淘汰，超出 `retainClosedGraphs` 时这张图可能
         // 当场就被整张淘汰了 —— 那时候告诉模型"还查得到"就是假话。
         if (runtime.graphs.has(entry.graphId)) {
@@ -595,10 +610,19 @@ function resolveDeclareTarget(runtime, { graphId, label }) {
     const resolved = runtime._resolveGraph(graphId)
     if (!resolved.ok) return resolved
     if (resolved.entry.state === 'closed') {
+      // "省掉 graph_id 就落进一张新图"只在没有活跃图时成立。还有活跃图的时候
+      // 省掉 graph_id 落的是那张活跃图 —— 照着这句假话走，本该独立的任务会长进
+      // 另一个任务的图里。
+      const active = runtime.activeGraphId ? runtime.graphs.get(runtime.activeGraphId) : null
       return {
         ok: false,
         reason: `graph "${graphId}" is closed and no longer takes new nodes. `
-          + 'Omit graph_id to declare into a fresh graph, or pass a label to name it.',
+          + (active === null
+            ? 'Omit graph_id to declare into a fresh graph, or pass a label to name it.'
+            : `Omit graph_id to declare into ${active.graphId}`
+              + `${active.label ? ` ${JSON.stringify(active.label)}` : ''}, the graph you are working `
+              + 'in, or pass a label to declare into the open graph with that name — a fresh graph '
+              + 'when there is none.'),
       }
     }
     return resolved

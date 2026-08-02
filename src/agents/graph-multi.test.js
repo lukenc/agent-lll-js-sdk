@@ -264,3 +264,64 @@ test('runtime.graph 在无活跃图时返回 null 而不抛', () => {
   assert.strictEqual(rt.graph, null)
   assert.doesNotThrow(() => rt.statusTable())
 })
+
+// ---- 关掉一张**非活跃**图：三处措辞不能替它编一个不存在的后果 ----
+
+test('graph_close 一张非活跃图时不谎称"没有活跃图了"', async () => {
+  const { rt, tool } = makeRuntime()
+  await tool('agent_graph').execute({ label: 'task-A', nodes: [{ node_id: 'a1', description: 'A 的活' }] })
+  const a = rt.activeGraphId
+  await tool('agent_graph').execute({ label: 'task-B', nodes: [{ node_id: 'b1', description: 'B 的活' }] })
+  const b = rt.activeGraphId
+  assert.notStrictEqual(a, b)
+
+  const out = await tool('graph_close').execute({ graph_id: a, disposition: 'keep_running' })
+
+  // 活跃图压根没变过 —— 说"你现在没有活跃图"是假话，而模型据此省掉 graph_id
+  // 的下一次声明会落进 B，任务 C 的节点就长在了任务 B 的图里。
+  assert.strictEqual(rt.activeGraphId, b, 'closeGraph 只清活跃图指针，关的不是活跃图就不该动它')
+  assert.ok(!/no active graph now/i.test(out), `不该声称没有活跃图了：\n${out}`)
+  assert.ok(out.includes(b), `应点名仍然活跃的那张图：\n${out}`)
+
+  // 模型照着这句话走：省掉 graph_id 的声明落在 B —— 消息必须提前说清这一点。
+  const declared = await tool('agent_graph').execute({ nodes: [{ node_id: 'c1', description: 'C 的活' }] })
+  assert.ok(declared.includes(b), '省掉 graph_id 仍然落在活跃图 B 上')
+  assert.ok(rt.graphs.get(b).graph.nodes.has('c1'))
+})
+
+test('关掉活跃图时才说"没有活跃图了"', async () => {
+  const { rt, tool } = makeRuntime()
+  await tool('agent_graph').execute({ label: 'task-A', nodes: [{ node_id: 'a1', description: 'A 的活' }] })
+  const a = rt.activeGraphId
+
+  const out = await tool('graph_close').execute({ graph_id: a, disposition: 'keep_running' })
+  assert.strictEqual(rt.activeGraphId, null)
+  assert.ok(/no active graph now/i.test(out), `关的是活跃图，这句话此时为真：\n${out}`)
+})
+
+test('往一张 closed 图声明的拒绝理由不谎称"省掉 graph_id 就是新图"', async () => {
+  const { rt, tool } = makeRuntime()
+  await tool('agent_graph').execute({ label: 'task-A', nodes: [{ node_id: 'a1', description: 'A 的活' }] })
+  const a = rt.activeGraphId
+  await tool('agent_graph').execute({ label: 'task-B', nodes: [{ node_id: 'b1', description: 'B 的活' }] })
+  const b = rt.activeGraphId
+  rt.closeGraph(a)
+
+  const out = await tool('agent_graph').execute({ graph_id: a, nodes: [{ node_id: 'a2', description: '追加' }] })
+  assert.ok(/closed/.test(out))
+  assert.ok(!/Omit graph_id to declare into a fresh graph/.test(out),
+    `B 还活跃着，省掉 graph_id 落的是 B 不是新图：\n${out}`)
+  assert.ok(out.includes(b), `应点名省掉 graph_id 会落在哪张图：\n${out}`)
+})
+
+test('awaiting_confirm 节点的提示不说一张从未活跃过的图"不再活跃"', async () => {
+  const { rt, tool } = makeRuntime()
+  await tool('agent_graph').execute({ label: 'task-A', nodes: [{ node_id: 'a1', description: 'A 的活' }] })
+  const a = rt.activeGraphId
+  await tool('agent_graph').execute({ label: 'task-B', nodes: [{ node_id: 'b1', description: 'B 的活' }] })
+  assert.strictEqual(rt.graphs.get(a).graph.get('a1').state, 'awaiting_confirm')
+
+  const out = await tool('graph_close').execute({ graph_id: a, disposition: 'keep_running' })
+  assert.ok(out.includes('awaiting_confirm'))
+  assert.ok(!/no longer active/.test(out), `A 从来就不是活跃图，"不再活跃"是假话：\n${out}`)
+})
