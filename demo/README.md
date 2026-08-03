@@ -300,6 +300,27 @@ subagent 通过 `ask_user` 提问时，页面底部会弹出黄色横幅，回�
 保留已完成的 handle（设计如此，`send_message` 还能唤醒它们），只 reset 的话面板里会
 挂着上一轮那批 agent。
 
+### 事件带归属，攒成 UI 状态是主机的活
+
+`runner._forwardTelemetry` 把每个 subagent 的 `llm.call` / `tool.call` /
+`round.start` / `round.end` 转发到**父 agent 的同一条总线**上，并补上 `agentId`
+与 `agentName`。主 agent 自己发的事件不带这两个字段 —— 所以归属规则只有一条：
+
+```js
+const owner = payload.agentId ?? 'main'
+```
+
+但框架**刻意不缓存**"某个 agent 都调过哪些工具"：`AgentHandle` 只记 `metrics`
+聚合数。要在界面上画出工具流水，主机必须自己从事件流攒一份账。两个 demo 页面各
+示范了一遍：
+
+- 服务端页：`demo/lib/activity.js`（有单测），`/agents` 响应里每个 agent 带
+  `activity: { rounds, tools, truncated }`
+- 浏览器页：同一份逻辑的内联副本（单文件页面没有模块加载器，import 不进来）
+
+两处都有上限（每个 agent 最多 20 条工具流水、最多 50 个 agent），因为一个跑飞的
+agent 可能调几百次工具，无界数组会把内存和响应体一起撑爆。
+
 ---
 
 ## 试试这些话术
