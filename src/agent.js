@@ -40,6 +40,19 @@ import { formatMcpToolSummary } from './mcp/metadata.js'
 import { createSkillRegistry } from './skills/registry.js'
 import { SkillFilter } from './skills/filter.js'
 import { applySkillArgs } from './skills/model.js'
+import { createSubagentRuntime } from './agents/runtime.js'
+import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
+// 一次轮边界排空时，超过这个条数的待注入消息会被合并为一条 —— 连续多条 user
+// 消息会被部分供应商拒绝。常量的家在 `agents/mailbox.js`：它是注入契约的一部分，
+// 发信方（邮箱）与收信方（这里）必须用同一个数，各存一份必然分叉。
+import { INJECTION_MERGE_THRESHOLD } from './agents/mailbox.js'
+
+/**
+ * 允许注入的 role。`'tool'` 必须被拒 —— 一条没有 `tool_call_id` 的孤儿 tool
+ * 消息正是轮边界注入这套机制要防的破坏；`'assistant'` 也拒，伪造一轮助手发言
+ * 会让模型误以为自己说过那句话。
+ */
+const INJECTABLE_ROLES = new Set(['user', 'system'])
 
 /**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
@@ -191,7 +204,10 @@ export class Agent {
    * @param {(name: string, args: object, result: string) => void} [opts.hooks.afterToolCall] - 工具执行后
    * @param {(round: number) => void} [opts.hooks.onRoundStart] - 每轮 ReAct 循环开始
    * @param {(error: Error, context: object) => void} [opts.hooks.onError] - 错误回调
-   * @param {(question: string) => Promise<string>} [opts.hooks.onAskUser] - 用户交互回调（提供后自动注入 ask_user 工具）
+   * @param {(question: string, meta?: { askId: string, agentId: string, agentName: string, parentAgentId: string, nodeId: string|null, taskDescription: string }) => Promise<string|void>|string|void} [opts.hooks.onAskUser]
+   *   用户交互回调（提供后自动注入 ask_user 工具）。第二参 `meta` 说明这个问题是谁问的
+   *   —— 并发提问因此可区分；只读第一参的旧式单参 hook 不受影响。返回值即回答；返回
+   *   null/undefined 表示"稍后经 `answerQuestion(askId, ...)` 回答"（配置了 subagents 时可用）。
    * @param {boolean} [opts.validateStreamCompletion=true] - 校验流完整性（finish_reason 缺失时抛 LlmStreamIncompleteError）
    * @param {object} [opts.skills] - Skill 系统配置。提供后创建 SkillRegistry 并注入 `skill` 元工具
    * @param {import('./skills/provider.js').SkillProvider[]} opts.skills.providers - skill 来源列表（本地目录 / HTTP 等）
@@ -200,6 +216,29 @@ export class Agent {
    * @param {object} [opts.skills.filter] - sidecar 过滤配置
    * @param {number} [opts.skills.filter.threshold=50] - skill 数量超过该阈值才触发过滤
    * @param {number} [opts.skills.filter.topK=20] - 过滤后保留的 skill 数量上限
+   * @param {object} [opts.subagents] - Subagent 系统配置。提供后创建 SubagentRuntime 并注入元工具（见 SUBAGENT_TOOL_NAMES）
+   * @param {object[]} [opts.subagents.types] - 额外注册的 Agent_Type（内置 general-purpose 始终可用）
+   * @param {string} [opts.subagents.defaultType='general-purpose'] - 未指定 subagent_type 时用的类型
+   * @param {number} [opts.subagents.maxConcurrent=4] - 每个 depth 层的并发上限
+   * @param {number} [opts.subagents.maxDepth=2] - 允许的最大派生深度
+   * @param {Record<string, { model?: string, apiKey?: string, url?: string }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）
+   * @param {object} [opts.subagents.retry] - 重试配置。`maxAttempts` 优先级：本字段 >
+   *   `Agent_Type.maxAttempts` > 3；`backoffMs` 为退避基数（默认 `min(2^attempt·1000, 8000)`）
+   * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
+   * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
+   * @param {number} [opts.subagents.retainClosedGraphs=5] - 保留多少张已关闭的图（FIFO 淘汰，在飞节点的图不淘汰）
+   * @param {object} [opts.subagents.a2a] - A2A 配置。`transport` 默认 'local'（进程内投递）；
+   *   其余字段原样交给 transport 工厂（见 `registerA2ATransport`）
+   * @param {object} [opts.subagents.ask] - 提问路由配置
+   * @param {number|null} [opts.subagents.ask.timeoutMs=null] - 单个提问的等待上限；
+   *   null = 永不超时（与旧 `onAskUser` 行为一致）。到点后提问方拿到一段"用户未回答"的
+   *   说明而不是继续挂着
+   * @param {boolean} [opts.subagents.keepAlive=true] - 还有后台 agent / 图节点在飞时，
+   *   模型给出的"最终回答"不收尾本轮，而是等它们的结果回来再让模型继续决策。
+   *   false = 关掉这个等待，最终回答一律立刻收尾（旧行为）
+   * @param {number} [opts.subagents.keepAliveTimeoutMs=600000] - 单次 keep-alive 等待的上限。
+   *   到点后置 `lastKeepAliveTimedOut`、发 `run.keep_alive.timeout`，并给模型留一条
+   *   "收尾或 agent_cancel"的提示；**每轮对话最多超时一次**，此后最终回答直接收尾
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -209,6 +248,8 @@ export class Agent {
     this.model = opts.model ?? 'gpt-4'
     this.systemPrompt = opts.systemPrompt ?? 'You are a helpful assistant.'
     this.url = resolveProviderUrl(opts.provider, opts.url)
+    /** 记住 provider 名 —— SubagentRunner 构造子 Agent 时要原样传下去。 */
+    this._providerName = opts.provider
     this.tools = opts.tools ?? []
     this.maxRounds = opts.maxRounds ?? 300
     this.temperature = opts.temperature ?? 0.6
@@ -216,6 +257,13 @@ export class Agent {
     this.validateStreamCompletion = opts.validateStreamCompletion ?? true
     /** 最近一次 run 的终止原因：null | 'completed' | 'max_rounds'。 */
     this.lastStopReason = null
+    /**
+     * 最近一次 run 里 keep-alive 是否等超时了 —— 即"这轮对话收尾时还有后台
+     * 工作没完"。**它是独立于 `lastStopReason` 的一面旗子**：那个取值集合是
+     * 跨包契约（CHANGELOG 里写了 null | 'completed' | 'max_rounds'），不能为
+     * 超时新增一个值。
+     */
+    this.lastKeepAliveTimedOut = false
 
     // ---- Tool_Registry generation 与动态 MCP 状态 ----
     // `this.tools` 保持为数组（元素顺序 = 加入顺序），既有 `tools` 选项语义不变。
@@ -337,12 +385,17 @@ export class Agent {
     this._currentRun = null
 
     // ---- 内置工具：ask_user ----
-    // 当提供 hooks.onAskUser 时，自动注入 ask_user 工具，
-    // 让 LLM 在需要时可以向用户提问并等待回答。
-    if (this.hooks.onAskUser) {
-      const onAskUser = this.hooks.onAskUser
+    // 提供 hooks.onAskUser **或**配置了 subagents 时注入 ask_user 工具。
+    // 后者也注入的原因：subagents 下每个提问都经 AskRegistry 登记，主机可以只用
+    // `pendingQuestions()` / `answerQuestion()` 这条命令式通道应答（Web UI、HTTP
+    // 服务这类没法阻塞在 Promise 里的宿主），此时并没有 onAskUser hook。
+    if (this.hooks.onAskUser || opts.subagents) {
+      // 可能不存在 —— 只配了 subagents 而没给 hook 时走登记表通道。
+      const onAskUser = this.hooks.onAskUser ?? null
       this.tools = [
-        ...this.tools,
+        // 同名替换而非追加：子 agent 继承了父的 ask_user（闭包里是**父**的归属），
+        // 再叠一个自己的会让发给模型的工具表出现重名项。留下自己这一个。
+        ...this.tools.filter(t => t.name !== 'ask_user'),
         {
           name: 'ask_user',
           description: 'Ask the user a question and wait for their response. Use this when you need clarification, confirmation, or additional information from the user before proceeding.',
@@ -353,8 +406,24 @@ export class Agent {
             },
             required: ['question'],
           },
-          execute: async function(params) {
-            return await onAskUser(params.question)
+          execute: async (params, ctx = {}) => {
+            const registry = this.subagents?.ask ?? null
+            if (!registry) {
+              // 理论上不可达（注入条件要求二者至少有一个），但别留一个能抛
+              // TypeError 的洞 —— 工具执行失败要以可纠正的字符串回给模型。
+              if (!onAskUser) return 'Error: no user-interaction channel is configured.'
+              return await onAskUser(params.question)
+            }
+            // 登记表内部同时负责通知主机 hook 并与 `answerQuestion` 竞速
+            // （见 agents/ask.js 的 onQuestion）——这里只需把归属交出去。
+            return registry.ask({
+              agentId: ctx.agentId ?? 'main',
+              agentName: ctx.agentName ?? 'main',
+              parentAgentId: ctx.parentAgentId ?? 'main',
+              nodeId: ctx.nodeId ?? null,
+              taskDescription: ctx.taskDescription ?? '',
+              question: params.question,
+            })
           },
         },
       ]
@@ -471,6 +540,26 @@ export class Agent {
         registerBaseTool('skill_resource')
       }
     }
+
+    // ---- Subagent 系统 ----
+    // `opts.subagents` 配置后创建 SubagentRuntime 并注入元工具。未配置时
+    // `this.subagents` 恒为 null，全部相关行为与旧版本逐字节一致。
+    this.subagents = null
+    /** 合并进 `tool.execute(args, ctx)` 第二参的归属字段。 */
+    this._toolContextExtra = { agentId: 'main', agentName: 'main', depth: 0, cwd: null }
+    /**
+     * 待注入消息队列。后台 subagent 完成通知、图节点就绪通知、A2A 投递三者
+     * 共用这一个机制 —— 都不打断正在执行的工具，只在轮边界汇入。
+     * @type {object[]}
+     */
+    this._pendingInjections = []
+    if (opts.subagents) {
+      this.subagents = createSubagentRuntime({ parent: this, ...opts.subagents })
+      this.tools = [...this.tools, ...this.subagents.tools]
+      // 与 `skill` 同一理由：开启意图识别后 ToolFilter 会裁剪工具集，元工具被
+      // 裁掉时 system prompt 里的类型清单就指向了模型调不到的工具。
+      for (const name of SUBAGENT_TOOL_NAMES) registerBaseTool(name)
+    }
   }
 
   /**
@@ -516,6 +605,9 @@ export class Agent {
   reset() {
     this.memory.clear()
     this.memory.add({ role: 'system', content: this.systemPrompt })
+    // 上一个会话的通知不该漏进新会话 —— memory 与 history 都清了，队列还留着的话，
+    // 新会话跑到 round 1 就会把陈旧通知注入进去。
+    this._pendingInjections = []
     // 动态 MCP 生命周期拆除：仅当 `_managedClients` 非空时以 fire-and-forget 方式
     // 触发 `_teardownManagedClients()`（关闭客户端、移除动态工具并取消 Base_Tool
     // 注册、清空集合）。`reset()` 保持同步返回 undefined（Req 7.2），故不 await；
@@ -528,6 +620,24 @@ export class Agent {
         })
     }
     this._lastIntent = null
+    // Subagent 生命周期拆除：与上面的 MCP 拆除同一手法 —— `reset()` 必须保持
+    // 同步返回 undefined，所以只触发取消而不 await。`closeSubagents()` 内部先
+    // abort 各自的 AbortController 再 drain，因此在跑的 subagent 会真的停下来。
+    // 挂 `.catch` 而不是裸 `void`：`close()` 里的 `transition()` 若抛异常，裸
+    // fire-and-forget 会变成未处理的 rejection（Node 默认直接结束进程）。
+    if (this.subagents) {
+      // 闸门必须**同步**落下：`_pendingInjections` 上面已经清空了，但拆除是异步的，
+      // 被取消的 subagent 要在之后才 settle —— 它那条 `<agent-notification
+      // state="cancelled">` 会排在清空之后入队，新会话的第 1 轮于是被告知一个它从
+      // 没派过的 agent。`beginClose()` 把此刻已存在的 handle 的通知作废（之后新派
+      // 的不受影响），因此这个缺口里不管谁 settle 都进不来。
+      this.subagents.beginClose()
+      Promise.resolve()
+        .then(() => this.closeSubagents())
+        .catch(() => {
+          // 取消是尽力而为；reset() 不因它失败而失败。
+        })
+    }
     // Clear telemetry aggregates so a reset agent reports zero history.
     // Listeners registered via `on(...)` are NOT cleared — that would silently
     // break application-level subscriptions across a reset.
@@ -675,12 +785,15 @@ export class Agent {
 
   /**
    * Return model/tool artifacts captured by RuntimeHistory-backed memories.
+   * @param {object} [opts]
+   * @param {string} [opts.agentId] 只返回该 agent 登记的产物（subagent 系统用）
    * @returns {Promise<object[]>}
    */
-  async getArtifacts() {
+  async getArtifacts({ agentId } = {}) {
     const rh = this.memory?.runtimeHistory
-    if (rh && typeof rh.project === 'function') return rh.project('artifacts')
-    return []
+    if (!rh || typeof rh.project !== 'function') return []
+    const rows = rh.project('artifacts')
+    return agentId == null ? rows : rows.filter(r => r.agentId === agentId)
   }
 
   // ---- Telemetry public API ----
@@ -833,6 +946,9 @@ export class Agent {
     // (Finding M-5). plan_and_execute itself doesn't set `lastStopReason`,
     // so it correctly reads back as `null` after such a run.
     this.lastStopReason = null
+    // keep-alive 的"已放弃过一次"闸门必须**按 run 重置**：它在本 run 内抑制第
+    // 二次等待（见 `_keepAliveOnce`），粘到下一轮对话就成了永久关闭 keep-alive。
+    this.lastKeepAliveTimedOut = false
 
     const rootCtx = {
       traceId,
@@ -901,8 +1017,10 @@ export class Agent {
     const startedAt = Date.now()
     const startedPerfNow = performance.now()
 
-    // See `_runWithSession` — same staleness-reset rationale (Finding M-5).
+    // See `_runWithSession` — same staleness-reset rationale (Finding M-5)，
+    // keep-alive 的闸门同理按 run 重置。
     this.lastStopReason = null
+    this.lastKeepAliveTimedOut = false
 
     const rootCtx = {
       traceId,
@@ -1057,7 +1175,7 @@ export class Agent {
       return {
         body: {
           model: this.model,
-          messages: this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages)),
+          messages: this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages))),
           temperature: this.temperature,
           ...(assembled.tools ? { tools: assembled.tools } : {}),
         },
@@ -1067,7 +1185,7 @@ export class Agent {
     }
 
     // 简单模式：直接使用 memory 中的消息
-    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
+    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
 
     const openaiTools = filteredTools.length > 0 ? formatToolsForOpenAI(filteredTools) : undefined
     return {
@@ -1197,6 +1315,165 @@ export class Agent {
   async closeMCPClients() {
     if (this._managedClients.size === 0) return
     await this._teardownManagedClients()
+  }
+
+  /**
+   * 取消全部在跑的 subagent（abort 各自的 AbortController）并等它们 settle。
+   * 未配置 subagents 时为安全空操作；可重复调用（终态 handle 会被跳过）。
+   *
+   * @returns {Promise<void>}
+   */
+  async closeSubagents() {
+    if (!this.subagents) return
+    await this.subagents.close()
+  }
+
+  // ---- 多路提问路由 ----
+
+  /**
+   * 当前全部待答提问（跨 agent 的全局清单，纯数据，可直接给 UI / 序列化）。
+   *
+   * 每条记录带 `askId` 与提问方归属（agentId / agentName / parentAgentId /
+   * nodeId / taskDescription），因此并发提问不会混淆是谁在问什么。
+   * 未配置 subagents 时恒为空数组。
+   *
+   * @returns {object[]}
+   */
+  pendingQuestions() {
+    return this.subagents?.ask?.pending() ?? []
+  }
+
+  /**
+   * 定向应答一个提问 —— 给不能阻塞在 Promise 里的宿主（Web UI / HTTP 服务）用的
+   * 命令式通道。它与 `hooks.onAskUser` 的返回值**竞速**：先到先赢，后到者静默
+   * no-op（返回 false），不抛错也不覆盖已交付的回答。
+   *
+   * @param {string} askId
+   * @param {string} answer
+   * @returns {boolean} false = askId 不存在或已被应答/取消
+   */
+  answerQuestion(askId, answer) {
+    return this.subagents?.ask?.answer(askId, answer, { via: 'api' }) ?? false
+  }
+
+  /**
+   * 取消一个提问。等待方拿到一段取消说明作为 `ask_user` 的结果，而不是挂死。
+   *
+   * @param {string} askId
+   * @param {string} [reason]
+   * @returns {boolean} false = askId 不存在或已被应答/取消
+   */
+  cancelQuestion(askId, reason = 'cancelled by host') {
+    return this.subagents?.ask?.cancel(askId, reason) ?? false
+  }
+
+  // ---- 轮边界消息注入 ----
+
+  /**
+   * 把一条消息排入待注入队列。它会在**下一个 ReAct 轮边界**写进 memory，
+   * 而不是立刻写 —— 轮中间插消息会切断 `assistant(tool_calls)` 与其 `tool`
+   * 结果的配对，`memory-policy.js` 的裁剪逻辑依赖这个不变量。
+   *
+   * 非法入参（非对象 / 无 content / role 不在 `INJECTABLE_ROLES` 内）被丢弃而不
+   * 抛异常：调用方多为后台通知发送者，抛异常会打穿它们的 fire-and-forget 路径。
+   *
+   * @param {{ role?: string, content: string }} message
+   * @returns {this}
+   */
+  enqueueMessage(message) {
+    if (!message || typeof message !== 'object') return this
+    if (typeof message.content !== 'string' || message.content.length === 0) return this
+    // role 必须在白名单内。注入的消息会被直接 memory.add，一条 role:'tool' 且没有
+    // tool_call_id 的孤儿消息正是本机制要防的那类破坏 —— 而 `role ?? 'user'` 只挡
+    // null/undefined，挡不住显式传进来的 'tool'。A2A / 图调度这些外部发送方的入参
+    // 不该被当成可信输入。
+    const role = message.role ?? 'user'
+    if (!INJECTABLE_ROLES.has(role)) {
+      console.warn(`[agent] enqueueMessage: dropping message with role "${message.role}" `
+        + `(injectable roles: ${[...INJECTABLE_ROLES].join(', ')})`)
+      return this
+    }
+    this._pendingInjections.push({ role, content: message.content })
+    return this
+  }
+
+  /**
+   * 排空待注入队列写进 memory。返回实际写入的消息条数。
+   * 超过 `INJECTION_MERGE_THRESHOLD` 条时合并为一条 —— 连续多条 user 消息会
+   * 被部分供应商拒绝。
+   * @returns {number}
+   */
+  _drainPendingInjections() {
+    const pending = this._pendingInjections
+    if (pending.length === 0) return 0
+    this._pendingInjections = []
+    if (pending.length <= INJECTION_MERGE_THRESHOLD) {
+      for (const message of pending) this.memory.add(message)
+      return pending.length
+    }
+    this.memory.add({ role: 'user', content: pending.map(m => m.content).join('\n\n') })
+    return 1
+  }
+
+  /**
+   * keep-alive 的一次等待 —— ReAct 循环在"模型给了最终回答、没有工具调用"时调它，
+   * 决定这一轮到底能不能收尾。
+   *
+   * 五种去向：
+   *   - `'injected'` —— 有待注入消息，直接进下一轮把它读了；
+   *   - `'event'` —— 被 subagent 事件唤醒（通常伴随一条刚入队的通知）；
+   *   - `'timeout'` —— 等到上限还没动静，已置旗子 + 发事件 + 给模型留话；
+   *   - `'aborted'` —— 调用方的 signal abort 了（下一轮开头 throwIfAborted）；
+   *   - `'idle'` —— 没有该等的东西，收尾。
+   *
+   * 三道判断的**顺序是本方法的全部要害**，逐条说明见内联注释。
+   *
+   * @param {{ signal?: AbortSignal }} [opts]
+   * @returns {Promise<'injected'|'event'|'timeout'|'aborted'|'idle'>}
+   */
+  async _keepAliveOnce({ signal } = {}) {
+    if (!this.subagents || !this.subagents.keepAlive) return 'idle'
+
+    // (1) 待注入消息**先于**任何在飞判断。后台 agent 已经跑完时没有任何东西在
+    // 飞，但它的完成通知还在队列里没被读 —— 先判在飞就会 return 'idle'、本轮
+    // 收尾，通知一直躺到未来某轮跑到 round 1 才被排空（drain 只在 round > 0
+    // 发生）。而"跑完就通知你"正是这套机制存在的唯一理由。
+    if (this._pendingInjections.length > 0) return 'injected'
+
+    // (2) 本 run 已经等超时过一次就不再等第二次。超时那次已经给模型留了"收尾
+    // 或 agent_cancel"的话；它若不接手，再等一个完整超时只是把同一次干等重放
+    // 一遍 —— `maxRounds` 默认 300，那是 300 × 10 分钟 ≈ 50 小时的挂起和 300
+    // 次超时事件。注意这道闸在 (1) 之后：抑制的是第二次**等待**，不是第二次
+    // **投递**，迟到的完成通知照样会被 (1) 接住。
+    if (this.lastKeepAliveTimedOut) return 'idle'
+
+    // (3) 用 `hasInFlight()` 而不是 `hasPending()`。blocked / awaiting_confirm
+    // 的图节点等的是主 agent 自己的下一步动作，不是后台任务：它们不产生任何
+    // 事件、也不会自行推进，按它们来等就是每轮干等到超时。
+    if (!this.subagents.hasInFlight()) return 'idle'
+
+    const startedAt = performance.now()
+    const outcome = await this.subagents.nextEvent({
+      signal, timeoutMs: this.subagents.keepAliveTimeoutMs,
+    })
+    if (outcome === 'timeout') {
+      this.lastKeepAliveTimedOut = true
+      const pendingAgents = this.subagents.registry.list().length
+      // **跨全部图**，不是活跃图那一张：这个数字进的是"请收尾"那句提示，而模型是
+      // 照告知行事的 —— 未完成节点落在非活跃图里时告诉它"0 个图节点未完成"，正好
+      // 在它决定要不要停下来的那一刻给了它错的数。
+      const pendingNodes = this.subagents.pendingNodeCount()
+      this._safeEmit('run.keep_alive.timeout', {
+        pendingAgents, pendingNodes, waitedMs: performance.now() - startedAt,
+      })
+      this.enqueueMessage({
+        role: 'user',
+        content: `<agent-notification>还有 ${pendingAgents} 个 agent、${pendingNodes} 个图节点未完成，`
+          + `但已等待超过 ${this.subagents.keepAliveTimeoutMs}ms。请收尾：说明哪些工作仍在进行，`
+          + '或用 agent_cancel 取消它们。</agent-notification>',
+      })
+    }
+    return outcome
   }
 
   /**
@@ -1448,6 +1725,10 @@ export class Agent {
       }
 
       try {
+        // 轮边界：先排空待注入消息，再构建本轮请求体。此刻上一轮的
+        // assistant(tool_calls) 与全部 tool 结果都已成对落盘。
+        if (round > 0) this._drainPendingInjections()
+
         let body
         if (round === 0) {
           const first = await this._runPipeline(userMessage, signal)
@@ -1480,6 +1761,10 @@ export class Agent {
         // finish_reason === 'length' 且无工具调用：文本被截断，直接返回已有内容
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
+          // keep-alive：还有 subagent / 图节点没完事就不收尾，等它们的结果回来
+          // 再让模型继续决策。轮次仍受 maxRounds 约束。
+          const outcome = await this._keepAliveOnce({ signal })
+          if (outcome !== 'idle') continue
           this.lastStopReason = 'completed'
           return textContent
         }
@@ -1520,7 +1805,7 @@ export class Agent {
                 errorKind = 'rejected'
                 result = `Tool call "${call.name}" was rejected by the application.`
               } else {
-                result = await tool.execute(call.arguments, { signal })
+                result = await tool.execute(call.arguments, { ...this._toolContextExtra, signal })
               }
             } catch (err) {
               // Classify per Requirement 3.7: abort wins over generic
@@ -1634,6 +1919,9 @@ export class Agent {
       }
 
       try {
+        // 轮边界：同 `_reactLoop`，先排空待注入消息再构建本轮请求体。
+        if (round > 0) this._drainPendingInjections()
+
         let body
         let intent
         if (round === 0) {
@@ -1688,6 +1976,10 @@ export class Agent {
 
         if (toolCalls.length === 0) {
           this.memory.add({ role: 'assistant', content: textContent })
+          // 同 `_reactLoop`。续轮时**不吐 done**，注入的内容也不作为 delta 吐给
+          // 消费方 —— 它是喂给模型的上下文，不是模型说的话。
+          const outcome = await this._keepAliveOnce({ signal })
+          if (outcome !== 'idle') continue
           this.lastStopReason = 'completed'
           yield { type: 'done', content: textContent, stopReason: 'completed' }
           return
@@ -1730,7 +2022,7 @@ export class Agent {
                 errorKind = 'rejected'
                 result = `Tool call "${call.name}" was rejected by the application.`
               } else {
-                result = await tool.execute(call.arguments, { signal })
+                result = await tool.execute(call.arguments, { ...this._toolContextExtra, signal })
               }
             } catch (err) {
               errorKind = (err?.name === 'AbortError' || signal?.aborted)
@@ -2023,6 +2315,27 @@ export class Agent {
     return out
   }
 
+  /**
+   * 把 agent 类型清单合并进 system 消息（Level 1，与 skill 清单同一手法）。
+   * 未配置 subagents 时原样返回入参（含引用身份）。
+   * @param {object[]} messages
+   * @returns {object[]}
+   */
+  _withSubagentTypesNote(messages) {
+    if (!this.subagents) return messages
+    const note = this.subagents.typesNote()
+    const out = messages.slice()
+    const sysIdx = out.findIndex((m) => m && m.role === 'system')
+    if (sysIdx === -1) {
+      out.unshift({ role: 'system', content: note })
+    } else {
+      const sys = out[sysIdx]
+      const base = typeof sys.content === 'string' ? sys.content : ''
+      out[sysIdx] = { ...sys, content: base ? `${base}\n\n${note}` : note }
+    }
+    return out
+  }
+
   /** `skill` 元工具的 execute:返回正文 + Level 3 资源访问说明;未知名软失败。 */
   _invokeSkill(name, args) {
     const def = this.skills?.get(name)
@@ -2050,7 +2363,7 @@ export class Agent {
   }
 
   async _buildSimpleBody(tools = this.tools) {
-    const messages = this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages()))
+    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
     const openaiTools = tools.length > 0 ? formatToolsForOpenAI(tools) : undefined
     return {
       body: {
