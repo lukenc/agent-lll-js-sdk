@@ -189,6 +189,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <span class="dot"></span>
     <span id="mcpBadgeText">MCP 未连接</span>
   </span>
+  <span class="mcp-badge off" id="skillBadge" title="Skill 状态" style="cursor: help;">
+    <span class="dot"></span>
+    <span id="skillBadgeText">Skill 未启用</span>
+  </span>
   <div class="strategy-switch">
     <span class="strategy-label">执行策略:</span>
     <select id="strategy" onchange="switchStrategy(this.value)">
@@ -617,6 +621,27 @@ fetch('/mcp-status').then(r => r.json()).then((s) => {
     badge.className = 'mcp-badge off'
     text.textContent = 'MCP 未挂载'
     badge.title = '服务器未配置 MCP_SERVER_CMD 环境变量，未挂载任何 MCP Server。\n\n示例:\n  MCP_SERVER_CMD=node \\\n  MCP_SERVER_ARGS="src/mcp/__fixtures__/mock-mcp-server.js" \\\n  OPENAI_API_KEY=sk-xxx node demo/server.js'
+  }
+}).catch(() => {})
+
+// 查询技能加载状态，渲染技能徽章。服务端 Agent 已按 local provider 加载了
+// demo/skills/，技能清单会自动注入系统提示，LLM 用 skill 元工具按需调用。
+fetch('/skills-status').then(r => r.json()).then((s) => {
+  const badge = document.getElementById('skillBadge')
+  const text = document.getElementById('skillBadgeText')
+  if (s.enabled && s.count > 0) {
+    badge.className = 'mcp-badge on'
+    text.textContent = `Skill: ${s.count} 个已加载`
+    const lines = s.skills.map(sk => {
+      const files = sk.files.length ? ` (+${sk.files.length} 文件)` : ''
+      return `  • ${sk.name}${files}: ${sk.description}`
+    })
+    badge.title = `已加载技能 (目录 ${s.dir}):\n` + lines.join('\n')
+    addMsg('phase', `🧩 已加载 ${s.count} 个技能，对话中说出匹配的请求即可触发:\n${lines.join('\n')}\n\n试试:\n  • "帮我算一下 12*8 和 (5+3)^2，生成一份计算报告" — math-report 技能\n  • "写一首关于秋天的七言绝句" — ancient-poet 技能(会读 references 里的格律)`)
+  } else {
+    badge.className = 'mcp-badge off'
+    text.textContent = 'Skill 未启用'
+    badge.title = '未找到 demo/skills 目录，技能系统未启用。\n\n换目录: SKILLS_DIR=/path/to/skills node demo/server.js'
   }
 }).catch(() => {})
 </script>

@@ -8,7 +8,7 @@ export { registerSkillProvider, resolveProvider } from './provider.js'
 export { createLocalSkillProvider } from './providers/local.js'
 export { createHttpSkillProvider } from './providers/http.js'
 export { SkillFilter } from './filter.js'
-export { parseFrontmatter, parseSkillMd } from './model.js'
+export { parseFrontmatter, parseSkillMd, applySkillArgs } from './model.js'
 export {
   SkillLoadError, SkillParseError, SkillMaterializeError, SkillProviderError,
 } from './errors.js'

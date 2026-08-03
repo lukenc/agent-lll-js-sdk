@@ -113,6 +113,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <span class="dot"></span>
     <span id="mcpBadgeText">MCP 未连接</span>
   </span>
+  <span id="skillBadge" class="mcp-badge off" title="Skill 状态" style="cursor:help">
+    <span class="dot"></span>
+    <span id="skillBadgeText">Skill 未启用</span>
+  </span>
   <label class="telemetry-toggle">
     <input type="checkbox" id="showTelemetry" checked onchange="toggleTelemetry(this.checked)">
     📡 遥测面板
@@ -165,6 +169,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </label>
   <label class="check">
     <input type="checkbox" id="enableAskUser" checked> 注入 ask_user 工具（允许 LLM 向你发问）
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableSkills" checked> 启用技能系统（从 /skill-source 经 HTTP provider 加载 demo/skills）
   </label>
 
   <button onclick="initAgent()">连接</button>
@@ -245,6 +252,8 @@ var chat = document.getElementById('chat')
 var input = document.getElementById('input')
 var sendBtn = document.getElementById('send')
 var registeredMcpToolNames = new Set()
+// 技能系统是否可用 —— 由 /skills-status 决定(demo server 找到 demo/skills 目录才为 true)。
+var skillsAvailable = false
 
 // 浏览器端可用的工具
 
@@ -704,7 +713,12 @@ async function refreshBrowserMcpTools() {
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
     var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
-    agent.tools = baseTools.concat(mcpTools)
+    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user):它们不在
+    // baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们冲掉,
+    // 导致挂载/卸载 MCP 后技能系统或 ask_user 失效。按名字从现有 tools 里捞回来。
+    var META_TOOL_NAMES = { skill: 1, skill_resource: 1, ask_user: 1 }
+    var preserved = (agent.tools || []).filter(function(t) { return META_TOOL_NAMES[t.name] })
+    agent.tools = baseTools.concat(mcpTools).concat(preserved)
   }
 }
 
@@ -715,8 +729,52 @@ if (location.protocol === 'file:') {
   statusEl.className = 'mcp-panel-status err'
   statusEl.textContent = '⚠️ 当前是 file:// 模式,MCP 代理不可用。请用 demo server 启动后访问 http://localhost:3000/browser'
   document.getElementById('mcpConnectBtn').disabled = true
+  // 技能系统同样依赖 demo server 的 /skill-source,file:// 下不可用。
+  renderSkillBadge({ enabled: false, fileMode: true })
 } else {
   syncMcpStatus({ silent: true })
+  syncSkillsStatus()
+}
+
+/**
+ * 拉取 /skills-status,设置全局 skillsAvailable 并渲染技能徽章。
+ * 技能清单(Level 1)由 SDK 在每轮自动注入系统提示末尾;这里只负责让 UI 知道
+ * 技能是否可用,以及在 initAgent() 时决定是否配置 HTTP SkillProvider。
+ */
+async function syncSkillsStatus() {
+  try {
+    var res = await fetch('/skills-status')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    var s = await res.json()
+    skillsAvailable = !!(s.enabled && s.count > 0)
+    renderSkillBadge(s)
+  } catch (err) {
+    // demo server 没开 /skills-status(旧版本)或网络问题 —— 静默降级。
+    console.warn('[skills] 无法获取技能状态:', err.message)
+    skillsAvailable = false
+    renderSkillBadge({ enabled: false })
+  }
+}
+
+function renderSkillBadge(s) {
+  var badge = document.getElementById('skillBadge')
+  var text = document.getElementById('skillBadgeText')
+  if (s && s.enabled && s.count > 0) {
+    badge.className = 'mcp-badge on'
+    text.textContent = 'Skill: ' + s.count + ' 个可用'
+    var lines = (s.skills || []).map(function(sk) {
+      var files = sk.files && sk.files.length ? ' (+' + sk.files.length + ' 文件)' : ''
+      return '  • ' + sk.name + files + ': ' + sk.description
+    })
+    badge.title = '浏览器端经 HTTP provider(/skill-source)加载的技能:\n' + lines.join('\n') +
+      '\n\n勾选"启用技能系统"并点"连接"后,说出匹配请求即可触发。'
+  } else {
+    badge.className = 'mcp-badge off'
+    text.textContent = 'Skill 未启用'
+    badge.title = s && s.fileMode
+      ? 'file:// 模式下技能系统不可用(需要 demo server 提供 /skill-source)。请用 demo server 启动后访问 http://localhost:3000/browser'
+      : '未找到 demo/skills 目录或 demo server 未启用技能。\n\n换目录: SKILLS_DIR=/path/to/skills node demo/server.js'
+  }
 }
 
 function initAgent() {
@@ -729,6 +787,7 @@ function initAgent() {
   var simpleApiKey = document.getElementById('simpleApiKey').value.trim()
   var enableIntent = document.getElementById('enableIntent').checked
   var enableAskUser = document.getElementById('enableAskUser').checked
+  var enableSkills = document.getElementById('enableSkills').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
   var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
@@ -739,11 +798,16 @@ function initAgent() {
     ? ' 你还可以使用服务端挂载的 MCP 工具。当前 MCP 工具摘要: ' + mcpTools.map(summarizeBrowserMcpTool).join('；') + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在。'
     : ''
 
+  // 技能提示 —— 技能清单(Level 1)由 SDK 自动注入系统提示末尾,这里只补一句引导。
+  var skillNote = (enableSkills && skillsAvailable)
+    ? ' 系统提示末尾列出了可用技能;当用户请求与某个技能匹配时,先调用 skill 工具加载完整指令再作答。技能附带的参考文件用 skill_resource 工具读取。'
+    : ''
+
   var agentOpts = {
     provider: provider,
     apiKey: apiKey,
     model: model,
-    systemPrompt: '你是一个功能丰富的助手，拥有多种工具能力：查询时间、数学计算、天气查询、单位换算、随机生成、文本处理、页面操作、记事本、弹窗提示、倒计时提醒。当用户请求信息不充分时（例如没说清城市、金额、单位等），优先使用 ask_user 工具向用户追问，而不是自行猜测。请用中文回答，善用工具完成用户请求。' + mcpNote,
+    systemPrompt: '你是一个功能丰富的助手，拥有多种工具能力：查询时间、数学计算、天气查询、单位换算、随机生成、文本处理、页面操作、记事本、弹窗提示、倒计时提醒。当用户请求信息不充分时（例如没说清城市、金额、单位等），优先使用 ask_user 工具向用户追问，而不是自行猜测。请用中文回答，善用工具完成用户请求。' + mcpNote + skillNote,
     tools: allTools,
     strategy: strategy,
     enableIntentRecognition: enableIntent,
@@ -751,6 +815,15 @@ function initAgent() {
     // 12 轮足够覆盖 ask_user → 工具调用 → 合成回复的典型三轮流程外加几次
     // 重试空间；超出上限框架会写入 `[max rounds exceeded]` 体面退出。
     maxRounds: 12,
+  }
+  // 技能系统 —— 浏览器端用 HTTP provider 从 demo server 的 /skill-source 拉技能。
+  // runtime: 'browser' 会改注入 skill_resource 工具(Level 3 走 provider.readResource,
+  // 即再发一次 GET /skill-source/skills/<name>/<path>),而不是 Node 的 read_file。
+  if (enableSkills && skillsAvailable) {
+    agentOpts.skills = {
+      runtime: 'browser',
+      providers: [{ type: 'http', baseUrl: location.origin + '/skill-source' }],
+    }
   }
   if (simpleProvider) agentOpts.simpleProvider = simpleProvider
   if (simpleModel) agentOpts.simpleModel = simpleModel
@@ -792,6 +865,9 @@ function initAgent() {
   addMsg('assistant', '已连接 ' + provider + ' (' + model + ')。' + tip + '\n\n我拥有 10 种工具能力，试试：\n  \u2022 "现在几点了" — 时间查询\n  \u2022 "算一下 2^10" — 数学计算\n  \u2022 "北京天气怎么样" — 天气查询\n  \u2022 "把 100 公里换算成英里" — 单位换算\n  \u2022 "帮我生成一个强密码" — 随机生成\n  \u2022 "统计一下这段话的字数：Hello World" — 文本处理\n  \u2022 "把页面切换成暗色模式" — 页面操作\n  \u2022 "帮我记一条笔记：明天开会" — 记事本\n  \u2022 "用弹窗告诉我一个笑话" — 弹窗提示\n  \u2022 "30秒后提醒我喝水" — 倒计时提醒\n\n\uD83E\uDDED 试试模糊请求触发意图识别：\n  \u2022 "帮我做点啥" — AMBIGUOUS 意图\n  \u2022 "查天气" — 不说城市，会触发 ask_user 追问\n  \u2022 "先算一下 100×50 的面积，再用这个值生成一个等长密码，最后把结果存为笔记" — COMPLEX 意图\n\n\uD83D\uDCE1 右侧遥测面板会实时展示：\n  \u2022 每次 LLM 调用的 tokens / 耗时 / operation.name（agent.intent / agent.chat / plan.* 等）\n  \u2022 每次工具执行的结果字节数 / 错误分类\n  \u2022 本次运行与会话累计的聚合指标\n\n\uD83D\uDCA1 切换策略或模型配置后点击"连接"即可生效。')
   // 新连接 → 重置遥测面板
   resetTelemetryUI_browser()
+  if (enableSkills && skillsAvailable) {
+    addMsg('phase', '🧩 技能系统已启用(HTTP provider ← /skill-source)。说出匹配请求即可触发:\n  • "写一首关于秋天的七言绝句" — ancient-poet(会用 skill_resource 读格律参考)\n  • "帮我算一下 12*8 和 (5+3)^2，生成一份计算报告" — math-report')
+  }
   input.focus()
 }
 

@@ -39,6 +39,7 @@ import { createMCPClient } from './mcp/index.js'
 import { formatMcpToolSummary } from './mcp/metadata.js'
 import { createSkillRegistry } from './skills/registry.js'
 import { SkillFilter } from './skills/filter.js'
+import { applySkillArgs } from './skills/model.js'
 
 /**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
@@ -427,11 +428,15 @@ export class Agent {
           parameters: {
             type: 'object',
             properties: {
-              name: { type: 'string', description: 'The skill name, exactly as listed in the system prompt' },
+              skill: { type: 'string', description: 'The name of a skill from the available-skills list. Do not guess names.' },
+              args: { type: 'string', description: 'Optional arguments for the skill' },
             },
-            required: ['name'],
+            required: ['skill'],
           },
-          execute: async ({ name }) => this._invokeSkill(name),
+          // 参数形状对齐 Claude Code 的 Skill 工具:{ skill, args }。
+          // `name` 是历史别名 —— 弱模型常照着"skill 名"的直觉发 name,
+          // 兜一下比让它吃一次 unknown skill 软失败再重试便宜。
+          execute: async ({ skill, name, args }) => this._invokeSkill(skill ?? name, args),
         },
       ]
       // Skill 是元工具(与 ask_user 同一先例,亦在 INITIAL_BASE_TOOLS 中):
@@ -1994,11 +1999,17 @@ export class Agent {
    *   The following skills are available for use with the Skill tool:
    *   - name
    *   - name: description
+   * 声明了 argument-hint 的 skill 追加 ` (args: <hint>)` —— 模型只能从清单
+   * 里知道该往 `args` 里填什么,不写出来这个参数对自主调用等于不可见。
    */
   _withSkillListingNote(messages) {
     const active = this._activeSkills()
     if (active.length === 0) return messages
-    const lines = active.map(s => s.description ? `- ${s.name}: ${s.description}` : `- ${s.name}`)
+    const lines = active.map(s => {
+      let line = s.description ? `- ${s.name}: ${s.description}` : `- ${s.name}`
+      if (s.argumentHint) line += ` (args: ${s.argumentHint})`
+      return line
+    })
     const block = `The following skills are available for use with the Skill tool:\n\n${lines.join('\n')}`
     const out = messages.slice()
     const sysIdx = out.findIndex((m) => m && m.role === 'system')
@@ -2013,13 +2024,18 @@ export class Agent {
   }
 
   /** `skill` 元工具的 execute:返回正文 + Level 3 资源访问说明;未知名软失败。 */
-  _invokeSkill(name) {
+  _invokeSkill(name, args) {
     const def = this.skills?.get(name)
     if (!def || def.disableModelInvocation) {
       const valid = this._activeSkills().map(s => s.name).join(', ') || '(none)'
       return `Error: unknown skill "${name}". Valid skills: ${valid}`
     }
-    let out = def.body
+    // 先做占位符展开($ARGUMENTS / $1..$9)。正文里没有占位符却传了 args 时
+    // 把它附加为上下文,而不是静默丢弃 —— 后者是最难排查的一类失败。
+    const { text, applied } = applySkillArgs(def.body, args)
+    let out = text
+    const rawArgs = String(args ?? '').trim()
+    if (!applied && rawArgs) out += `\n\nArguments: ${rawArgs}`
     const fileList = def.files.filter(f => f !== 'SKILL.md')
     out += '\n---\n'
     if (def.baseDir) {
