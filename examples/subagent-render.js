@@ -103,17 +103,28 @@ export function createRenderer({ stream = process.stdout, isTTY = stream.isTTY, 
     liveLines = lines.length
   }
 
+  /**
+   * 普通输出。必定落在活动区上方。
+   *
+   * 独立的顶层函数而不是返回对象上的方法：这个渲染器是设计给拷贝粘贴用的
+   * （见文件头注释），返回对象一旦被解构（`const { log, settle } =
+   * createRenderer()`）取出的方法就丢了闭包所在的 `this`。用方法 + `this.log()`
+   * 转发（旧写法）在这种解构后的自由调用下会直接抛 `Cannot read properties of
+   * undefined`。闭包在这几个局部变量（stream/isTTY/clearLive）上，不依赖 `this`，
+   * 解构出来单独调用也没问题。
+   */
+  function log(line = '') {
+    if (finished) return
+    clearLive()
+    stream.write(line + '\n')
+  }
+
   return {
-    /** 普通输出。必定落在活动区上方。 */
-    log(line = '') {
-      if (finished) return
-      clearLive()
-      stream.write(line + '\n')
-    },
+    log,
 
     /** 固化一行（某个 agent 落终态）。语义等同 log，单独开一个名字是为了读起来清楚。 */
     settle(line) {
-      this.log(line)
+      log(line)
     },
 
     /** 重绘活动区。rows: Array<{label, detail, ms}> */

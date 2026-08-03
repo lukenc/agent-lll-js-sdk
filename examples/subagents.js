@@ -440,16 +440,27 @@ try {
   render.log(`事件计数: ${JSON.stringify(seen)}`)
 } finally {
   clearInterval(answerPoller)
-  // 后台 agent 会跨 chat() 存活；不收尾进程不会自然退出。这一步可能还会触发
-  // agent.succeeded/failed/cancelled（比如 closeSubagents 取消了一个还在跑的
-  // 节点），所以 render.done() 必须等它跑完才能调用，否则那条 settle 会被
-  // done() 之后的 finished 门禁吞掉。
-  await agent.closeSubagents()
-  await agent.closeMCPClients?.()
-  if (mcpClient) await mcpClient.close().catch(() => {})
-  if (ticker) clearInterval(ticker)
-  restoreConsole()
-  render.done()
+  try {
+    // 后台 agent 会跨 chat() 存活；不收尾进程不会自然退出。这一步可能还会触发
+    // agent.succeeded/failed/cancelled（比如 closeSubagents 取消了一个还在跑的
+    // 节点），所以 render.done() 必须等它跑完才能调用，否则那条 settle 会被
+    // done() 之后的 finished 门禁吞掉 —— 这也是这三步用 allSettled 并配一个
+    // 嵌套 finally 的原因：teardown 必须排在 done() 之前，但任何一步失败都不能
+    // 连累下面的终端收尾（clearInterval(ticker) / restoreConsole() / done()）
+    // 被跳过，否则终端会留一个隐藏光标、被 shim 劫持的 console 的残影。
+    const results = await Promise.allSettled([
+      agent.closeSubagents(),
+      agent.closeMCPClients?.() ?? Promise.resolve(),
+      mcpClient ? mcpClient.close() : Promise.resolve(),
+    ])
+    for (const r of results) {
+      if (r.status === 'rejected') render.log(`    ⚠ 收尾失败: ${r.reason?.message ?? r.reason}`)
+    }
+  } finally {
+    if (ticker) clearInterval(ticker)
+    restoreConsole()
+    render.done()
+  }
 }
 
 // ---------------------------------------------------------------------------
