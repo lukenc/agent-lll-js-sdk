@@ -1249,8 +1249,25 @@ subagents: {
 
 `isolation: 'remote'` 未实现，软失败。
 
-### 注意事项
+### 跑起来看看
 
+两个可以直接执行的集成入口：
+
+```bash
+# 命令行：7 幕跑完既有功能（工具 / Skill / MCP）+ subagent（后台派发 / DAG /
+# 产物轨 / 提问路由），末尾对若干关键事实做断言，不成立则非 0 退出
+OPENAI_API_KEY=sk-xxx node examples/subagents.js
+
+# 浏览器：服务端 Agent 与浏览器端 Agent 两个页面都带 subagent 面板
+OPENAI_API_KEY=sk-xxx node demo/server.js
+#   http://localhost:3000/        —— 服务端 Agent（提问走 /questions + /answer 命令式通道）
+#   http://localhost:3000/browser —— 浏览器端 Agent（提问走 hooks.onAskUser 弹层，Key 在页面里填）
+```
+
+面板会实时显示每个 subagent 的状态、每张图的节点与依赖边、以及产物轨；subagent 提问时
+页面会要求你回答，答案按 `askId` 定向送回提问的那一个 agent。细节见 `demo/README.md`。
+
+### 注意事项
 1. **后台 agent 跨 `chat()` 存活。** 它们不随 `chat()` 返回而终止，会一路跑到终态 ——
    因此宿主进程在全部后台 agent settle 之前不会自然退出。
 2. **退出前调 `closeSubagents()`。** 它取消全部在跑的 agent、reject 全部待答提问
