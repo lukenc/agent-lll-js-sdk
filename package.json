@@ -21,7 +21,7 @@
     "build": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --platform=browser --external:node:* --outfile=dist/lll-web-agent.js",
     "build:min": "esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --platform=browser --external:node:* --minify --outfile=dist/lll-web-agent.min.js",
     "prepublishOnly": "npm run build && npm run build:min",
-    "test": "node --test \"src/**/*.test.js\"",
+    "test": "node --test \"src/**/*.test.js\" \"demo/**/*.test.js\" \"examples/**/*.test.js\"",
     "example": "node examples/basic.js"
   },
   "engines": {
