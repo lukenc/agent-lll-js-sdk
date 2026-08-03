@@ -90,6 +90,10 @@ function _buildLlmCallPayload({
  *   - When present, one `llm.call` event is emitted on success/failure, and
  *     `onLlmSpanStart(spanId)` is invoked right before HTTP dispatch so the
  *     caller (Agent) can wire child tool-call spans to this call.
+ * @param {boolean} [opts.validateCompletion=true] - 是否要求流以非空
+ *   finish_reason 收尾（否则抛 LlmStreamIncompleteError）。零 chunk 流恒为
+ *   错误，不受此开关影响。设 false 恢复旧的宽容行为，用于合法不发
+ *   finish_reason 的 provider。
  * @yields {{ type: 'delta'|'reasoning'|'tool_call'|'usage'|'done', ... }}
  *   - { type: 'delta', content: string }
  *   - { type: 'reasoning', content: string }
@@ -97,7 +101,7 @@ function _buildLlmCallPayload({
  *   - { type: 'usage', usage: Usage_Object } — emitted at most once per stream
  *   - { type: 'done', response: object } — 最终重构的非流式等价响应（含 usage）
  */
-export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) {
+export async function* streamChatIter({ url, apiKey, body, signal, telemetry, validateCompletion = true }) {
   const ctx = telemetry?.ctx || null
   // Stopwatch + span id are only meaningful when ctx is present. Keep the
   // zero-telemetry path free of observable side effects.
@@ -117,6 +121,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
     responseModel: null,
   }
   let usageYielded = false
+  let parsedChunkCount = 0
 
   try {
     // 只对初始连接重试，流开始后不重试（已经 yield 了部分数据）
@@ -140,7 +145,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
 
       if (!resp.ok) {
         const errorBody = await resp.text().catch(() => '')
-        throw new LlmApiError(resp.status, errorBody)
+        throw new LlmApiError(resp.status, errorBody, Object.fromEntries(resp.headers.entries()))
       }
 
       return resp
@@ -166,6 +171,7 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
 
           let json
           try { json = JSON.parse(data) } catch { continue }
+          parsedChunkCount++
 
           // Capture the response model from the first chunk that carries it
           // (some providers include it on every chunk; we only need it once).
@@ -217,6 +223,20 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
       }
     } finally {
       reader.releaseLock()
+    }
+
+    // 语义层完整性校验（对齐 openai-node finalizeChatCompletion / Anthropic
+    // message_stop 检测）：OpenAI 兼容流正常完成时，最后一个内容 chunk 的
+    // finish_reason 必非空。传输层无法区分"干净的提前断开"和正常结束，
+    // 只能在这里判。零 chunk 恒为错误，不受开关控制。
+    if (parsedChunkCount === 0) {
+      throw new LlmStreamIncompleteError({ chunkCount: 0, partialContentLength: 0 })
+    }
+    if (validateCompletion && collected.finishReason == null) {
+      throw new LlmStreamIncompleteError({
+        chunkCount: parsedChunkCount,
+        partialContentLength: collected.content.length,
+      })
     }
 
     // Success path — emit `llm.call` right before the terminal `done` yield
@@ -280,14 +300,15 @@ export async function* streamChatIter({ url, apiKey, body, signal, telemetry }) 
  * @param {object} opts.body - 请求体（含 messages, model, tools 等）
  * @param {AbortSignal} [opts.signal] - 取消信号
  * @param {object} [opts.telemetry] - See `streamChatIter`.
+ * @param {boolean} [opts.validateCompletion=true] - See `streamChatIter`.
  * @param {function} [opts.onDelta] - 文本增量回调 (delta: string) => void
  * @param {function} [opts.onReasoning] - 思考过程增量回调
  * @param {function} [opts.onToolCall] - 工具调用增量回调 (index, toolCall) => void
  * @returns {Promise<object>} 重构后的非流式响应 JSON
  */
-export async function streamChat({ url, apiKey, body, signal, telemetry, onDelta, onReasoning, onToolCall }) {
+export async function streamChat({ url, apiKey, body, signal, telemetry, validateCompletion, onDelta, onReasoning, onToolCall }) {
   let response = null
-  for await (const event of streamChatIter({ url, apiKey, body, signal, telemetry })) {
+  for await (const event of streamChatIter({ url, apiKey, body, signal, telemetry, validateCompletion })) {
     switch (event.type) {
       case 'delta': onDelta?.(event.content); break
       case 'reasoning': onReasoning?.(event.content); break
@@ -334,7 +355,7 @@ export async function syncChat({ url, apiKey, body, signal, telemetry }) {
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')
-        throw new LlmApiError(response.status, errorBody)
+        throw new LlmApiError(response.status, errorBody, Object.fromEntries(response.headers.entries()))
       }
 
       return response.json()
@@ -359,7 +380,7 @@ export async function syncChat({ url, apiKey, body, signal, telemetry }) {
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')
-        throw new LlmApiError(response.status, errorBody)
+        throw new LlmApiError(response.status, errorBody, Object.fromEntries(response.headers.entries()))
       }
 
       return response.json()
@@ -441,33 +462,108 @@ function reconstructResponse(collected) {
 }
 
 export class LlmApiError extends Error {
-  constructor(status, body) {
+  constructor(status, body, headers = null) {
     super(`LLM API error ${status}: ${body.slice(0, 200)}`)
     this.status = status
     this.body = body
+    /** 小写键的响应头普通对象（Headers.entries() 产物），或 null。 */
+    this.headers = headers
   }
 }
 
+export class LlmStreamIncompleteError extends Error {
+  constructor({ chunkCount, partialContentLength }) {
+    super(
+      chunkCount === 0
+        ? 'LLM stream ended without sending any chunks'
+        : `LLM stream ended prematurely: no finish_reason received after ${chunkCount} chunk(s), ` +
+          `${partialContentLength} char(s) of partial content. The connection was likely cut by ` +
+          'the server or a proxy — retry the request. If your provider legitimately omits ' +
+          'finish_reason, pass { validateStreamCompletion: false } to the Agent (or ' +
+          'validateCompletion: false to streamChatIter).',
+    )
+    // Finding M-9: `.name` is a cross-package contract — app code
+    // (e.g. edu-desktop-app's agent-handlers.ts) matches on
+    // `err.name === 'LlmStreamIncompleteError'` rather than `instanceof`,
+    // because symlinked/monorepo installs of this package can produce dual
+    // class identities (two copies of this module, so `instanceof` fails
+    // across the package boundary) while `.name` survives. Do not rename
+    // this string without checking downstream consumers.
+    this.name = 'LlmStreamIncompleteError'
+    this.chunkCount = chunkCount
+    this.partialContentLength = partialContentLength
+  }
+}
+
+const RETRY_BACKOFF_CAP_MS = 8_000
+const RETRY_AFTER_CAP_MS = 60_000
+
 /**
- * 指数退避重试 — 对 429 (rate limit) 和 5xx (服务端错误) 自动重试。
+ * 是否可安全重试 — 对齐 openai-node / anthropic-sdk 共同策略：
+ * 408/409/429/5xx 与网络层错误（undici 的 TypeError: fetch failed）重试；
+ * 4xx 其余、Abort、以及流开始后的截断（LlmStreamIncompleteError —
+ * 部分数据已交付消费方，重放不安全）不重试。
+ *
+ * TypeError 单独判定时收窄到"网络形状"的 TypeError：undici 在网络层失败
+ * （连接被拒绝/DNS 失败/连接中途终止等）时抛的 TypeError 消息含
+ * 'fetch failed' / 'terminated'，且通常挂有 `.cause`（底层 errno/socket
+ * 错误）。不收窄会把调用方闭包里任意确定性的程序员错误（例如对 BigInt
+ * 调用 JSON.stringify 抛出的 TypeError）也当成"网络抖动"重试三次，把瞬时
+ * 失败拖成 ~7s 的无意义退避。
+ */
+export function isRetryableError(err) {
+  if (err?.name === 'AbortError') return false
+  if (err instanceof LlmStreamIncompleteError) return false
+  if (err instanceof LlmApiError) {
+    return err.status === 408 || err.status === 409 || err.status === 429 || err.status >= 500
+  }
+  return (
+    err instanceof TypeError &&
+    (err.message.includes('fetch failed') || err.message.includes('terminated') || err.cause != null)
+  )
+}
+
+/**
+ * 单次重试等待毫秒数。服务端 retry-after-ms（毫秒，优先）/ retry-after
+ * （秒或 HTTP 日期）优先并钳制到 60s；否则 min(base·2^attempt, 8s) 乘
+ * [0.75, 1.0] 的减法抖动（Stainless 公式）。
+ */
+export function computeRetryDelayMs(err, attempt, baseDelayMs = 500) {
+  const hinted = retryAfterMs(err instanceof LlmApiError ? err.headers : null)
+  if (hinted != null) return Math.min(hinted, RETRY_AFTER_CAP_MS)
+  const nominal = Math.min(baseDelayMs * Math.pow(2, attempt), RETRY_BACKOFF_CAP_MS)
+  return nominal * (1 - 0.25 * Math.random())
+}
+
+function retryAfterMs(headers) {
+  if (!headers) return null
+  const ms = parseFloat(headers['retry-after-ms'])
+  if (Number.isFinite(ms) && ms >= 0) return ms
+  const raw = headers['retry-after']
+  if (raw == null) return null
+  const secs = parseFloat(raw)
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000
+  const untilMs = Date.parse(raw) - Date.now()
+  return Number.isFinite(untilMs) && untilMs >= 0 ? untilMs : null
+}
+
+/**
+ * 指数退避重试 — 对齐 openai-node / anthropic-sdk 的可重试错误集合与退避公式。
  * @param {() => Promise<T>} fn - 要重试的异步函数
  * @param {object} [opts]
  * @param {number} [opts.maxRetries=3] - 最大重试次数
- * @param {number} [opts.baseDelayMs=1000] - 基础延迟（毫秒）
+ * @param {number} [opts.baseDelayMs=500] - 基础延迟（毫秒）
  * @param {AbortSignal} [opts.signal] - 取消信号
  * @returns {Promise<T>}
  */
-export async function withRetry(fn, { maxRetries = 3, baseDelayMs = 1000, signal } = {}) {
+export async function withRetry(fn, { maxRetries = 3, baseDelayMs = 500, signal } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn()
     } catch (err) {
-      const retryable = err instanceof LlmApiError &&
-        (err.status === 429 || err.status >= 500)
-      if (!retryable || attempt >= maxRetries) throw err
+      if (!isRetryableError(err) || attempt >= maxRetries) throw err
       signal?.throwIfAborted()
-      const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 500
-      await new Promise(r => setTimeout(r, delay))
+      await new Promise(r => setTimeout(r, computeRetryDelayMs(err, attempt, baseDelayMs)))
     }
   }
 }

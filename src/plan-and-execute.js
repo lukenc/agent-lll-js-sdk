@@ -123,6 +123,9 @@ const DEFAULTS = {
  * @param {number} [opts.planningTimeoutMs=120000]
  * @param {number} [opts.synthesisTimeoutMs=120000]
  * @param {boolean} [opts.useStreaming=false] - 使用流式 API 调用（浏览器端建议开启）
+ * @param {boolean} [opts.validateStreamCompletion=true] - 透传给内部 streamChat
+ *   调用的流完整性校验开关（仅在 useStreaming 时生效）；对齐 Agent 的同名选项，
+ *   使 plan_and_execute 策略下的 escape hatch 与 react 策略一致生效（Finding I-1）。
  * @param {function} [opts.onPhase] - (phase, message) => void
  * @param {function} [opts.onPlanGenerated] - (steps: PlanStep[]) => void
  * @param {function} [opts.onStepStart] - (index, description, step: PlanStep) => void
@@ -148,13 +151,15 @@ export class PlanAndExecuteStrategy {
     this.planningTimeoutMs = opts.planningTimeoutMs ?? DEFAULTS.planningTimeoutMs
     this.synthesisTimeoutMs = opts.synthesisTimeoutMs ?? DEFAULTS.synthesisTimeoutMs
     this.useStreaming = opts.useStreaming ?? false
+    this.validateStreamCompletion = opts.validateStreamCompletion ?? true
 
-    // 回调
-    this.onPhase = opts.onPhase ?? (() => {})
-    this.onPlanGenerated = opts.onPlanGenerated ?? (() => {})
-    this.onStepStart = opts.onStepStart ?? (() => {})
-    this.onStepComplete = opts.onStepComplete ?? (() => {})
-    this.onPlanRevised = opts.onPlanRevised ?? (() => {})
+    // 回调 —— 统一经 safeCallback 包裹：应用侧回调抛异常（或异步 reject）
+    // 不得打断 plan/step 主流程（与 Agent._safeHook 同一约定）。
+    this.onPhase = safeCallback(opts.onPhase ?? (() => {}), 'onPhase')
+    this.onPlanGenerated = safeCallback(opts.onPlanGenerated ?? (() => {}), 'onPlanGenerated')
+    this.onStepStart = safeCallback(opts.onStepStart ?? (() => {}), 'onStepStart')
+    this.onStepComplete = safeCallback(opts.onStepComplete ?? (() => {}), 'onStepComplete')
+    this.onPlanRevised = safeCallback(opts.onPlanRevised ?? (() => {}), 'onPlanRevised')
   }
 
   /**
@@ -228,7 +233,7 @@ export class PlanAndExecuteStrategy {
         this.onStepComplete(step.index, true, stepResult, step)
       } catch (err) {
         const duration = Date.now() - stepStart
-        const errorMsg = err.message || 'Step execution failed'
+        const errorMsg = (err?.message ?? String(err)) || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
         this.onStepComplete(step.index, false, errorMsg, step)
@@ -325,7 +330,7 @@ export class PlanAndExecuteStrategy {
         }
       } catch (err) {
         const duration = Date.now() - stepStart
-        const errorMsg = err.message || 'Step execution failed'
+        const errorMsg = (err?.message ?? String(err)) || 'Step execution failed'
         step.markFailed(errorMsg, duration)
         stepsContext += `\n[Step ${step.index + 1} FAILED]: ${truncate(errorMsg, 300)}`
         yield {
@@ -375,7 +380,15 @@ export class PlanAndExecuteStrategy {
     const ctx = childContext(this._rootCtx ?? null, operationName)
     const telemetry = ctx ? { ctx } : undefined
     if (this.useStreaming) {
-      return streamChat({ url: this.url, apiKey: this.apiKey, body, signal, onDelta: () => {}, telemetry })
+      return streamChat({
+        url: this.url,
+        apiKey: this.apiKey,
+        body,
+        signal,
+        onDelta: () => {},
+        telemetry,
+        validateCompletion: this.validateStreamCompletion,
+      })
     }
     return syncChat({ url: this.url, apiKey: this.apiKey, body, signal, telemetry })
   }
@@ -533,7 +546,8 @@ export class PlanAndExecuteStrategy {
             errorKind = (err?.name === 'AbortError' || signal?.aborted)
               ? 'aborted'
               : 'exception'
-            result = `Error executing ${call.name}: ${err.message}`
+            // 防 `throw null` / 原始值打穿 catch 块（与 agent.js 同一约定）。
+            result = `Error executing ${call.name}: ${err?.message ?? String(err)}`
           }
         }
         messages.push(formatToolResult(call.id, call.name, result))
@@ -661,6 +675,25 @@ export class PlanAndExecuteStrategy {
 }
 
 // ==================== Utility Functions ====================
+
+/**
+ * 把应用侧回调包一层保护：同步 throw 被吞（console.warn），返回 Promise
+ * 时挂一个 no-op rejection handler，避免异步回调以 unhandled rejection
+ * 的形式炸掉进程。函数声明（可提升）—— 构造函数在模块顶部即可引用。
+ * @param {Function} fn
+ * @param {string} name - 仅用于 warn 日志
+ * @returns {Function}
+ */
+function safeCallback(fn, name) {
+  return (...args) => {
+    try {
+      const ret = fn(...args)
+      if (ret && typeof ret.catch === 'function') ret.catch(() => {})
+    } catch (err) {
+      console.warn(`[plan-and-execute] callback "${name}" threw:`, err?.message || err)
+    }
+  }
+}
 
 /**
  * High-resolution monotonic clock helper. `performance.now()` exists in

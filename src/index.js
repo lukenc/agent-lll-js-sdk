@@ -24,7 +24,7 @@ export {
 } from './tool-filter.js'
 export { KnowledgeBase, createKnowledgeEntry } from './knowledge-base.js'
 export { ContextManager, defaultTokenBudget, estimateTokens } from './context-manager.js'
-export { streamChat, syncChat, streamChatIter, LlmApiError, withRetry } from './llm-client.js'
+export { streamChat, syncChat, streamChatIter, LlmApiError, LlmStreamIncompleteError, withRetry, isRetryableError, computeRetryDelayMs } from './llm-client.js'
 export { PlanAndExecuteStrategy, PlanStep, StepStatus, parsePlan } from './plan-and-execute.js'
 export { TelemetryBus, newTraceId, newSpanId, childContext, extractUsage, utf8ByteLength } from './telemetry.js'
 export {
@@ -43,3 +43,32 @@ export {
   serializeMcpToolForBrowser,
   summarizeMcpOutputSchema,
 } from './mcp/index.js'
+export {
+  createSkillRegistry,
+  registerSkillProvider,
+  createLocalSkillProvider,
+  createHttpSkillProvider,
+  SkillFilter,
+  SkillLoadError,
+  SkillParseError,
+  SkillMaterializeError,
+  SkillProviderError,
+} from './skills/index.js'
+export {
+  createSubagentRuntime,
+  registerAgentType,
+  getAgentType,
+  listAgentTypes,
+  unregisterAgentType,
+  resetAgentTypes,
+  AGENT_TYPE_NAME_RE,
+  INITIAL_AGENT_TYPES,
+  registerA2ATransport,
+  RESERVED_A2A_TRANSPORTS,
+  SUBAGENT_TOOL_NAMES,
+  SubagentError,
+  AgentTypeError,
+  AgentGraphError,
+  A2AError,
+  WorktreeIsolationError,
+} from './agents/index.js'

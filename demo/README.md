@@ -16,6 +16,7 @@ MCP 配置面板的小产品。
 | `server.js` | Node HTTP 服务器：提供 `/chat`(SSE 流式)、策略切换、MCP 挂载、遥测指标等接口 |
 | `index.html` | **服务端 Agent** 前端：Agent 跑在 server 上，浏览器只做展示，API Key 留在服务端（安全） |
 | `browser.html` | **浏览器端 Agent** 前端：Agent 直接跑在浏览器里，API Key 填在页面上（仅开发测试） |
+| `skills/` | 内置示例技能（`math-report` 计算报告 + `ancient-poet` 古体诗，后者演示 Level 3 参考文件）；server 找到此目录即自动启用技能系统 |
 | `mcp-servers/web-search.js` | 内置搜索 MCP server，搜狗搜索 + 网页抓取，零依赖、免 API Key |
 | `mcp-servers/searxng-search.js` | SearXNG MCP server，对接本地 Docker 起的多引擎聚合搜索 |
 | `searxng/` | SearXNG 的 Docker 配置（`settings.yml` + 启动说明），见 `searxng/README.md` |
@@ -147,7 +148,8 @@ node demo/server.js
 2. **简单任务模型（可选，sidecar）**：单独给意图识别 / 工具筛选 / 记忆摘要用的小模型；留空则复用主模型
 3. **启用意图识别**：开启后每轮对话前先用简单模型判断复杂度/清晰度并筛工具，遥测面板会出 `agent.intent` 事件
 4. **注入 ask_user 工具**：开启后 LLM 信息不足时会弹真人对话框向你追问（如「查天气」不说城市）
-5. 点「连接」生成 Agent 并订阅遥测
+5. **启用技能系统**：开启后从 server 的 `/skill-source` 经 HTTP provider 加载 `demo/skills`（默认勾选）
+6. 点「连接」生成 Agent 并订阅遥测
 
 ### 浏览器端完整能力清单
 
@@ -155,6 +157,7 @@ node demo/server.js
 - MCP 工具：通过「🔌 MCP Server」面板挂载（走服务端代理，见用法三方式 A），挂完热更新到 Agent，不丢对话
 - 意图识别 + 工具筛选（sidecar 小模型）
 - `ask_user` 交互式追问（真人弹框回答）
+- 技能系统（HTTP provider ← `/skill-source`）：Level 1 清单自动注入、`skill` 加载正文、`skill_resource` 读附属文件
 - ReAct / Plan & Execute 策略切换
 - 遥测面板：实时事件流（含 `reasoning` 思考流）+ Run/Session 聚合指标
 
@@ -224,6 +227,66 @@ DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
 
 ---
 
+## 用法四：技能系统（Skills）
+
+技能（Skill）是一份**命名的指令包**：一个 `SKILL.md`（带 name / description 的
+frontmatter + 正文指令），可选带 `references/` `scripts/` `assets/` 等附属文件。
+它让你把「怎么做某类任务」的知识沉淀成可复用的模块，通过**三级渐进披露**按需加载，
+不会一次性塞满上下文：
+
+- **Level 1（清单）**：SDK 每轮把 `name: description` 列表自动追加到系统提示末尾，
+  只占几十 token，让 LLM 知道有哪些技能可用。
+- **Level 2（正文）**：LLM 判断某技能匹配当前请求时，调用 `skill` 元工具，
+  拿到该技能 `SKILL.md` 的完整正文指令。
+- **Level 3（附属文件）**：正文里若指示读取 `references/xxx.md` 等文件，
+  服务端 Agent 用 `read_file` 工具读，浏览器端 Agent 用自动注入的 `skill_resource` 工具读。
+
+### 默认即开：找到 `demo/skills` 就启用
+
+server 启动时如果发现 `demo/skills/` 目录存在，就会自动加载其中的技能，无需额外开关：
+
+```bash
+OPENAI_API_KEY=sk-xxx node demo/server.js
+# 启动日志会打印：Skills: 已加载 2 个技能 (ancient-poet, math-report)
+```
+
+内置两个示例技能：
+
+| 技能 | 触发示例 | 演示点 |
+|---|---|---|
+| `math-report` | 「帮我算一下 12*8 和 (5+3)^2，生成一份计算报告」 | Level 2：正文指导先用 `calculate` 工具再产出 Markdown 报告表 |
+| `ancient-poet` | 「写一首关于秋天的七言绝句」 | Level 3：正文让模型先读 `references/formats.md` 格律再作诗 |
+
+换一个技能目录：
+
+```bash
+SKILLS_DIR=/path/to/your/skills OPENAI_API_KEY=sk-xxx node demo/server.js
+```
+
+### 服务端 Agent（`/`）
+
+技能在 server 端用 local provider（`{ type: 'local', dir: SKILLS_DIR }`）加载，
+Level 3 走 server 注入的、限定在 `SKILLS_DIR` 内的 `read_file` 工具。页面左上角有
+**Skill 徽章**显示已加载技能数与清单，连接后会推一条提示消息带触发示例。
+
+### 浏览器端 Agent（`/browser`）
+
+浏览器无法直接读服务端文件系统，所以走 **HTTP provider**：Agent 配置
+`{ type: 'http', baseUrl: '/skill-source' }`，由 server 的 `/skill-source/*` 接口
+按技能 provider 的 wire 协议提供技能清单与文件；Level 3 由 SDK 自动注入的
+`skill_resource` 工具再发一次 `GET /skill-source/skills/<name>/<path>` 读取。
+
+页面配置栏有「**启用技能系统**」勾选框（默认勾选），顶部有 **Skill 徽章**。
+勾选并「连接」后，说出匹配请求即可触发。注意 `file://` 直接打开时技能系统不可用
+（依赖 server 的 `/skill-source`），必须经 `http://localhost:3000/browser` 访问。
+
+> `disable-model-invocation: true` 的技能不会出现在 Level 1 清单里，也不能被 `skill`
+> 工具加载，只能由代码 `agent.skills.get(name)` 主动取用——适合放不想让模型自发触发的内部流程。
+> `examples/skills/` 里的 `internal-notes` 演示了这一点。
+
+---
+
+
 ## 服务端接口速查（给想二次开发的人）
 
 ### RuntimeHistory 与上下文轨道
@@ -265,6 +328,89 @@ demo 会在每轮对话结束后展示当前 Agent 的 RuntimeHistory 轨道快�
 | POST | `/mcp-disconnect` | 卸载 MCP server，body `{ name }`（不传则全卸） |
 | GET | `/mcp-tools` | 列出所有已挂载 MCP 工具（含 title/icons/outputSchema/execution/annotations/modelDescription，供浏览器端代理调用） |
 | POST | `/mcp-call` | 代理执行某个 MCP 工具，body `{ name, arguments }` |
+| GET | `/skills-status` | 技能系统状态：`{ enabled, dir, count, skills:[{name,description,version,files,hidden}] }` |
+| GET | `/skill-source/manifest.json` | HTTP SkillProvider 清单（供浏览器端 Agent 加载技能） |
+| GET | `/skill-source/skills/<name>/<relPath>` | 读取某技能的附属文件（Level 3，带路径穿越防护） |
+| GET | `/agents` | Subagent 快照：agent 列表、每张图的节点、产物轨、待答提问 |
+| GET | `/questions` | 只取待答提问（面板高频轮询用） |
+| POST | `/answer` | 定向回答一个提问，body `{ askId, answer }` 或 `{ askId, cancel: true, reason }` |
+
+---
+
+## 用法四：Subagent（派活给子 agent / DAG 编排）
+
+默认**开启**（`SUBAGENTS=0` 关闭）。开启后服务端 Agent 会带上 12 个元工具
+（`agent` / `agent_status` / `agent_cancel` / `agent_graph` / `graph_start` /
+`graph_close` / `graph_reactivate` / `send_message` / `artifact_write` /
+`artifact_list` / `history_search` / `history_get`），以及两个演示用的
+Agent_Type：
+
+| 类型 | 能做什么 | 拿到的工具 |
+|---|---|---|
+| `explorer` | 只读检索：读项目笔记、汇报事实 | `read_note` + 基础设施 floor |
+| `interviewer` | 替编排者向用户问一个具体问题 | 只有 floor（含 `ask_user`） |
+
+> 窄类型不需要把 `artifact_write` / `history_search` / `ask_user` 写进 `tools` ——
+> 它们是框架保证带上的 floor（与父 agent 实际拥有的工具取交集）。
+
+右侧面板会实时显示每个 subagent 的状态、每张图的节点与依赖、以及产物轨。
+subagent 通过 `ask_user` 提问时，页面底部会弹出黄色横幅，回答按 `askId` 定向送回
+提问的那一个 agent（所以多个 agent 同时提问也不会串）。
+
+服务端用的是**命令式提问通道**（`agent.pendingQuestions()` / `agent.answerQuestion()`），
+不是 `hooks.onAskUser` —— HTTP 服务端不需要在某个请求上下文里 `await` 一个几分钟后
+才有的回答。浏览器端 demo 相反，用的是 hook + 弹层（签名已扩展为
+`onAskUser(question, meta)`，`meta.agentName` 会显示在弹层标题里）。
+
+**「新会话」会重建 Agent**，而不是只 `reset()`：`AgentRegistry` 按 `retainCompleted`
+保留已完成的 handle（设计如此，`send_message` 还能唤醒它们），只 reset 的话面板里会
+挂着上一轮那批 agent。
+
+### 事件带归属，攒成 UI 状态是主机的活
+
+`runner._forwardTelemetry` 把每个 subagent 的 `llm.call` / `tool.call` /
+`round.start` / `round.end` 转发到**父 agent 的同一条总线**上，并补上 `agentId`、
+`agentName` 与 `parentAgentId`（后者是做深度感知的归属 UI 时需要的那个字段）。
+主 agent 自己发的事件不带这些字段 —— 所以归属规则只有一条：
+
+```js
+const owner = payload.agentId ?? 'main'
+```
+
+但框架**刻意不缓存**"某个 agent 都调过哪些工具"：`AgentHandle` 只记 `metrics`
+聚合数。要在界面上画出工具流水，主机必须自己从事件流攒一份账。两个 demo 页面各
+示范了一遍：
+
+- 服务端页：`demo/lib/activity.js`（有单测），`/agents` 响应里每个 agent 带
+  `activity: { rounds, tools, truncated }`
+- 浏览器页：同一份逻辑的内联副本（单文件页面没有模块加载器，import 不进来）
+
+两处都有上限（每个 agent 最多 20 条工具流水、最多 50 个 agent），因为一个跑飞的
+agent 可能调几百次工具，无界数组会把内存和响应体一起撑爆。
+
+---
+
+## 试试这些话术
+
+启动后（`OPENAI_API_KEY=sk-xxx node demo/server.js`）在页面里输入：
+
+| 说 | 会走到 |
+|---|---|
+| 现在几点 / 算一下 (17+25)*3 | 普通工具调用 |
+| 用一个 explorer 在后台调研这个仓库的错误处理约定 | 后台 subagent + keep-alive + 轮边界注入 |
+| 用 agent_graph 声明一张依赖图：并行统计模块清单和变更记录，第三个节点汇总 | DAG：两个 auto 上游 + 一个 confirm 闸门 → `graph_start` → `graph_close` |
+| 用 artifact_list 把产物列出来 | 产物轨 |
+| 派一个 interviewer 问我发布窗口定在什么时候 | 提问路由（服务端横幅 / 浏览器端弹层） |
+| 北京天气怎么样、帮我记一条笔记… | `/browser` 那 10 个工具（既有能力） |
+
+同一套集成也有一个纯命令行的版本：
+
+```bash
+OPENAI_API_KEY=sk-xxx node examples/subagents.js
+```
+
+7 幕跑完既有功能（工具 / Skill / MCP）与 subagent（后台派发 / DAG / 产物轨 / 提问路由），
+末尾对若干关键事实做断言，任一条不成立以非 0 退出 —— 可以直接当回归脚本用。
 
 ---
 
@@ -275,7 +421,8 @@ demo 会在每轮对话结束后展示当前 Agent 的 RuntimeHistory 轨道快�
 
 **`/chat` 不工作 / 提示没有 API Key**
 服务端 Agent 需要 `OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY`。浏览器端 Agent
-（`/browser`）不受影响，Key 在页面里填。
+（`/browser`）不受影响，Key 在页面里填。用 OpenAI 兼容的代理/聚合服务时，
+服务端设 `LLM_URL=https://.../v1/chat/completions`，浏览器端填页面上的「自定义 API URL」。
 
 **端口 3000 被占用**
 server 会自动尝试 3001、3002……最多试 10 次。也可以用 `PORT=8080` 指定。

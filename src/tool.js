@@ -77,8 +77,23 @@ export function formatToolResult(callId, toolName, result) {
     role: 'tool',
     tool_call_id: callId,
     name: toolName,
-    content: typeof result === 'string' ? result : JSON.stringify(result),
+    content: stringifyToolResult(result),
   }
+}
+
+/**
+ * 把任意工具返回值收敛为字符串。JSON.stringify 对循环引用 / BigInt /
+ * 抛异常的 toJSON 会 throw，而本函数在工具调用的 try/catch 之外被调用，
+ * 一旦抛出会终止整个 run —— 因此逐级降级：JSON → String → 占位符。
+ */
+function stringifyToolResult(result) {
+  if (typeof result === 'string') return result
+  try {
+    const json = JSON.stringify(result)
+    if (json !== undefined) return json
+  } catch { /* circular / BigInt / toJSON throw — fall through */ }
+  try { return String(result) }
+  catch { return '[unserializable tool result]' }
 }
 
 function safeParseJSON(str) {
