@@ -41,13 +41,43 @@ const HERE = new URL('.', import.meta.url).pathname
 // 0. 配置
 // ---------------------------------------------------------------------------
 
-const API_KEY = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY
+// 供应商与 Key 的解析。SDK 支持 openai / deepseek / qwen / moonshot / zhipu / x-grok，
+// 所以这里也按同一组来认 —— 只认两个 key 会让示例在其他供应商上跑不起来。
+// 显式 PROVIDER 优先；否则按"哪个 key 存在"推断。
+const KEY_BY_PROVIDER = {
+  openai: process.env.OPENAI_API_KEY,
+  deepseek: process.env.DEEPSEEK_API_KEY,
+  // 阿里云百炼（dashscope）的 OpenAI 兼容端点
+  qwen: process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY,
+  moonshot: process.env.MOONSHOT_API_KEY,
+  zhipu: process.env.ZHIPU_API_KEY,
+  'x-grok': process.env.XAI_API_KEY || process.env.GROK_API_KEY,
+}
+const DEFAULT_MODEL_BY_PROVIDER = {
+  openai: 'gpt-4o',
+  deepseek: 'deepseek-chat',
+  qwen: 'qwen-plus',
+  moonshot: 'moonshot-v1-8k',
+  zhipu: 'glm-4',
+  'x-grok': 'grok-2-latest',
+}
+
+const PROVIDER = process.env.PROVIDER
+  || Object.keys(KEY_BY_PROVIDER).find(p => KEY_BY_PROVIDER[p])
+  || 'openai'
+// 显式 PROVIDER 时也允许用通用的 LLM_API_KEY 传 key，省得为每家记一个变量名。
+const API_KEY = KEY_BY_PROVIDER[PROVIDER] || process.env.LLM_API_KEY
 if (!API_KEY) {
-  console.error('需要 API Key:')
+  console.error(`需要 API Key（当前 provider: ${PROVIDER}）：`)
   console.error('  OPENAI_API_KEY=sk-xxx node examples/subagents.js')
   console.error('  DEEPSEEK_API_KEY=sk-xxx node examples/subagents.js')
+  console.error('  PROVIDER=qwen DASHSCOPE_API_KEY=sk-xxx node examples/subagents.js')
+  console.error('  PROVIDER=<任意> LLM_API_KEY=sk-xxx node examples/subagents.js')
   process.exit(1)
 }
+const MODEL = process.env.MODEL || DEFAULT_MODEL_BY_PROVIDER[PROVIDER] || 'gpt-4o'
+// subagent 的 `model: 'fast'` 别名解析到这里；不配就与主模型同一套。
+const SIMPLE_MODEL = process.env.SIMPLE_MODEL || MODEL
 
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true'
 const render = createRenderer()
@@ -95,12 +125,6 @@ function restoreConsole() {
   console.warn = _origConsoleWarn
   console.error = _origConsoleError
 }
-
-const PROVIDER = process.env.PROVIDER
-  || (process.env.DEEPSEEK_API_KEY && !process.env.OPENAI_API_KEY ? 'deepseek' : 'openai')
-const MODEL = process.env.MODEL || (PROVIDER === 'deepseek' ? 'deepseek-chat' : 'gpt-4o')
-// subagent 的 `model: 'fast'` 别名解析到这里；不配就与主模型同一套。
-const SIMPLE_MODEL = process.env.SIMPLE_MODEL || MODEL
 
 // ---------------------------------------------------------------------------
 // 1. 既有能力：自定义工具 + 一份"项目笔记"（给 subagent 一点真东西可读）
@@ -165,9 +189,15 @@ const SUBAGENT_TYPES = [
   {
     name: 'explorer',
     description: '只读检索：读项目笔记、汇报事实，不做任何修改。',
-    systemPrompt: '你是一个只读检索子 agent。用 read_note 找到事实，'
-      + '用 artifact_write 把结论登记到产物轨（key 用文件路径形式），'
-      + '最后一条消息就是你交回去的报告：先给结论，再给证据，不要复述过程。',
+    // 措辞刻意写硬。宽松版（"用 read_note 找到事实"）实测会让较弱的模型一轮都不调工具、
+    // 直接凭常识编一份看起来很像的报告 —— 演示里最坏的失败形态，因为它看不出来。
+    systemPrompt: '你是一个只读检索子 agent，任务是汇报**项目笔记里实际写了什么**。\n'
+      + '硬性步骤，不得跳过：\n'
+      + '1. 先调 read_note 把相关笔记读出来。你对这个仓库没有任何先验知识，'
+      + '不调工具就作答等于编造，是本次任务的失败。\n'
+      + '2. 再调 artifact_write 把结论登记到产物轨（key 用文件路径形式，如 notes/xxx.md）。\n'
+      + '3. 最后一条消息是你交回去的报告：先给结论，再引用笔记里的原文作为证据，不要复述过程。\n'
+      + '报告里出现任何笔记中没有的编号、类名或结构，都算失败。',
     model: 'fast',
     tools: ['read_note'],
     maxRounds: 10,
@@ -264,7 +294,7 @@ const agent = new Agent({
 })
 
 // 遥测（既有功能 + subagent 的新事件）
-const seen = { spawn: 0, succeeded: 0, failed: 0, artifacts: 0, graphNodes: 0, asks: 0, toolCalls: 0 }
+const seen = { spawn: 0, succeeded: 0, failed: 0, artifacts: 0, conflicts: 0, graphNodes: 0, asks: 0, toolCalls: 0 }
 agent.on('tool.call', (p) => {
   seen.toolCalls++
   if (p.agentId && live.has(p.agentId)) live.get(p.agentId).detail = p.name
@@ -321,6 +351,13 @@ agent.on('artifact.write', (p) => {
   seen.artifacts++
   render.log(`    · 产物 ${p.key} sha:${p.sha} by ${p.agentName}`)
 })
+// 产物轨是文档里点名的"跨 agent 主要护栏"，而 `artifact.conflict` 是它**唯一**的报警。
+// 不订阅它，两个 subagent 拿同一个 key 互相覆盖时界面上一点动静都没有 —— 真跑一次就撞上了
+// （两个节点都写了 notes/changelog.md）。护栏不发声等于没有护栏。
+agent.on('artifact.conflict', (p) => {
+  seen.conflicts++
+  render.log(`    ⚠ 产物冲突：${p.key} 上一版属于 ${p.owner}（policy=${p.policy}）`)
+})
 agent.on('graph.node.settled', (p) => { seen.graphNodes++ })
 agent.on('ask.user', () => { seen.asks++ })
 agent.on('run.keep_alive.timeout', (p) => render.log(`    · keep-alive 等了 ${Math.round(p.waitedMs)}ms`))
@@ -365,11 +402,18 @@ try {
   check('计算结果正确（126 出现在回复里）', /126/.test(r1), r1.slice(0, 50))
 
   mark = (await agent.getHistory('model')).length
-  const r2 = await act('第 2 幕 · 既有功能：Skill 系统',
+  await act('第 2 幕 · 既有功能：Skill 系统',
     '用 incident-report 这个 skill，给昨晚的登录超时故障列一份复盘提纲。')
   const t2 = await toolsCalledSince(mark)
-  check('skill 元工具被调用（Level 2 正文注入）', t2.includes('skill'), t2.join(', '))
-  check('回复按 skill 的五段式组织', /时间线/.test(r2) && /根因/.test(r2), r2.slice(0, 60))
+  check('skill 元工具被调用', t2.includes('skill'), t2.join(', '))
+  // 判 Level 2 正文**真的进了模型上下文**：skill 工具的返回值就是 SKILL.md 的正文，
+  // 它作为 tool 消息落在 model 轨上，所以搜正文里的标题即可。
+  // 不判"回复里有没有出现五段式的段名" —— 那是模型的措辞，同一次运行里模型可能只回一句
+  // "提纲结构已明确"就收尾，而正文注入这件事照样是成立的（实测撞到过）。
+  const skillTrack = await agent.getHistory('model')
+  check('skill 正文（Level 2）注入进了模型上下文',
+    skillTrack.some(m => typeof m?.content === 'string' && m.content.includes('事故复盘报告')),
+    'model 轨里找 SKILL.md 的标题')
 
   if (mcpTools.length > 0) {
     mark = (await agent.getHistory('model')).length
@@ -386,8 +430,21 @@ try {
     + '（run_in_background 用默认的 true），等它回来后把它的结论转述给我。')
   check('subagent 被派出去了', seen.spawn >= 1, `spawn=${seen.spawn}`)
   check('subagent 跑完并成功', seen.succeeded >= 1, `succeeded=${seen.succeeded} failed=${seen.failed}`)
-  check('后台结果经轮边界注入回到主 agent（回复里带 ERR-CONV-01 的内容）',
-    /ERR-CONV-01|软失败|不 ?throw|白名单/.test(r4), r4.slice(0, 80))
+  // 判的是**轮边界注入这个机制**发生了没有 —— 后台 agent 的结果是以一条
+  // `<agent-notification>` user 消息的形式插进主 agent 上下文的，那条消息进没进去就是答案。
+  //
+  // 注意两个坑：
+  // 1) 早先这里断言主 agent 的回复里要出现笔记原文的字眼，那是在量"子 agent 有没有听话去
+  //    读笔记"（模型行为），不是量集成 —— 子 agent 完全可以不调 read_note 就交一份报告，
+  //    而注入机制照样是好的。断言的对象必须是机制。
+  // 2) `getHistory` 两组轨道的**返回形状不同**：'model' / 'visible' 给的是投影后的扁平
+  //    消息（`{ role, content }`），而 'all' / 'internal' 给的是 RuntimeHistory 的原始事件
+  //    （内容在 `.message.content`）。按扁平形状去读 'all' 会永远读不到东西，而且不报错。
+  //    这里查 'model' 轨：通知的意义本来就是"进了模型的上下文"。
+  const modelTrack = await agent.getHistory('model')
+  const notified = modelTrack.some(m => typeof m?.content === 'string' && m.content.includes('<agent-notification'))
+  check('后台结果经轮边界注入进主 agent 的上下文（model 轨里有 <agent-notification>）', notified,
+    notified ? '已注入' : 'model 轨里找不到注入的通知')
 
   const r5 = await act('第 5 幕 · 新功能：DAG 编排（2 个并行上游 + 1 个确认闸门）',
     '用 agent_graph 声明一张依赖图来做发布说明：两个互不依赖的节点分别统计模块清单、'
@@ -412,8 +469,16 @@ try {
     + '搜一下 "ERR-CONV-01"，告诉我搜到了什么。')
   const t6 = await toolsCalledSince(mark)
   const artifacts = await agent.getArtifacts()
-  check('产物轨记下了各 subagent 的产出', artifacts.length >= 3,
+  // 判产物轨这条机制成立没有:有记录、且每条都带得清归属（哪个 agent、哪个图节点写的）。
+  // 不判条数 —— 有几个 subagent 选择调 artifact_write 是模型行为，不是集成的性质。
+  check('产物轨有记录', artifacts.length >= 1,
     `${artifacts.length} 条: ${artifacts.map(a => a.key).join(', ')}`)
+  check('每条产物都带得清归属（agentName + sha）',
+    artifacts.length > 0 && artifacts.every(a => a.agentName && a.sha),
+    artifacts.map(a => `${a.key}←${a.agentName}${a.nodeId ? '@' + a.nodeId : ''}`).join(' '))
+  check('图节点写的产物记下了 nodeId',
+    artifacts.some(a => a.nodeId),
+    artifacts.map(a => a.nodeId ?? '-').join(','))
   check('artifact_list / history_search 都被调到',
     t6.includes('artifact_list') && t6.includes('history_search'), t6.join(', '))
   check('第 6 幕正常收尾', typeof r6 === 'string' && r6.length > 0)
