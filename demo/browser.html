@@ -78,6 +78,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .sa-graph{margin-top:6px}
 .sa-graph .sa-graph-head{font-size:11px;color:#444;font-weight:600;margin:6px 0 2px}
 .sa-node{padding-left:10px}
+.sa-head{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:4px 0}
+.sa-head .sa-caret{color:#999;width:10px;display:inline-block}
+.sa-head .sa-cost{margin-left:auto;color:#888;font-size:10px;font-family:'SF Mono',Menlo,monospace}
+.sa-tools{padding:2px 0 4px 20px}
+.sa-tool{display:flex;gap:6px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#555;padding:1px 0}
+.sa-tool .sa-tool-ms{margin-left:auto;color:#aaa}
+.sa-tool.bad{color:#b42318}
+.sa-thinking{color:#8a5a00;font-style:italic}
+.sa-truncated{color:#aaa;font-size:10px;padding-left:20px}
+.sa-fail{color:#b42318;font-size:10px}
 .telemetry .event{padding:5px 7px;border-radius:5px;background:#fff;border:1px solid #e8e8e8;font-family:'SF Mono',Menlo,monospace;font-size:11px;line-height:1.3;display:flex;flex-direction:column;gap:2px}
 .telemetry .event .evt-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .telemetry .event .evt-name{font-weight:600;padding:1px 5px;border-radius:3px;font-size:10px}
@@ -267,6 +277,54 @@ var defineTool = LllWebAgent.defineTool
 var registerBaseTool = LllWebAgent.registerBaseTool
 var unregisterBaseTool = LllWebAgent.unregisterBaseTool
 var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
+
+/**
+ * 活动账本 —— 与 demo/lib/activity.js **逻辑等价的内联副本**。
+ * 这个页面是刻意的单文件 + IIFE bundle，没有模块加载器，import 不进来。
+ * 改这里记得同步那一份（那份有单测）。
+ */
+function createActivityLedger(maxTools, maxAgents) {
+  maxTools = maxTools || 20
+  maxAgents = maxAgents || 50
+  var byAgent = new Map()
+  function entry(id) {
+    var e = byAgent.get(id)
+    if (!e) {
+      e = { rounds: 0, tools: [], truncated: 0 }
+      byAgent.set(id, e)
+      while (byAgent.size > maxAgents) {
+        var oldest = byAgent.keys().next().value
+        if (oldest === id) break
+        byAgent.delete(oldest)
+      }
+    }
+    return e
+  }
+  return {
+    onRoundStart: function(p) {
+      var e = entry((p && p.agentId) || 'main')
+      var n = p && typeof p.round === 'number' ? p.round + 1 : e.rounds
+      if (n > e.rounds) e.rounds = n
+    },
+    onToolCall: function(p) {
+      p = p || {}
+      var e = entry(p.agentId || 'main')
+      e.tools.push({
+        name: String(p.name || '?'),
+        ok: typeof p.ok === 'boolean' ? p.ok : null,
+        ms: typeof p.durationMs === 'number' ? Math.round(p.durationMs) : null,
+      })
+      while (e.tools.length > maxTools) { e.tools.shift(); e.truncated += 1 }
+    },
+    snapshot: function(id) {
+      var e = byAgent.get(id)
+      return e ? { rounds: e.rounds, tools: e.tools.slice(), truncated: e.truncated } : null
+    },
+    clear: function() { byAgent.clear() },
+  }
+}
+
+var activityLedger = createActivityLedger()
 
 /**
  * 浏览器端的 Agent_Type。`tools` 只列任务工具 —— artifact_write / artifact_list /
@@ -858,6 +916,13 @@ function initAgent() {
 
   agent = new Agent(agentOpts)
 
+  // 重连即新会话，账本跟着清；手动展开/折叠的记忆也一并清空（新会话的
+  // agentId 全新分配，留着旧的没有意义）。
+  activityLedger.clear()
+  saManual.clear()
+  agent.on('round.start', function(p) { activityLedger.onRoundStart(p) })
+  agent.on('tool.call', function(p) { activityLedger.onToolCall(p) })
+
   // 订阅遥测事件，实时渲染到右侧面板。
   // 说明：监听器为空时 Agent 也会维护 getLastRunMetrics / getSessionMetrics，
   // 这里显式订阅以做 UI 可视化。失败时通过 console.warn 暴露。
@@ -1091,6 +1156,42 @@ function saEsc(s) {
   })
 }
 
+// 用户手动切换过的 agentId。1s 一次的轮询会重绘整块 DOM —— 不记住手动选择，
+// 用户刚展开的卡片下一秒就被默认策略折回去了。
+var saManual = new Map()   // agentId -> boolean(expanded)
+
+function saToggle(agentId, defaultExpanded) {
+  var cur = saManual.has(agentId) ? saManual.get(agentId) : defaultExpanded
+  saManual.set(agentId, !cur)
+  renderBrowserSubagents()
+}
+
+function saExpanded(a) {
+  var terminal = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) !== -1
+  return saManual.has(a.agentId) ? saManual.get(a.agentId) : !terminal
+}
+
+/** 耗时 · token · 步数。运行中 wallClockMs 还没落定，用 startedAt 现算。 */
+function saCost(a) {
+  var m = a.metrics || {}
+  var running = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) === -1
+  var ms = running && a.startedAt ? Date.now() - a.startedAt : m.wallClockMs
+  var u = m.usage || {}
+  var tok = (u.input_tokens || 0) + (u.output_tokens || 0)
+  var parts = []
+  if (ms) parts.push(formatDuration(ms))
+  if (tok) parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + 'k tok' : tok + ' tok')
+  if (m.rounds) parts.push(m.rounds + ' 步')
+  return parts.length ? parts.join(' · ') : '—'
+}
+
+/** failureKind 不在 toStatus() 顶层，在 attempts[] 里逐次记录，取最后一条。 */
+function saFailure(a) {
+  var attempts = a.attempts || []
+  var last = attempts.length ? attempts[attempts.length - 1] : null
+  return last && last.failureKind ? last.failureKind : null
+}
+
 async function renderBrowserSubagents() {
   var panel = document.getElementById('subagentPanel')
   var body = document.getElementById('saBody')
@@ -1122,10 +1223,45 @@ async function renderBrowserSubagents() {
 
   var parts = []
   agents.forEach(function(a) {
-    var meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.metrics && a.metrics.rounds ? 'rounds=' + a.metrics.rounds : null]
+    var expanded = saExpanded(a)
+    var terminal = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) !== -1
+    var meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.attempt > 1 ? 'attempt ' + a.attempt : null]
       .filter(Boolean).join(' · ')
-    parts.push('<div class="sa-row"><span class="sa-state ' + saEsc(a.state) + '">' + saEsc(a.state) + '</span>'
-      + '<span class="sa-name">' + saEsc(a.name) + '</span><span class="sa-meta">' + saEsc(meta) + '</span></div>')
+    var fail = saFailure(a)
+    parts.push(
+      // 不用内联 onclick：agentId 拼进 '单引号 JS 字符串' 又嵌在双引号 HTML 属性里，
+      // saEsc() 只转义 & < > "，转义不了单引号。改成 data-* + 渲染后绑定监听器，
+      // 直接不进入那个嵌套语境。
+      '<div class="sa-head" data-agent-id="' + saEsc(a.agentId) + '" data-default-expanded="' + (terminal ? '0' : '1') + '">'
+      + '<span class="sa-caret">' + (expanded ? '▼' : '▶') + '</span>'
+      + '<span class="sa-state ' + saEsc(a.state) + '">' + saEsc(a.state) + '</span>'
+      + '<span class="sa-name">' + saEsc(a.name) + '</span>'
+      + '<span class="sa-meta">' + saEsc(meta) + '</span>'
+      + (fail ? '<span class="sa-fail">' + saEsc(fail) + '</span>' : '')
+      + '<span class="sa-cost">' + saEsc(saCost(a)) + '</span></div>'
+    )
+    if (!expanded) return
+    var act = activityLedger.snapshot(a.agentId)
+    parts.push('<div class="sa-tools">')
+    if (act && act.truncated > 0) {
+      parts.push('<div class="sa-truncated">…前 ' + act.truncated + ' 条已省略</div>')
+    }
+    var tools = act ? act.tools : []
+    tools.forEach(function(t) {
+      var mark = t.ok === false ? '✗' : '✓'
+      parts.push('<div class="sa-tool' + (t.ok === false ? ' bad' : '') + '">'
+        + '<span>' + mark + ' ' + saEsc(t.name) + '</span>'
+        + '<span class="sa-tool-ms">' + (t.ms == null ? '' : t.ms + 'ms') + '</span></div>')
+    })
+    // tool.call 是执行完才发的，所以没有"进行中"的工具行。运行中而流水没长出新条目
+    // 时，agent 大多数情况下是在等 LLM —— 用一行"思考中"表达，不伪造一条工具行。
+    // waiting_input 是例外：那不是模型在想，是模型已经问完、卡在等人类回答。
+    if (a.state === 'waiting_input') {
+      parts.push('<div class="sa-tool sa-thinking">⏸ 等你回答…</div>')
+    } else if (!terminal) {
+      parts.push('<div class="sa-tool sa-thinking">● 思考中…</div>')
+    }
+    parts.push('</div>')
   })
   graphs.forEach(function(g) {
     parts.push('<div class="sa-graph"><div class="sa-graph-head">图 ' + saEsc(g.entry.graphId)
@@ -1147,6 +1283,11 @@ async function renderBrowserSubagents() {
     parts.push('</div>')
   }
   body.innerHTML = parts.join('')
+  // 内联 onclick 会把 agentId 拼进 HTML 属性里的 JS 字符串字面量，saEsc() 覆盖不到
+  // 那个语境；渲染完再绑监听器，直接不进入需要转义的嵌套上下文。
+  body.querySelectorAll('.sa-head').forEach(function(el) {
+    el.onclick = function() { saToggle(el.dataset.agentId, el.dataset.defaultExpanded === '1') }
+  })
 }
 
 function askUserDialog(question) {
