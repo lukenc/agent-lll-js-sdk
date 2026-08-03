@@ -2,7 +2,22 @@
 
 开箱即用的 LLM Agent SDK — 配个 API Key 就能跑。
 
-内置完整 Runtime 管线：意图识别 → 工具过滤 → 上下文管理（token 预算） → ReAct 循环。
+内置完整 Runtime 管线：意图识别 → 工具过滤 → 上下文管理（token 预算） → ReAct 循环，
+外加四个可选子系统：**MCP Client**、**Skill 系统**、**Subagent 系统**、**Telemetry**。
+每个子系统未配置时零开销 —— 不注入工具、不发事件、行为与不带它时一致。
+
+## 目录
+
+- [安装](#安装) · [快速开始](#快速开始) · [流式对话](#流式对话) · [架构](#架构)
+- **核心模块**：[Agent 配置](#agent) · [Hooks](#hooks) · [IntentRecognizer](#intentrecognizer) ·
+  [KnowledgeBase](#knowledgebase) · [ContextManager](#contextmanager) ·
+  [Memory 策略](#memory-策略) · [RuntimeHistory 与轨道](#runtimehistory-与轨道) ·
+  [ToolFilter](#toolfilter) · [PlanAndExecute](#planandexecute-执行策略)
+- **可选子系统**：[可观测性 / Telemetry](#可观测性--telemetry) ·
+  [MCP Client](#mcp-clientmodel-context-protocol) ·
+  [运行时动态工具管理](#运行时动态工具管理) ·
+  [Skill 系统](#skill-系统) · [Subagent 系统](#subagent-系统)
+- [浏览器使用](#浏览器使用) · [示例与 demo](#示例与-demo) · [License](#license)
 
 ## 安装
 
@@ -123,20 +138,110 @@ const agent = new Agent({ ..., validateStreamCompletion: false })
 
 主入口，支持两种模式：
 
+**基础**
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `provider` | (必需) | 供应商: openai, deepseek, qwen, moonshot, zhipu, x-grok |
 | `apiKey` | (必需) | API Key |
 | `model` | `'gpt-4'` | 模型名称 |
-| `tools` | `[]` | 工具列表 |
+| `url` | 按 `provider` 推导 | 自定义 API URL（OpenAI 兼容端点） |
+| `systemPrompt` | `'You are a helpful assistant.'` | 系统提示词 |
+| `tools` | `[]` | 工具列表（`defineTool` 产出的 Tool_Def） |
+| `temperature` | `0.6` | 温度（Agent 场景建议 0.5-0.7，兼顾工具调用稳定性与对话自然度） |
 | `maxRounds` | `300` | 最大 ReAct 轮次 |
-| `enableIntentRecognition` | `false` | 启用意图识别 |
+
+**Runtime 管线**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `enableIntentRecognition` | `false` | 启用意图识别（sidecar LLM 调用，见 [IntentRecognizer](#intentrecognizer)） |
 | `knowledgeBase` | `null` | 知识库实例 |
 | `tokenBudget` | `null` | token 预算配置 |
-| `memory` | `SlidingWindowMemory(40)` | 自定义记忆实例 |
 | `strategy` | `'react'` | 执行策略: `'react'` 或 `'plan_and_execute'` |
-| `planAndExecuteOpts` | `{}` | PlanAndExecute 策略配置（见下方） |
+| `planAndExecuteOpts` | `{}` | PlanAndExecute 策略配置（见 [下方](#planandexecute-配置参数)） |
 | `validateStreamCompletion` | `true` | 校验流式响应以非空 `finish_reason` 收尾；为 `false` 时容忍网关省略 `finish_reason` 的流（不再抛 `LlmStreamIncompleteError`）。`react` 与 `plan_and_execute` 两种策略下均生效 |
+
+**记忆**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `memory` | `SummarizingMemory({ threshold: 20, keepRecent: 5 })` | 自定义记忆实例。默认实例的 summarizer 走简单任务模型（见下）自动压缩上下文 |
+| `memoryOpts.threshold` | `20` | 触发摘要的消息数阈值（仅在未传 `memory` 时生效） |
+| `memoryOpts.keepRecent` | `5` | 摘要后保留的最近消息数（仅在未传 `memory` 时生效） |
+
+> 默认记忆是 `SummarizingMemory` 而不是滑动窗口 —— 长会话里较早的轮次会被压缩成摘要。
+> 任何读原始历史的宿主逻辑都要容忍"最初那条 user 消息已经不在了"。需要不压缩的行为请
+> 显式传 `memory: new SlidingWindowMemory(40)`。
+
+**简单任务模型（sidecar）**
+
+意图识别、难度判断、工具/skill 筛选、记忆摘要这些 sidecar 调用走这一组配置；任一字段
+未配置时回退到主模型的对应字段。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `simpleModel` | 回退到 `model` | 简单任务模型名 |
+| `simpleApiKey` | 回退到 `apiKey` | 简单任务模型的 API Key |
+| `simpleProvider` | 回退到 `provider` | 简单任务模型的供应商 |
+| `simpleUrl` | 回退到 `url` | 简单任务模型的自定义 URL |
+
+> `simpleModel` 同时是 subagent 系统 `fast` 别名的来源，见 [模型别名](#模型别名)。
+
+**扩展子系统**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `hooks` | `{}` | 生命周期钩子，见 [Hooks](#hooks) |
+| `skills` | `null` | Skill 系统配置，见 [Skill 系统](#skill-系统) |
+| `subagents` | `null` | Subagent 系统配置，见 [Subagent 系统](#subagent-系统) |
+| `enableDynamicMCP` | `false` | 注入 `load_mcp_server` 元工具，让模型在对话中自主挂载 MCP Server，见 [运行时动态工具管理](#运行时动态工具管理) |
+| `dynamicMCPOpts.connectTimeoutMs` | `30000` | 动态加载 MCP 的连接超时 |
+| `dynamicMCPOpts.closeTimeoutMs` | `5000` | 动态加载 MCP 的关闭超时 |
+
+`skills` / `subagents` 未配置时对应子系统完全不启用（零开销）：不注入任何工具、不发任何
+新事件、`agent.skills` / `agent.subagents` 恒为 `null`。
+
+### Hooks
+
+五个可选钩子，都在 `opts.hooks` 下。
+
+| 钩子 | 签名 | 说明 |
+|------|------|------|
+| `beforeToolCall` | `(name, args) => Promise<boolean\|void>` | 工具执行前。**返回 `false` 阻止本次执行** —— 这是宿主唯一的工具准入闸门 |
+| `afterToolCall` | `(name, args, result) => void` | 工具执行后，`result` 是工具返回的字符串 |
+| `onRoundStart` | `(round) => void` | 每轮 ReAct 循环开始 |
+| `onError` | `(error, context) => void` | 错误回调。ReAct 工具执行路径传 `{ round, toolName }`，动态 MCP 替换连接失败时传 `{ serverKey, phase }` |
+| `onAskUser` | `(question, meta) => Promise<string\|void>` | 用户交互回调；提供后自动注入 `ask_user` 工具，见 [提问路由](#提问路由) |
+
+抛异常不会打断 ReAct 循环：`onRoundStart` / `afterToolCall` / `onError` 走 `_safeHook`
+隔离（同步抛出被 catch 并 `console.warn`，返回的 promise 挂一个 no-op rejection handler）；
+`beforeToolCall` 在每个工具自己的 `try/catch` 里被 await，失败按工具执行失败归类；
+`onAskUser` 抛错则取消该次提问，等待方拿到一段说明而不是挂死。
+
+```js
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  tools: [readFile, shellExec],
+  hooks: {
+    beforeToolCall: async (name, args) => {
+      if (name === 'shell_exec' && /rm\s+-rf/.test(args.command)) return false  // 拦下
+    },
+    afterToolCall: (name, args, result) => log(`${name} → ${result.slice(0, 80)}`),
+    onRoundStart: (round) => log(`round ${round}`),
+    onError: (err, ctx) => log(`error in round ${ctx?.round}, tool ${ctx?.toolName}: ${err.message}`),
+  },
+})
+```
+
+> **`beforeToolCall` / `afterToolCall` / `onError` 会原样转发给每一个 subagent。**
+> 这是安全边界而不是便利：Skill 与 Subagent 两个系统都没有沙箱，宿主的工具准入策略必须
+> 能覆盖子 agent。详见两节各自的"安全"说明。
+>
+> 另外两个由 subagent 运行时改写而不是透传：`onAskUser` 被换成经 `AskRegistry` 登记
+> （这样提问才带得上归属、能被 `answerQuestion` 定向应答），`onRoundStart` 被用来在轮
+> 边界投递邮箱消息。
 
 ### IntentRecognizer
 
@@ -194,10 +299,11 @@ const result = cm.assemblePrompt({
 ```js
 import { SlidingWindowMemory, SummarizingMemory, TokenAwareMemory } from 'lll-web-agent'
 
-// 滑动窗口（默认）
+// 滑动窗口
 const sw = new SlidingWindowMemory(40)
 
-// 摘要记忆（超阈值时 LLM 压缩）
+// 摘要记忆（超阈值时 LLM 压缩）—— Agent 未传 memory 时的默认策略，
+// 默认实例的 summarizer 由 Agent 自动接到简单任务模型上
 const sm = new SummarizingMemory({
   threshold: 20,
   keepRecent: 5,
@@ -242,7 +348,7 @@ import { ToolFilter, BASE_TOOLS } from 'lll-web-agent'
 
 const filter = new ToolFilter()
 const filtered = filter.filter(intentResult, allTools)
-// BASE_TOOLS (keyword_search, read_file, write_file, shell_exec, project_tree) 始终保留
+// BASE_TOOLS (keyword_search, read_file, write_file, shell_exec, project_tree, ask_user) 始终保留
 ```
 
 ### PlanAndExecute 执行策略
@@ -495,6 +601,8 @@ const session = agent.getSessionMetrics()   // 所有 run 的累计 Session_Metr
 
 发射的事件类型：
 
+**核心（始终发射）**
+
 | 事件 | 触发时机 | 关键字段 |
 |------|----------|----------|
 | `session.start` | `chat()` / `stream()` 开始 | `traceId`, `spanId`, `parentSpanId: null`, `strategy`, `startedAt` |
@@ -503,6 +611,65 @@ const session = agent.getSessionMetrics()   // 所有 run 的累计 Session_Metr
 | `llm.call` | 每次 LLM HTTP 调用完成（含 sidecar） | OTel GenAI 字段 + `traceId` / `spanId` / `parentSpanId`, `ok`, `error?` |
 | `tool.call` | 每次工具执行结束 | `name`, `arguments`, `durationMs`, `bytes`, `ok`, `errorKind?` |
 | `warn` | 监听器抛异常时 | `source`, `eventType`, `error` |
+
+**Subagent（仅配置 `opts.subagents` 后发射）**
+
+| 事件 | 触发时机 | 关键字段 |
+|------|----------|----------|
+| `agent.spawn` | 子 agent 被创建 | `agentId`, `agentName`, `parentAgentId`, `type`, `description`, `depth`, `nodeId`, `model`, `isolation` |
+| `agent.state` | 子 agent 状态迁移 | `agentId`, `agentName`, `parentAgentId`, `from`, `to` |
+| `agent.retry` | 按 `failureKind` 自动重试前 | `agentId`, `agentName`, `parentAgentId`, `attempt`, `failureKind`, `delayMs` |
+| `agent.succeeded` | 子 agent 走到成功终态 | `agentId`, `agentName`, `parentAgentId`, `rounds`, `usage`, `wallClockMs`, `artifactKeys` |
+| `agent.failed` | 重试用尽或不可重试的失败 | `agentId`, `agentName`, `parentAgentId`, `failureKind`, `attempts`, `lastError` |
+| `agent.cancelled` | 经 `agent_cancel` / `closeSubagents()` 取消 | `agentId`, `agentName`, `parentAgentId`, `reason` |
+| `run.keep_alive.timeout` | keep-alive 等待超时（每轮对话最多一次） | `pendingAgents`, `pendingNodes`, `waitedMs` |
+
+**图编排（仅配置 `opts.subagents` 后发射）**
+
+| 事件 | 触发时机 | 关键字段 |
+|------|----------|----------|
+| `graph.opened` | 新建一张图 | `graphId`, `label` |
+| `graph.declared` | `agent_graph` 声明成功 | `accepted`（本批节点 id）, `total` |
+| `graph.closed` | `graph_close` | `graphId`, `label`, `reason`, `disposition`, `cancelled`, `stoppedAgents`, `outstanding`（后三者是**计数**） |
+| `graph.reopened` | 激活已关闭图导致重开 | `graphId`, `label`, `reason` |
+| `graph.evicted` | 超出 `retainClosedGraphs` 被 FIFO 淘汰 | `graphId`, `label`, `nodes` |
+| `graph.reactivated` | `graph_reactivate` 整批完成 | `graphId`, `nodeIds`, `reason`, `reopened` |
+| `graph.node.ready` | 节点依赖满足、待主 agent 确认 | `nodeId`, `upstream[]`（`nodeId` / `agentId` / `state`） |
+| `graph.node.auto_start` | `on_ready: 'auto'` 节点自行起飞 | `nodeId` |
+| `graph.node.started` | `graph_start` 启动了节点 | `nodeId`, `subagentType` |
+| `graph.node.settled` | 节点收到终态回报 | `nodeId`, `state`, `agentId` |
+| `graph.node.blocked` | 上游死亡导致阻塞 | `nodeId`, `reason`, `upstreamNodeId` |
+| `graph.node.skipped` | `on_upstream_failure: 'skip'` 生效 | `nodeId`, `reason`, `upstreamNodeId` |
+| `graph.node.cancelled` | 节点被取消 | `nodeId`, `reason`, `previousState`, `agentId` |
+| `graph.node.reactivated` | 单个节点被送回 `blocked` | `nodeId`, `previousState`, `generation` |
+| `graph.node.stale_report` | 丢弃了一份 generation 对不上的迟到回报 | `nodeId`, `state`, `agentId`, `generation`, `currentGeneration` |
+| `graph.callback.error` | 调度回调抛异常 | `nodeId`, `callback`, `error` |
+
+**产物轨 / 提问 / A2A（仅配置 `opts.subagents` 后发射）**
+
+| 事件 | 触发时机 | 关键字段 |
+|------|----------|----------|
+| `artifact.write` | `artifact_write` 登记成功 | `artifactId`, `key`, `sha`, `bytes`, `agentId`, `agentName` |
+| `artifact.conflict` | 同 key 跨 agent 冲突 | `key`, `owner`, `policy`（`'warn'` = 已写入并告警，`'deny'` = 已拒绝） |
+| `ask.user` | 有 agent 发起提问 | `askId`, `agentId`, `agentName`, `parentAgentId`, `nodeId`, `taskDescription`, `question`, `askedAt` |
+| `ask.answered` | 提问被应答 | `askId`, `agentId`, `agentName`, `via`（`'hook'` / `'api'`） |
+| `ask.cancelled` | 提问被取消或超时 | `askId`, `agentId`, `reason` |
+| `a2a.delivered` | `send_message` 投递成功 | `envelopeId`, `from`, `to`, `kind` |
+
+#### 归属：子 agent 的事件带 `agentId`，主 agent 的不带
+
+子 agent 内部的 `llm.call` / `tool.call` / `round.start` / `round.end` 原样转发到**父
+agent 的同一条总线**上，仅追加 `agentId` / `agentName` / `parentAgentId`。主 agent 自己
+发的事件没有这几个字段，所以归属规则只有一条：
+
+```js
+const owner = payload.agentId ?? 'main'
+```
+
+宿主注册一个监听器即可看到整棵树。但框架**刻意不缓存**"某个 agent 都调过哪些工具" ——
+`AgentHandle` 只记 `metrics` 聚合数。要在界面上画出每个 agent 的工具流水，宿主必须自己
+从事件流攒一份账（并自行设上限，一个跑飞的 agent 可能调几百次工具）。两个 demo 页面各
+示范了一遍，服务端那份在 `demo/lib/activity.js`（带单测）。
 
 监听器为空时不会改变 `chat()` / `stream()` 的返回值、`hooks.*` 的参数或任何现有
 事件的字段 — 纯加法，可直接升级。 `agent.reset()` 会把 `getLastRunMetrics()`
@@ -679,6 +846,45 @@ const mcp = await createMCPClient({
 })
 ```
 
+### 运行时动态工具管理
+
+构造之后仍可增删工具，下一轮 ReAct 立即可见。
+
+```js
+agent.addTools(readFile)                 // 单个 Tool_Def
+agent.addTools([toolA, toolB])           // 或数组（长度上限 1000）
+agent.removeTool('read_file')            // → boolean，未命中返回 false
+agent.getTools()                         // → Tool_Def[] 防御性快照，改它不影响注册表
+await agent.closeMCPClients()            // 关闭运行时动态连接的 MCP client
+```
+
+`addTools` 同名覆盖（保持原有位置），新名追加到末尾；任一元素缺少非空字符串 `name`
+时整体回滚并抛 `TypeError`。`removeTool` 移除后会对该名调用 `unregisterBaseTool()`，
+但 `INITIAL_BASE_TOOLS` 里的 6 个预置名例外 —— 它们的 base 身份始终保留。
+
+**让模型自主挂载 MCP Server**：构造时传 `enableDynamicMCP: true`，工具集里就多一个
+`load_mcp_server` 元工具，LLM 可在对话中自己决定加载哪个 MCP Server。
+
+```js
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  enableDynamicMCP: true,
+  dynamicMCPOpts: { connectTimeoutMs: 30000, closeTimeoutMs: 5000 },  // 均为默认值
+})
+```
+
+`load_mcp_server` 的入参是 `{ serverKey, transport, command?, args?, url?, headers?, name? }`。
+重复加载同一 `serverKey` 会先关掉旧连接、摘掉它贡献的工具，再挂新的。经这条路加入的工具
+自动 `registerBaseTool()`，因此开启意图识别时不会被 `ToolFilter` 裁掉。连接失败 / 列不出
+工具 / 超时都以一句可纠正的话软失败，不炸掉这一轮。
+
+> `load_mcp_server` 本身**不**是 base tool（它不在 `INITIAL_BASE_TOOLS` 里），只是一个
+> 普通工具。
+
+`agent.reset()` 与 `closeMCPClients()` 会统一关闭全部运行时连接，避免子进程泄漏。
+完整示例：`node examples/dynamic-mcp.js`（示例 1、2 不需要 LLM Key）。
+
 ### 浏览器端使用 MCP（通过服务端代理）
 
 浏览器没有 `child_process`，不能直接跑 `createMCPClient({ transport: 'stdio' })`；
@@ -831,7 +1037,8 @@ Review pull request #$1 with priority level $2, then assign to $3.
 frontmatter 的 `argument-hint` 会以 `- name: description (args: <hint>)` 的形式写进
 Level 1 清单 —— 这是模型唯一的参数形状线索，不声明它则 `args` 对自主调用不可见。
 正文里没有任何占位符却传了 `args` 时，参数会作为 `Arguments: <args>` 附加在正文末尾，
-不会被静默丢弃。展开逻辑也单独导出为 `applySkillArgs(body, args)` 便于宿主复用。
+不会被静默丢弃。展开逻辑在 `skills/model.js` 里单独实现为 `applySkillArgs(body, args)`
+（返回 `{ text, applied }`），但**目前没有从包入口导出** —— 详见下方"宿主侧 API"。
 
 Skill 数量超过 `filter.threshold`（默认 50）时，才会触发一次 sidecar LLM 调用
 （`SkillFilter`，复用 `simpleModel` 配置）按用户消息做 Top-K 相关性排序；该调用在
@@ -862,6 +1069,40 @@ GET {baseUrl}/skills/{name}/{relPath}
 
 `hash` 字段可选，用于 `agent.refreshSkills()` 增量刷新（未变化的 skill 直接复用缓存的
 `Skill_Def`，跳过重新拉取 + 解析）。
+
+### 宿主侧 API
+
+```js
+await agent.loadSkills()      // 急切全量加载；首次 chat()/stream() 前会自动调用
+await agent.refreshSkills()   // 重新加载（按 hash 跳过未变项），下一轮重建 Level 1 清单
+
+agent.skills.list()                          // → Skill_Def[]
+agent.skills.get('review-pr')                // → Skill_Def | null
+await agent.skills.readResource(name, rel)   // 读捆绑资源（拒绝 `..` / 绝对路径）
+```
+
+`loadSkills()` 的 promise 会被 memo；失败时清空 memo，下次调用重试而不是永久卡在失败态。
+一次成功的 `refreshSkills()` 也会"治愈"此前失败的 load。
+
+> **已知缺口：`applySkillArgs` 目前拿不到。** 它从 `src/skills/index.js` 导出，但
+> `src/index.js` 没有把它再导出一层，而 `package.json` 的 `exports` 只映射了 `"."`，
+> 所以 `import { applySkillArgs } from 'lll-web-agent'` 和子路径导入都取不到它 ——
+> 尽管文件本身随包发布。要复用参数展开逻辑，现在只能自己实现，或等这个导出补上。
+> 同样不可达的还有 `parseSkillMd` / `parseFrontmatter` / `resolveProvider`。
+
+### 跑起来看看
+
+```bash
+OPENAI_API_KEY=sk-xxx node examples/skills.js
+```
+
+用 `examples/skills/` 下的本地 skill 包演示 Level 1 清单 → `skill` 工具注入正文 →
+Level 3 资源读取的完整链路，包含 `disable-model-invocation: true` 的技能（不进清单、
+只能由代码 `agent.skills.get(name)` 取用）。
+
+demo 侧默认就开：只要 `demo/skills` 目录存在就启用，用 `SKILLS_DIR=/path/to/skills`
+换目录。服务端页（`/`）走 local provider，浏览器页（`/browser`）走 HTTP provider +
+`skill_resource`。细节见 `demo/README.md`。
 
 ### 安全
 
@@ -1281,6 +1522,41 @@ subagents: {
 
 `isolation: 'remote'` 未实现，软失败。
 
+### 宿主侧 API
+
+```js
+// 提问路由（见上）
+agent.pendingQuestions()
+agent.answerQuestion(askId, answer)
+agent.cancelQuestion(askId, reason)
+
+// 主动往主 agent 的上下文里塞一条消息 —— 在**下一个 ReAct 轮边界**写进 memory，
+// 不是立刻写。后台完成通知、图节点就绪通知、send_message 投递共用这一条队列。
+agent.enqueueMessage({ role: 'user', content: '用户补充：优先看 auth 模块' })
+
+// 产物轨
+await agent.getArtifacts()                        // 全部
+await agent.getArtifacts({ agentId: 'agt_...' })  // 按 agent 过滤
+
+// 图容器（惰性，起手无图）
+agent.subagents.graph          // 当前在用的那张图的 AgentGraph；没有活跃图时为 null
+agent.subagents.graphs         // Map<graphId, GraphEntry>，含已关闭的
+agent.subagents.newGraph({ label })
+agent.subagents.closeGraph(graphId, { reason, disposition })   // disposition 缺省 'keep_running'
+
+// keep-alive 观测
+agent.lastKeepAliveTimedOut    // boolean，本轮是否在还有活在飞时放弃了等待
+agent.lastStopReason           // null | 'completed' | 'max_rounds'（取值集合未扩张）
+
+// 退出前
+await agent.closeSubagents()
+```
+
+`enqueueMessage` 只接受 `role` 为 `'user'` / `'system'` 的消息；`'tool'` 与
+`'assistant'` 会被丢弃并 `console.warn` —— 一条没有 `tool_call_id` 的孤儿 tool 消息正是
+轮边界注入这套机制要防的破坏，而伪造一轮助手发言会让模型误以为自己说过那句话。非法入参
+被丢弃而不抛异常：调用方多是后台通知的 fire-and-forget 路径。
+
 ### 跑起来看看
 
 两个可以直接执行的集成入口：
@@ -1291,13 +1567,20 @@ subagents: {
 OPENAI_API_KEY=sk-xxx node examples/subagents.js
 
 # 浏览器：服务端 Agent 与浏览器端 Agent 两个页面都带 subagent 面板
+npm run build                             # /browser 页面依赖这个 bundle，只需跑一次
 OPENAI_API_KEY=sk-xxx node demo/server.js
 #   http://localhost:3000/        —— 服务端 Agent（提问走 /questions + /answer 命令式通道）
 #   http://localhost:3000/browser —— 浏览器端 Agent（提问走 hooks.onAskUser 弹层，Key 在页面里填）
+
+# 关掉 subagent 系统对比一下（元工具不注入、行为回到旧版本）
+SUBAGENTS=0 OPENAI_API_KEY=sk-xxx node demo/server.js
 ```
 
-面板会实时显示每个 subagent 的状态、每张图的节点与依赖边、以及产物轨；subagent 提问时
-页面会要求你回答，答案按 `askId` 定向送回提问的那一个 agent。细节见 `demo/README.md`。
+demo 默认注册两个演示用 Agent_Type：`explorer`（只读检索，拿 `read_note` + 基础设施
+floor）与 `interviewer`（只有 floor，含 `ask_user`）。面板会实时显示每个 subagent 的
+状态、每张图的节点与依赖边、以及产物轨；subagent 提问时页面会要求你回答，答案按
+`askId` 定向送回提问的那一个 agent。新增的 `/agents`、`/questions`、`/answer` 三个端点
+是宿主接法的参考实现。细节见 `demo/README.md`。
 
 ### 注意事项
 1. **后台 agent 跨 `chat()` 存活。** 它们不随 `chat()` 返回而终止，会一路跑到终态 ——
@@ -1347,6 +1630,41 @@ OPENAI_API_KEY=sk-xxx node demo/server.js
 12. **重跑与产物冲突策略的组合** —— 激活刻意不动产物轨（旧记录留着好做对比），因此在
     `artifacts.policy: 'deny'` 下，重跑写同一个 `key` 时若上一代记录属于另一个 agent，
     写入会被拒。这是既有语义，但"重跑 + deny"这个组合是新出现的。
+
+## 示例与 demo
+
+`examples/` 下每个文件都能直接跑。标注"免 Key"的部分不需要任何 API Key。
+
+| 文件 | 覆盖内容 | 运行 |
+|------|---------|------|
+| `basic.js` | 最小可用 Agent + 工具调用 | `OPENAI_API_KEY=sk-xxx node examples/basic.js` |
+| `deepseek.js` | 多供应商（DeepSeek） | `DEEPSEEK_API_KEY=sk-xxx node examples/deepseek.js` |
+| `memory.js` | 三种 Memory 策略 + RuntimeHistory 轨道投影 | `node examples/memory.js`（免 Key 跑示例 1~3） |
+| `plan-and-execute.js` | PlanAndExecute 三阶段策略 | `OPENAI_API_KEY=sk-xxx node examples/plan-and-execute.js`（示例 4 免 Key） |
+| `mcp.js` | MCP 基础流程 + BASE_TOOLS 运行时 CRUD | `node examples/mcp.js`（免 Key 跑 MCP 流程） |
+| `dynamic-mcp.js` | `addTools`/`removeTool`/`getTools` + `load_mcp_server` + 生命周期 | `node examples/dynamic-mcp.js`（免 Key 跑示例 1+2） |
+| `mcp-custom-transport.js` | `registerTransport` 注入非内置 transport | `node examples/mcp-custom-transport.js`（免 Key） |
+| `websearch-mcp.js` | SearXNG MCP 实时搜索 + 网页抓取 | `node examples/websearch-mcp.js`（需本地 SearXNG） |
+| `skills.js` | Skill 三级渐进披露 + `refreshSkills()` | `OPENAI_API_KEY=sk-xxx node examples/skills.js` |
+| `subagents.js` | **综合验收用例**：7 幕跑完工具 / Skill / MCP + subagent 四大能力，末尾断言 | `OPENAI_API_KEY=sk-xxx node examples/subagents.js` |
+
+> `examples/subagent-render.js` 是 `subagents.js` 用的终端渲染模块，不是独立入口。
+
+`demo/` 是浏览器侧的集成参考，同时提供服务端 Agent 与浏览器端 Agent 两个页面：
+
+```bash
+npm run build                             # /browser 页面依赖这个 bundle
+OPENAI_API_KEY=sk-xxx node demo/server.js
+#   http://localhost:3000/        —— 服务端 Agent（API Key 不出服务端）
+#   http://localhost:3000/browser —— 浏览器端 Agent（Key 在页面里填）
+```
+
+常用开关：`SUBAGENTS=0` 关掉 subagent 系统、`SKILLS_DIR=<dir>` 换技能目录、
+`DYNAMIC_MCP=1` 开 `load_mcp_server`、`MCP_SERVER_CMD` 系列挂 MCP Server、
+`PROVIDER` / `MODEL` / `LLM_URL` 换供应商。完整清单见 `demo/README.md`。
+
+> `demo/` 与 `examples/` 都打**真实供应商**，两边都没有 stub 模型 —— 它们是给接入方的
+> 集成参考，一个假 LLM 出现在里面会误导读者。
 
 ## License
 
