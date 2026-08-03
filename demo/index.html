@@ -710,11 +710,16 @@ function renderTelemetry(name, payload) {
   // 没有 tool_call 的轮次（例如开场白）会让主区域看起来完全没反应；这里拿
   // round.start 时垫一条消息，round.end 时原地替换成耗时，既不污染事件流
   // 面板，也能让用户看到"还在跑"。
-  if (name === 'round.start') {
+  // 只给**主 agent** 画轮次气泡。框架把每个 subagent 的 round.start/round.end 也转发到
+  // 同一条总线上（带 agentId），不挡住的话：三个 DAG 节点在跑时，聊天区会插进一串没有归属的
+  // 「⏳ Round 0 思考中…」，紧挨着主 agent 的「Round 5」—— 读起来像主 agent 重启了。
+  // subagent 的逐轮活动属于右侧面板，不属于对话流。
+  if (name === 'round.start' && !payload.agentId) {
     const r = addMsg('phase', `⏳ Round ${payload.round} 思考中…`)
     r.dataset.roundSpan = payload.spanId
   }
-  if (name === 'round.end') {
+  // round.end 同样要挡：否则某个 subagent 的 round.end 会去改写主 agent 的那条气泡。
+  if (name === 'round.end' && !payload.agentId) {
     const r = chat.querySelector(`[data-round-span="${payload.spanId}"]`)
     if (r) r.textContent = `✓ Round ${payload.round} 完成 (${formatDuration(payload.durationMs)})`
   }
@@ -722,7 +727,7 @@ function renderTelemetry(name, payload) {
   // subagent 的几件大事直接落到主聊天区。放在这里而不是只进事件流面板:
   // 「派了谁、谁回来了、谁在问你」是用户真正要跟的线索,而事件流是给排查用的。
   if (name === 'agent.spawn') {
-    addMsg('phase', `🤖 派出 subagent ${payload.name ?? payload.agentName ?? ''}（${payload.type ?? '?'}）`)
+    addMsg('phase', `🤖 派出 subagent ${payload.agentName ?? ''}（${payload.type ?? '?'}）`)
   }
   if (name === 'agent.succeeded') {
     addMsg('phase', `✅ subagent ${payload.agentName} 完成（rounds=${payload.rounds ?? '—'}）`)
