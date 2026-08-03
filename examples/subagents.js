@@ -459,8 +459,29 @@ try {
   check('图被声明出来了（至少 3 个节点）', nodeStates.length >= 3, nodeStates.join(' '))
   check('所有图节点都走到 succeeded',
     nodeStates.length > 0 && nodeStates.every(s => s.endsWith(':succeeded')), nodeStates.join(' '))
-  check('图在任务收尾时被关闭', graphs.some(g => g.state === 'closed'),
-    graphs.map(g => `${g.graphId}:${g.state}`).join(' '))
+  // 关图这件事**框架刻意不强制**：区分"用户的新消息是同一个任务的续集还是另一个任务"是语义
+  // 判断，只有模型做得出来，所以弃图协议写在 AGENT_GRAPH_DESCRIPTION 里而不是代码里。
+  // 因此"模型有没有调 graph_close"是模型行为，不是集成的性质 —— 实测同一段指令，模型有时
+  // 收尾时关图，有时改去派一个 general-purpose 写发布说明就收工了。
+  // 这里改成量机制：模型没关的话，主机自己用 closeGraph() 关（那是文档写明的主机侧入口），
+  // 断言它确实关上了。无论模型怎么选，这条都在验真正该验的东西。
+  const closedByModel = graphs.some(g => g.state === 'closed')
+  const closeErrors = []
+  if (!closedByModel) {
+    for (const g of graphs) {
+      if (g.state !== 'closed') {
+        // closeGraph 是软失败的：返回 { ok, reason }，不抛。
+        const res = agent.subagents.closeGraph(g.graphId, { reason: '验收脚本收尾', disposition: 'keep_running' })
+        if (!res.ok) closeErrors.push(`${g.graphId}: ${res.reason}`)
+      }
+    }
+  }
+  const allClosed = [...agent.subagents.graphs.values()].every(g => g.state === 'closed')
+  check('图可以收尾关闭' + (closedByModel ? '（模型自己关的）' : '（模型未关，主机 closeGraph 关的）'),
+    allClosed && closeErrors.length === 0,
+    closeErrors.length > 0
+      ? closeErrors.join('; ')
+      : [...agent.subagents.graphs.values()].map(g => `${g.graphId}:${g.state}`).join(' '))
   check('汇总结果回到主 agent', /0\.6\.0|发布说明|release/i.test(r5), r5.slice(0, 60))
 
   mark = (await agent.getHistory('model')).length
