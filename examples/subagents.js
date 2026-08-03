@@ -68,6 +68,34 @@ function startTicker() {
 // Ctrl-C 也要清活动区并恢复光标，否则终端留残影、光标可能一直是隐藏的。
 process.on('SIGINT', () => { render.done(); process.exit(130) })
 
+// SDK 内部在软失败路径上会直接 console.warn/console.error（agent.js /
+// intent-recognizer.js / memory.js / mcp/client.js / skills/*.js）。这些调用
+// 绕过了 render.log() 的 clearLive()——如果在 TTY 活动区正在重绘时触发
+// （第 4-7 幕，恰好是 subagent 在跑的时候），会把 spinner 画面弄花。框架本身
+// 不知道有活动区在画，所以由宿主（这个示例）兜底：运行期间把 console.warn/
+// error 转给 render.log，退出前在 render.done() 之前恢复（见 finally）。
+// _inShim 防止 render.log 本身抛错时递归回到这个 shim。
+const _origConsoleWarn = console.warn
+const _origConsoleError = console.error
+let _inShim = false
+function _shimmedLog(orig, args) {
+  if (_inShim) { orig.apply(console, args); return }
+  _inShim = true
+  try {
+    render.log(`    ⚠ ${args.map(String).join(' ')}`)
+  } catch {
+    orig.apply(console, args)
+  } finally {
+    _inShim = false
+  }
+}
+console.warn = (...args) => _shimmedLog(_origConsoleWarn, args)
+console.error = (...args) => _shimmedLog(_origConsoleError, args)
+function restoreConsole() {
+  console.warn = _origConsoleWarn
+  console.error = _origConsoleError
+}
+
 const PROVIDER = process.env.PROVIDER
   || (process.env.DEEPSEEK_API_KEY && !process.env.OPENAI_API_KEY ? 'deepseek' : 'openai')
 const MODEL = process.env.MODEL || (PROVIDER === 'deepseek' ? 'deepseek-chat' : 'gpt-4o')
@@ -259,26 +287,36 @@ agent.on('agent.spawn', (p) => {
 })
 agent.on('agent.succeeded', (p) => {
   seen.succeeded++
+  // 落终态前先把活动行的 label 抢救出来——DAG 节点的 live label 是 nodeId
+  // （比如 `modules`/`changes`），agentName 只是类型名（`explorer`），两个并行
+  // 节点结束时都叫 explorer 就分不清谁是谁了。live 里没有这一条（比如漏收了
+  // spawn 事件）才退回 agentName。
+  const label = live.get(p.agentId)?.label ?? p.agentName
   live.delete(p.agentId)
   const u = p.usage || {}
   render.settle(formatSettled({
-    label: p.agentName, rounds: p.rounds,
+    label, rounds: p.rounds,
     tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
     ms: p.wallClockMs, ok: true,
   }))
 })
 agent.on('agent.failed', (p) => {
   seen.failed++
+  const label = live.get(p.agentId)?.label ?? p.agentName
   live.delete(p.agentId)
   // 注意：`agent.failed` 的 payload 与 `agent.succeeded` **不同构** —— 它只有
   // { agentId, agentName, parentAgentId, failureKind, attempts, lastError }，
   // 没有 rounds / usage / wallClockMs。照着成功那条抄会渲染出一串 undefined。
   // 另外这里的 `attempts` 是**数字**（第几次尝试），而 `toStatus().attempts` 是
   // 数组，名字撞了但类型不同，别混用。
-  render.settle(`✗ ${p.agentName}  ${p.failureKind ?? '失败'}（尝试 ${p.attempts} 次）`)
+  render.settle(`✗ ${label}  ${p.failureKind ?? '失败'}（尝试 ${p.attempts} 次）`)
   if (p.lastError) render.log(`    · ${String(p.lastError).slice(0, 120)}`)
 })
-agent.on('agent.cancelled', (p) => { live.delete(p.agentId) })
+agent.on('agent.cancelled', (p) => {
+  const label = live.get(p.agentId)?.label ?? p.agentName
+  live.delete(p.agentId)
+  render.settle(`✗ ${label}  已取消`)
+})
 agent.on('artifact.write', (p) => {
   seen.artifacts++
   render.log(`    · 产物 ${p.key} sha:${p.sha} by ${p.agentName}`)
@@ -401,13 +439,17 @@ try {
     + `tokens(in/out)=${session.usage.input_tokens}/${session.usage.output_tokens}`)
   render.log(`事件计数: ${JSON.stringify(seen)}`)
 } finally {
-  if (ticker) clearInterval(ticker)
-  render.done()
   clearInterval(answerPoller)
-  // 后台 agent 会跨 chat() 存活；不收尾进程不会自然退出。
+  // 后台 agent 会跨 chat() 存活；不收尾进程不会自然退出。这一步可能还会触发
+  // agent.succeeded/failed/cancelled（比如 closeSubagents 取消了一个还在跑的
+  // 节点），所以 render.done() 必须等它跑完才能调用，否则那条 settle 会被
+  // done() 之后的 finished 门禁吞掉。
   await agent.closeSubagents()
   await agent.closeMCPClients?.()
   if (mcpClient) await mcpClient.close().catch(() => {})
+  if (ticker) clearInterval(ticker)
+  restoreConsole()
+  render.done()
 }
 
 // ---------------------------------------------------------------------------
