@@ -63,6 +63,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .telemetry .events-head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;padding:6px 10px;border-bottom:1px solid #e0e0e0;display:flex;align-items:center;justify-content:space-between}
 .telemetry .events-head button{background:transparent;border:1px solid #ddd;color:#666;padding:1px 8px;border-radius:4px;cursor:pointer;font-size:10px}
 .telemetry .events{flex:1;overflow-y:auto;padding:6px 10px;display:flex;flex-direction:column;gap:3px}
+.telemetry .subagents{border-bottom:1px solid #e0e0e0;padding:8px 10px;max-height:30vh;min-height:90px;overflow-y:auto;flex:none}
+.telemetry .subagents .head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between}
+.telemetry .sa-empty{color:#999;font-size:11px}
+.sa-row{display:flex;align-items:center;gap:6px;font-family:'SF Mono',Menlo,monospace;font-size:11px;padding:3px 0;border-bottom:1px dashed #eee}
+.sa-row .sa-name{font-weight:600;color:#1a1a2e}
+.sa-row .sa-meta{color:#888}
+.sa-state{padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;background:#eee;color:#555}
+.sa-state.running,.sa-state.queued{background:#fff4d6;color:#8a5a00}
+.sa-state.succeeded{background:#e3f7e8;color:#1a7f37}
+.sa-state.failed,.sa-state.cancelled{background:#fde8e8;color:#b42318}
+.sa-state.waiting_input,.sa-state.awaiting_confirm{background:#e6f0ff;color:#1f4fd8}
+.sa-state.blocked{background:#f0f0f0;color:#777}
+.sa-graph{margin-top:6px}
+.sa-graph .sa-graph-head{font-size:11px;color:#444;font-weight:600;margin:6px 0 2px}
+.sa-node{padding-left:10px}
+.sa-head{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:4px 0}
+.sa-head .sa-caret{color:#999;width:10px;display:inline-block}
+.sa-head .sa-cost{margin-left:auto;color:#888;font-size:10px;font-family:'SF Mono',Menlo,monospace}
+.sa-tools{padding:2px 0 4px 20px}
+.sa-tool{display:flex;gap:6px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#555;padding:1px 0}
+.sa-tool .sa-tool-ms{margin-left:auto;color:#aaa}
+.sa-tool.bad{color:#b42318}
+.sa-thinking{color:#8a5a00;font-style:italic}
+.sa-truncated{color:#aaa;font-size:10px;padding-left:20px}
+.sa-fail{color:#b42318;font-size:10px}
 .telemetry .event{padding:5px 7px;border-radius:5px;background:#fff;border:1px solid #e8e8e8;font-family:'SF Mono',Menlo,monospace;font-size:11px;line-height:1.3;display:flex;flex-direction:column;gap:2px}
 .telemetry .event .evt-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .telemetry .event .evt-name{font-weight:600;padding:1px 5px;border-radius:3px;font-size:10px}
@@ -113,6 +138,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <span class="dot"></span>
     <span id="mcpBadgeText">MCP 未连接</span>
   </span>
+  <span id="skillBadge" class="mcp-badge off" title="Skill 状态" style="cursor:help">
+    <span class="dot"></span>
+    <span id="skillBadgeText">Skill 未启用</span>
+  </span>
   <label class="telemetry-toggle">
     <input type="checkbox" id="showTelemetry" checked onchange="toggleTelemetry(this.checked)">
     📡 遥测面板
@@ -135,6 +164,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </label>
   <label>API Key
     <input type="text" id="apikey" placeholder="sk-xxx" autocomplete="off">
+  </label>
+  <label>自定义 API URL
+    <input type="text" id="apiUrl" placeholder="留空用供应商默认地址" autocomplete="off">
   </label>
   <label>执行策略
     <select id="strategy">
@@ -165,6 +197,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </label>
   <label class="check">
     <input type="checkbox" id="enableAskUser" checked> 注入 ask_user 工具（允许 LLM 向你发问）
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableSkills" checked> 启用技能系统（从 /skill-source 经 HTTP provider 加载 demo/skills）
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableSubagents" checked> 启用 Subagent（注入 agent / agent_graph 等 12 个元工具）
   </label>
 
   <button onclick="initAgent()">连接</button>
@@ -217,6 +255,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         </div>
       </div>
     </div>
+    <div class="subagents" id="subagentPanel" style="display:none">
+      <div class="head">
+        <span>🤖 Subagents</span>
+        <span id="saSummary">—</span>
+      </div>
+      <div id="saBody"><div class="sa-empty">还没派出 subagent。试试「派一个 agent 去查北京天气」。</div></div>
+    </div>
     <div class="events-head">
       <span>事件流</span>
       <button onclick="clearEvents()">清空</button>
@@ -239,12 +284,120 @@ var defineTool = LllWebAgent.defineTool
 var registerBaseTool = LllWebAgent.registerBaseTool
 var unregisterBaseTool = LllWebAgent.unregisterBaseTool
 var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
+
+/**
+ * 活动账本 —— 与 demo/lib/activity.js **逻辑等价的内联副本**。
+ * 这个页面是刻意的单文件 + IIFE bundle，没有模块加载器，import 不进来。
+ * 改这里记得同步那一份（那份有单测）。
+ */
+function createActivityLedger(maxTools, maxAgents) {
+  maxTools = maxTools || 20
+  maxAgents = maxAgents || 50
+  var byAgent = new Map()
+  // 已知处于终态（succeeded/failed/cancelled）的 agentId 集合。
+  var terminalIds = new Set()
+  function entry(id) {
+    var e = byAgent.get(id)
+    if (!e) {
+      e = { rounds: 0, tools: [], truncated: 0 }
+      byAgent.set(id, e)
+      // Map 保持插入顺序，从头扫起找到的第一个终态 key 就是最旧的终态条目。
+      // 非终态条目永不淘汰，所以找不到终态条目时就不删——账本允许暂时超过上限。
+      while (byAgent.size > maxAgents) {
+        var oldestTerminal = null
+        var keys = byAgent.keys()
+        var next = keys.next()
+        while (!next.done) {
+          var key = next.value
+          if (key !== id && terminalIds.has(key)) { oldestTerminal = key; break }
+          next = keys.next()
+        }
+        if (oldestTerminal == null) break
+        byAgent.delete(oldestTerminal)
+        terminalIds.delete(oldestTerminal)
+      }
+    }
+    return e
+  }
+  return {
+    onRoundStart: function(p) {
+      var e = entry((p && p.agentId) || 'main')
+      var n = p && typeof p.round === 'number' ? p.round + 1 : e.rounds
+      if (n > e.rounds) e.rounds = n
+    },
+    onToolCall: function(p) {
+      p = p || {}
+      var e = entry(p.agentId || 'main')
+      e.tools.push({
+        name: String(p.name || '?'),
+        ok: typeof p.ok === 'boolean' ? p.ok : null,
+        ms: typeof p.durationMs === 'number' ? Math.round(p.durationMs) : null,
+      })
+      while (e.tools.length > maxTools) { e.tools.shift(); e.truncated += 1 }
+    },
+    snapshot: function(id) {
+      var e = byAgent.get(id)
+      return e ? { rounds: e.rounds, tools: e.tools.slice(), truncated: e.truncated } : null
+    },
+    /**
+     * 把 agentId 标记为终态（succeeded/failed/cancelled），使其成为下次淘汰时的候选。
+     * 未知 agentId 是无害的 no-op —— 不会替它创建一条空条目。
+     */
+    markTerminal: function(id) {
+      if (!byAgent.has(id)) return
+      terminalIds.add(id)
+    },
+    clear: function() { byAgent.clear(); terminalIds.clear() },
+  }
+}
+
+var activityLedger = createActivityLedger()
+
+/**
+ * 浏览器端的 Agent_Type。`tools` 只列任务工具 —— artifact_write / artifact_list /
+ * history_search / history_get / send_message / ask_user 是框架保证带上的 floor。
+ *
+ * 浏览器里没有 git worktree、没有 shell_exec,跨 agent 的护栏只有产物轨,
+ * 所以这里的类型都刻意做成"只读 + 登记产物"的窄类型。
+ */
+var BROWSER_SUBAGENT_TYPES = [
+  {
+    name: 'researcher',
+    description: '查一件具体的事（天气 / 单位换算 / 计算）并把结论带回来,不改页面。',
+    systemPrompt: '你是一个只读的调查子 agent。用给你的工具查清楚一件事,'
+      + '用 artifact_write 把结论登记到产物轨,最后一条消息就是你交回去的报告：先给结论,再给依据。',
+    tools: ['get_weather', 'convert_unit', 'calculate', 'get_current_time'],
+    maxRounds: 8,
+  },
+  {
+    name: 'scribe',
+    description: '把给定内容写进记事本,并登记成产物。',
+    systemPrompt: '你负责把编排者交代的内容用 notepad 记下来,'
+      + '再用 artifact_write 登记一条产物,最后回报你记了什么。',
+    tools: ['notepad', 'process_text'],
+    maxRounds: 6,
+  },
+  {
+    name: 'interviewer',
+    description: '需要用户拍板时,替编排者去问一个具体问题。',
+    systemPrompt: '你负责替编排者向用户问一个具体问题：'
+      + '用 ask_user 提问,拿到回答后把回答原样带回去,不要自行猜测。',
+    // 任务工具一个都不要:`ask_user` 由 floor 保证带上 —— 配了 subagents 之后
+    // 主 agent 一定有这个工具(不取决于上面那个勾选框,那个框控制的是**谁来答**:
+    // 勾上才装 hooks.onAskUser 弹层,不勾就只能等 ask.timeoutMs 超时)。
+    tools: [],
+    maxRounds: 6,
+  },
+]
+
 var agent = null
 var sending = false
 var chat = document.getElementById('chat')
 var input = document.getElementById('input')
 var sendBtn = document.getElementById('send')
 var registeredMcpToolNames = new Set()
+// 技能系统是否可用 —— 由 /skills-status 决定(demo server 找到 demo/skills 目录才为 true)。
+var skillsAvailable = false
 
 // 浏览器端可用的工具
 
@@ -704,7 +857,12 @@ async function refreshBrowserMcpTools() {
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
     var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
-    agent.tools = baseTools.concat(mcpTools)
+    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user):它们不在
+    // baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们冲掉,
+    // 导致挂载/卸载 MCP 后技能系统或 ask_user 失效。按名字从现有 tools 里捞回来。
+    var META_TOOL_NAMES = { skill: 1, skill_resource: 1, ask_user: 1 }
+    var preserved = (agent.tools || []).filter(function(t) { return META_TOOL_NAMES[t.name] })
+    agent.tools = baseTools.concat(mcpTools).concat(preserved)
   }
 }
 
@@ -715,20 +873,67 @@ if (location.protocol === 'file:') {
   statusEl.className = 'mcp-panel-status err'
   statusEl.textContent = '⚠️ 当前是 file:// 模式,MCP 代理不可用。请用 demo server 启动后访问 http://localhost:3000/browser'
   document.getElementById('mcpConnectBtn').disabled = true
+  // 技能系统同样依赖 demo server 的 /skill-source,file:// 下不可用。
+  renderSkillBadge({ enabled: false, fileMode: true })
 } else {
   syncMcpStatus({ silent: true })
+  syncSkillsStatus()
+}
+
+/**
+ * 拉取 /skills-status,设置全局 skillsAvailable 并渲染技能徽章。
+ * 技能清单(Level 1)由 SDK 在每轮自动注入系统提示末尾;这里只负责让 UI 知道
+ * 技能是否可用,以及在 initAgent() 时决定是否配置 HTTP SkillProvider。
+ */
+async function syncSkillsStatus() {
+  try {
+    var res = await fetch('/skills-status')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    var s = await res.json()
+    skillsAvailable = !!(s.enabled && s.count > 0)
+    renderSkillBadge(s)
+  } catch (err) {
+    // demo server 没开 /skills-status(旧版本)或网络问题 —— 静默降级。
+    console.warn('[skills] 无法获取技能状态:', err.message)
+    skillsAvailable = false
+    renderSkillBadge({ enabled: false })
+  }
+}
+
+function renderSkillBadge(s) {
+  var badge = document.getElementById('skillBadge')
+  var text = document.getElementById('skillBadgeText')
+  if (s && s.enabled && s.count > 0) {
+    badge.className = 'mcp-badge on'
+    text.textContent = 'Skill: ' + s.count + ' 个可用'
+    var lines = (s.skills || []).map(function(sk) {
+      var files = sk.files && sk.files.length ? ' (+' + sk.files.length + ' 文件)' : ''
+      return '  • ' + sk.name + files + ': ' + sk.description
+    })
+    badge.title = '浏览器端经 HTTP provider(/skill-source)加载的技能:\n' + lines.join('\n') +
+      '\n\n勾选"启用技能系统"并点"连接"后,说出匹配请求即可触发。'
+  } else {
+    badge.className = 'mcp-badge off'
+    text.textContent = 'Skill 未启用'
+    badge.title = s && s.fileMode
+      ? 'file:// 模式下技能系统不可用(需要 demo server 提供 /skill-source)。请用 demo server 启动后访问 http://localhost:3000/browser'
+      : '未找到 demo/skills 目录或 demo server 未启用技能。\n\n换目录: SKILLS_DIR=/path/to/skills node demo/server.js'
+  }
 }
 
 function initAgent() {
   var provider = document.getElementById('provider').value
   var model = document.getElementById('model').value
   var apiKey = document.getElementById('apikey').value.trim()
+  var apiUrl = document.getElementById('apiUrl').value.trim()
   var strategy = document.getElementById('strategy').value
   var simpleProvider = document.getElementById('simpleProvider').value
   var simpleModel = document.getElementById('simpleModel').value.trim()
   var simpleApiKey = document.getElementById('simpleApiKey').value.trim()
   var enableIntent = document.getElementById('enableIntent').checked
   var enableAskUser = document.getElementById('enableAskUser').checked
+  var enableSkills = document.getElementById('enableSkills').checked
+  var enableSubagents = document.getElementById('enableSubagents').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
   var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
@@ -739,11 +944,16 @@ function initAgent() {
     ? ' 你还可以使用服务端挂载的 MCP 工具。当前 MCP 工具摘要: ' + mcpTools.map(summarizeBrowserMcpTool).join('；') + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在。'
     : ''
 
+  // 技能提示 —— 技能清单(Level 1)由 SDK 自动注入系统提示末尾,这里只补一句引导。
+  var skillNote = (enableSkills && skillsAvailable)
+    ? ' 系统提示末尾列出了可用技能;当用户请求与某个技能匹配时,先调用 skill 工具加载完整指令再作答。技能附带的参考文件用 skill_resource 工具读取。'
+    : ''
+
   var agentOpts = {
     provider: provider,
     apiKey: apiKey,
     model: model,
-    systemPrompt: '你是一个功能丰富的助手，拥有多种工具能力：查询时间、数学计算、天气查询、单位换算、随机生成、文本处理、页面操作、记事本、弹窗提示、倒计时提醒。当用户请求信息不充分时（例如没说清城市、金额、单位等），优先使用 ask_user 工具向用户追问，而不是自行猜测。请用中文回答，善用工具完成用户请求。' + mcpNote,
+    systemPrompt: '你是一个功能丰富的助手，拥有多种工具能力：查询时间、数学计算、天气查询、单位换算、随机生成、文本处理、页面操作、记事本、弹窗提示、倒计时提醒。当用户请求信息不充分时（例如没说清城市、金额、单位等），优先使用 ask_user 工具向用户追问，而不是自行猜测。请用中文回答，善用工具完成用户请求。' + mcpNote + skillNote,
     tools: allTools,
     strategy: strategy,
     enableIntentRecognition: enableIntent,
@@ -752,27 +962,78 @@ function initAgent() {
     // 重试空间；超出上限框架会写入 `[max rounds exceeded]` 体面退出。
     maxRounds: 12,
   }
+  // 技能系统 —— 浏览器端用 HTTP provider 从 demo server 的 /skill-source 拉技能。
+  // runtime: 'browser' 会改注入 skill_resource 工具(Level 3 走 provider.readResource,
+  // 即再发一次 GET /skill-source/skills/<name>/<path>),而不是 Node 的 read_file。
+  if (enableSkills && skillsAvailable) {
+    agentOpts.skills = {
+      runtime: 'browser',
+      providers: [{ type: 'http', baseUrl: location.origin + '/skill-source' }],
+    }
+  }
   if (simpleProvider) agentOpts.simpleProvider = simpleProvider
   if (simpleModel) agentOpts.simpleModel = simpleModel
   if (simpleApiKey) agentOpts.simpleApiKey = simpleApiKey
+  if (apiUrl) agentOpts.url = apiUrl
   if (enableAskUser) {
     agentOpts.hooks = {
-      onAskUser: function(question) {
-        addMsg('phase', '❓ ask_user: ' + question)
-        return askUserDialog(question)
+      onAskUser: function(question, meta) {
+        // 签名扩展成 (question, meta) 之后,提问可能来自某个 subagent ——
+        // 不把 meta.agentName 显示出来的话,用户不知道是谁在问、为什么问。
+        var who = meta && meta.agentName && meta.agentName !== 'main'
+          ? meta.agentName + '（' + (meta.taskDescription || '') + '）'
+          : ''
+        addMsg('phase', '❓ ask_user' + (who ? ' from ' + who : '') + ': ' + question)
+        return askUserDialog(who ? '[' + who + '] ' + question : question)
       },
     }
   }
+  if (enableSubagents) {
+    // 浏览器里没有 git worktree、没有 shell_exec —— 跨 agent 的护栏只有产物轨,
+    // 所以这里显式把它调成 deny:同一个 key 被另一个 agent 覆盖时直接拒绝。
+    agentOpts.subagents = {
+      types: BROWSER_SUBAGENT_TYPES,
+      maxConcurrent: 2,
+      maxDepth: 2,
+      artifacts: { policy: 'deny' },
+      keepAlive: true,
+      keepAliveTimeoutMs: 60000,
+      // 必须设。`ask.timeoutMs` 默认 null = 永不超时,而这个页面**只有** hook 一条
+      // 应答通道:上面那个"注入 ask_user 工具"没勾时 hook 不装,一个 interviewer
+      // 子 agent 的提问就永远没人答 —— 它会一直占着并发槽挂到页面关掉。
+      ask: { timeoutMs: 120000 },
+    }
+    // subagent 一轮对话里要「派活 → 等 → 收结果 → 收尾」,12 轮容易不够。
+    agentOpts.maxRounds = 20
+  }
 
   agent = new Agent(agentOpts)
+
+  // 重连即新会话，账本跟着清；手动展开/折叠的记忆也一并清空（新会话的
+  // agentId 全新分配，留着旧的没有意义）。
+  activityLedger.clear()
+  saManual.clear()
+  agent.on('round.start', function(p) { activityLedger.onRoundStart(p) })
+  agent.on('tool.call', function(p) { activityLedger.onToolCall(p) })
 
   // 订阅遥测事件，实时渲染到右侧面板。
   // 说明：监听器为空时 Agent 也会维护 getLastRunMetrics / getSessionMetrics，
   // 这里显式订阅以做 UI 可视化。失败时通过 console.warn 暴露。
   var telemetryTypes = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call']
+  if (enableSubagents) {
+    telemetryTypes = telemetryTypes.concat([
+      'agent.spawn', 'agent.state', 'agent.succeeded', 'agent.failed', 'agent.cancelled',
+      'graph.declared', 'graph.node.ready', 'graph.node.settled', 'graph.closed',
+      'artifact.write', 'artifact.conflict', 'ask.user',
+    ])
+  }
   telemetryTypes.forEach(function(t) {
     agent.on(t, function(payload) { renderTelemetry(t, payload) })
   })
+  if (enableSubagents) {
+    // 后台 agent 的进展不走 delta 通道 —— 不定时刷新的话面板会停在派活那一刻。
+    startBrowserSubagentPolling()
+  }
   // 'warn' 也接入一下，便于发现监听器 bug
   agent.on('warn', function(w) { console.warn('[telemetry warn]', w) })
 
@@ -792,6 +1053,9 @@ function initAgent() {
   addMsg('assistant', '已连接 ' + provider + ' (' + model + ')。' + tip + '\n\n我拥有 10 种工具能力，试试：\n  \u2022 "现在几点了" — 时间查询\n  \u2022 "算一下 2^10" — 数学计算\n  \u2022 "北京天气怎么样" — 天气查询\n  \u2022 "把 100 公里换算成英里" — 单位换算\n  \u2022 "帮我生成一个强密码" — 随机生成\n  \u2022 "统计一下这段话的字数：Hello World" — 文本处理\n  \u2022 "把页面切换成暗色模式" — 页面操作\n  \u2022 "帮我记一条笔记：明天开会" — 记事本\n  \u2022 "用弹窗告诉我一个笑话" — 弹窗提示\n  \u2022 "30秒后提醒我喝水" — 倒计时提醒\n\n\uD83E\uDDED 试试模糊请求触发意图识别：\n  \u2022 "帮我做点啥" — AMBIGUOUS 意图\n  \u2022 "查天气" — 不说城市，会触发 ask_user 追问\n  \u2022 "先算一下 100×50 的面积，再用这个值生成一个等长密码，最后把结果存为笔记" — COMPLEX 意图\n\n\uD83D\uDCE1 右侧遥测面板会实时展示：\n  \u2022 每次 LLM 调用的 tokens / 耗时 / operation.name（agent.intent / agent.chat / plan.* 等）\n  \u2022 每次工具执行的结果字节数 / 错误分类\n  \u2022 本次运行与会话累计的聚合指标\n\n\uD83D\uDCA1 切换策略或模型配置后点击"连接"即可生效。')
   // 新连接 → 重置遥测面板
   resetTelemetryUI_browser()
+  if (enableSkills && skillsAvailable) {
+    addMsg('phase', '🧩 技能系统已启用(HTTP provider ← /skill-source)。说出匹配请求即可触发:\n  • "写一首关于秋天的七言绝句" — ancient-poet(会用 skill_resource 读格律参考)\n  • "帮我算一下 12*8 和 (5+3)^2，生成一份计算报告" — math-report')
+  }
   input.focus()
 }
 
@@ -968,6 +1232,164 @@ function tag(text, extraCls) {
 
 // 交互式 ask_user：LLM 调用 ask_user 工具时，弹出对话框由真人回答。
 // 这里做成 Promise，resolve 后把用户回答回传给 Agent。
+// ==== Subagent 面板（浏览器端）====
+//
+// 服务端 demo 靠轮询 /agents;这里 Agent 就在页面里,直接读它的 runtime 快照即可。
+// 读的都是 toStatus() / graph.get() 这类不含函数、不含 apiKey 的快照。
+
+var saTimer = null
+
+function startBrowserSubagentPolling() {
+  document.getElementById('subagentPanel').style.display = ''
+  if (saTimer) clearInterval(saTimer)
+  renderBrowserSubagents()
+  saTimer = setInterval(renderBrowserSubagents, 1000)
+}
+
+function saEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+  })
+}
+
+// 用户手动切换过的 agentId。1s 一次的轮询会重绘整块 DOM —— 不记住手动选择，
+// 用户刚展开的卡片下一秒就被默认策略折回去了。
+var saManual = new Map()   // agentId -> boolean(expanded)
+
+function saToggle(agentId, defaultExpanded) {
+  var cur = saManual.has(agentId) ? saManual.get(agentId) : defaultExpanded
+  saManual.set(agentId, !cur)
+  renderBrowserSubagents()
+}
+
+function saExpanded(a) {
+  var terminal = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) !== -1
+  return saManual.has(a.agentId) ? saManual.get(a.agentId) : !terminal
+}
+
+/** 耗时 · token · 步数。运行中 wallClockMs 还没落定，用 startedAt 现算。 */
+function saCost(a) {
+  var m = a.metrics || {}
+  var running = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) === -1
+  // Math.max(0, …)：这里的时钟是本机的，理论上不会算出负数，但和 demo/index.html
+  // 的 saCost（浏览器时钟 vs 服务端 startedAt，两台机器真的会偏移）保持实现一致。
+  var ms = running && a.startedAt ? Math.max(0, Date.now() - a.startedAt) : m.wallClockMs
+  var u = m.usage || {}
+  var tok = (u.input_tokens || 0) + (u.output_tokens || 0)
+  var parts = []
+  if (ms) parts.push(formatDuration(ms))
+  if (tok) parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + 'k tok' : tok + ' tok')
+  if (m.rounds) parts.push(m.rounds + ' 步')
+  return parts.length ? parts.join(' · ') : '—'
+}
+
+/** failureKind 不在 toStatus() 顶层，在 attempts[] 里逐次记录，取最后一条。 */
+function saFailure(a) {
+  var attempts = a.attempts || []
+  var last = attempts.length ? attempts[attempts.length - 1] : null
+  return last && last.failureKind ? last.failureKind : null
+}
+
+async function renderBrowserSubagents() {
+  var panel = document.getElementById('subagentPanel')
+  var body = document.getElementById('saBody')
+  var summary = document.getElementById('saSummary')
+  if (!agent || !agent.subagents) { panel.style.display = 'none'; return }
+  panel.style.display = ''
+
+  var rt = agent.subagents
+  var agents = rt.registry.list({ includeFinished: true }).map(function(h) { return h.toStatus() })
+  var running = agents.filter(function(a) {
+    return a.state === 'running' || a.state === 'queued' || a.state === 'waiting_input'
+  }).length
+  summary.textContent = running + ' 在跑 / ' + agents.length + ' 总计'
+
+  var artifacts = []
+  try { artifacts = await agent.getArtifacts() } catch (e) { artifacts = [] }
+
+  var graphs = []
+  rt.graphs.forEach(function(entry) {
+    var nodes = []
+    entry.graph.nodes.forEach(function(_v, id) { nodes.push(entry.graph.get(id)) })
+    graphs.push({ entry: entry, nodes: nodes })
+  })
+
+  if (agents.length === 0 && graphs.length === 0) {
+    body.innerHTML = '<div class="sa-empty">还没派出 subagent。试试「派一个 agent 去查北京天气」。</div>'
+    return
+  }
+
+  var parts = []
+  agents.forEach(function(a) {
+    var expanded = saExpanded(a)
+    var terminal = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) !== -1
+    var meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.attempt > 1 ? 'attempt ' + a.attempt : null]
+      .filter(Boolean).join(' · ')
+    var fail = saFailure(a)
+    parts.push(
+      // 不用内联 onclick：agentId 拼进 '单引号 JS 字符串' 又嵌在双引号 HTML 属性里，
+      // saEsc() 只转义 & < > "，转义不了单引号。改成 data-* + 渲染后绑定监听器，
+      // 直接不进入那个嵌套语境。
+      '<div class="sa-head" data-agent-id="' + saEsc(a.agentId) + '" data-default-expanded="' + (terminal ? '0' : '1') + '">'
+      + '<span class="sa-caret">' + (expanded ? '▼' : '▶') + '</span>'
+      + '<span class="sa-state ' + saEsc(a.state) + '">' + saEsc(a.state) + '</span>'
+      + '<span class="sa-name">' + saEsc(a.name) + '</span>'
+      + '<span class="sa-meta">' + saEsc(meta) + '</span>'
+      + (fail ? '<span class="sa-fail">' + saEsc(fail) + '</span>' : '')
+      + '<span class="sa-cost">' + saEsc(saCost(a)) + '</span></div>'
+    )
+    if (!expanded) return
+    var act = activityLedger.snapshot(a.agentId)
+    parts.push('<div class="sa-tools">')
+    if (act && act.truncated > 0) {
+      parts.push('<div class="sa-truncated">…前 ' + act.truncated + ' 条已省略</div>')
+    }
+    var tools = act ? act.tools : []
+    tools.forEach(function(t) {
+      var mark = t.ok === false ? '✗' : '✓'
+      parts.push('<div class="sa-tool' + (t.ok === false ? ' bad' : '') + '">'
+        + '<span>' + mark + ' ' + saEsc(t.name) + '</span>'
+        + '<span class="sa-tool-ms">' + (t.ms == null ? '' : t.ms + 'ms') + '</span></div>')
+    })
+    // tool.call 是执行完才发的，所以没有"进行中"的工具行。运行中而流水没长出新条目
+    // 时，agent 大多数情况下是在等 LLM —— 用一行"思考中"表达，不伪造一条工具行。
+    // waiting_input 是例外：那不是模型在想，是模型已经问完、卡在等人类回答。
+    if (a.state === 'waiting_input') {
+      parts.push('<div class="sa-tool sa-thinking">⏸ 等你回答…</div>')
+    } else if (!terminal) {
+      parts.push('<div class="sa-tool sa-thinking">● 思考中…</div>')
+    }
+    parts.push('</div>')
+  })
+  graphs.forEach(function(g) {
+    var active = g.entry.graphId === rt.activeGraphId
+    parts.push('<div class="sa-graph"><div class="sa-graph-head">图 ' + saEsc(g.entry.graphId)
+      + (g.entry.label ? ' 「' + saEsc(g.entry.label) + '」' : '') + ' [' + saEsc(g.entry.state) + (active ? ', active' : '') + ']</div>')
+    g.nodes.forEach(function(n) {
+      var dep = n.dependsOn && n.dependsOn.length ? ' ← ' + n.dependsOn.join(', ') : ''
+      var why = n.blockedReason ? ' (' + n.blockedReason + ')' : ''
+      parts.push('<div class="sa-row sa-node"><span class="sa-state ' + saEsc(n.state) + '">' + saEsc(n.state) + '</span>'
+        + '<span class="sa-name">' + saEsc(n.nodeId) + '</span>'
+        + '<span class="sa-meta">' + saEsc(n.description + dep + why) + '</span></div>')
+    })
+    parts.push('</div>')
+  })
+  if (artifacts.length > 0) {
+    parts.push('<div class="sa-graph"><div class="sa-graph-head">产物轨</div>')
+    artifacts.slice(-8).forEach(function(a) {
+      parts.push('<div class="sa-row sa-node"><span class="sa-name">' + saEsc(a.key) + '</span>'
+        + '<span class="sa-meta">sha:' + saEsc(a.sha || '') + ' by ' + saEsc(a.agentName || '') + '</span></div>')
+    })
+    parts.push('</div>')
+  }
+  body.innerHTML = parts.join('')
+  // 内联 onclick 会把 agentId 拼进 HTML 属性里的 JS 字符串字面量，saEsc() 覆盖不到
+  // 那个语境；渲染完再绑监听器，直接不进入需要转义的嵌套上下文。
+  body.querySelectorAll('.sa-head').forEach(function(el) {
+    el.onclick = function() { saToggle(el.dataset.agentId, el.dataset.defaultExpanded === '1') }
+  })
+}
+
 function askUserDialog(question) {
   return new Promise(function(resolve) {
     var overlay = document.createElement('div')
@@ -1038,13 +1460,42 @@ function renderTelemetry(name, payload) {
     if (agent) updateSessionMetricsFromAgent()
   }
 
+  // subagent 的几件大事直接落到主聊天区 —— 事件流面板是排查用的,
+  // 「派了谁、谁回来了」是用户要跟的主线。
+  if (name === 'agent.spawn') {
+    addMsg('phase', '🤖 派出 subagent ' + (payload.name || payload.agentName || '') + '（' + (payload.type || '?') + '）')
+    renderBrowserSubagents()
+  }
+  if (name === 'agent.succeeded') {
+    activityLedger.markTerminal(payload.agentId)
+    addMsg('phase', '✅ subagent ' + payload.agentName + ' 完成（rounds=' + (payload.rounds != null ? payload.rounds : '—') + '）')
+    renderBrowserSubagents()
+  }
+  if (name === 'agent.failed') {
+    activityLedger.markTerminal(payload.agentId)
+    addMsg('error', '❌ subagent ' + payload.agentName + ' 失败：' + (payload.failureKind || ''))
+  }
+  if (name === 'agent.cancelled') {
+    activityLedger.markTerminal(payload.agentId)
+  }
+  if (name === 'graph.declared') {
+    addMsg('phase', '🕸 依赖图已声明：' + (payload.accepted || []).join(' → ') + '（共 ' + payload.total + ' 个节点）')
+  }
+  if (name === 'artifact.conflict') {
+    addMsg('error', '⚠️ 产物冲突：' + payload.key + ' 已属于 ' + payload.owner + '（policy=' + payload.policy + '）')
+  }
+
   // 同 demo/index.html：round.start 时在主聊天区垫一条 "思考中" 消息，
   // round.end 时原地替换成耗时。防止用户误以为 Qwen 长思考是卡死。
-  if (name === 'round.start') {
+  // 但框架会把**每个 subagent** 的 round.start/round.end 也转发到父总线上——
+  // 三个 DAG 节点并跑时聊天区会被一堆不带归属的 "Round 0 思考中…" 淹没，
+  // 挤在主 agent 自己的 "Round 5" 旁边，读者会以为主 agent 重开了。
+  // 只有主 agent 自己的 round 事件才没有 agentId，用这个当守卫。
+  if (name === 'round.start' && !payload.agentId) {
     var r = addMsg('phase', '⏳ Round ' + payload.round + ' 思考中…')
     r.dataset.roundSpan = payload.spanId
   }
-  if (name === 'round.end') {
+  if (name === 'round.end' && !payload.agentId) {
     var r2 = chat.querySelector('[data-round-span="' + payload.spanId + '"]')
     if (r2) r2.textContent = '✓ Round ' + payload.round + ' 完成 (' + formatDuration(payload.durationMs) + ')'
   }
@@ -1067,6 +1518,15 @@ function renderTelemetry(name, payload) {
   detail.className = 'evt-detail'
   detail.textContent = formatDetail(name, payload)
   row.appendChild(detail)
+
+  // 主 agent 的事件不带 agentName（缺省即主），只给子 agent 转发上来的事件打标记。
+  if (payload.agentName) {
+    var who = document.createElement('span')
+    who.className = 'evt-meta'
+    who.textContent = '@' + payload.agentName
+    row.appendChild(who)
+  }
+
   el.appendChild(row)
 
   var meta = buildMeta(payload)
@@ -1107,6 +1567,31 @@ function formatDetail(name, p) {
       var errPart2 = p.ok === false ? '  ✗ ' + p.errorKind : ''
       return p.name + '  ' + dur2 + 'ms  ' + p.bytes + 'B' + errPart2
     }
+    // ---- subagent ----
+    case 'agent.spawn':
+      return (p.name || p.agentName || '') + '  type=' + (p.type || '—') + '  depth=' + (p.depth != null ? p.depth : '—')
+    case 'agent.state':
+      return (p.agentName || p.name || '') + '  ' + (p.from || '?') + ' → ' + (p.to || p.state || '?')
+    case 'agent.succeeded':
+      return p.agentName + '  rounds=' + (p.rounds != null ? p.rounds : '—')
+    case 'agent.failed':
+      return p.agentName + '  ' + (p.failureKind || '')
+    case 'agent.cancelled':
+      return p.agentName + '  ' + (p.reason || '')
+    case 'graph.declared':
+      return 'accepted=' + (p.accepted || []).join(', ') + '  total=' + p.total
+    case 'graph.node.ready':
+      return p.nodeId + '  等 graph_start 给契约'
+    case 'graph.node.settled':
+      return p.nodeId + ' → ' + p.state
+    case 'graph.closed':
+      return p.graphId + '  ' + (p.disposition || '')
+    case 'artifact.write':
+      return p.key + '  sha:' + p.sha + '  by ' + p.agentName
+    case 'artifact.conflict':
+      return p.key + '  与 ' + p.owner + ' 冲突  policy=' + p.policy
+    case 'ask.user':
+      return p.agentName + ': ' + String(p.question || '').slice(0, 50)
     default:
       return ''
   }

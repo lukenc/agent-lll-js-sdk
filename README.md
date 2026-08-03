@@ -74,9 +74,20 @@ for await (const event of agent.stream('帮我重构这个函数')) {
     case 'delta':      process.stdout.write(event.content); break
     case 'tool_start': console.log(`\n🔧 ${event.name}(${JSON.stringify(event.arguments)})`); break
     case 'tool_end':   console.log(`✅ ${event.name} → ${event.result}`); break
-    case 'done':       console.log('\n完成'); break
+    case 'done':
+      // done 附带结构化的 stopReason（'completed' | 'max_rounds'）与
+      // rounds（轮次耗尽时），供消费方判断而非解析哨兵字符串。
+      console.log(`\n完成 (stopReason=${event.stopReason}${event.rounds ? `, rounds=${event.rounds}` : ''})`)
+      break
   }
 }
+```
+
+若上游网关在流结束时省略 `finish_reason`（默认会被判定为截断并抛出
+`LlmStreamIncompleteError`），可关闭校验：
+
+```js
+const agent = new Agent({ ..., validateStreamCompletion: false })
 ```
 
 ## 架构
@@ -125,6 +136,7 @@ for await (const event of agent.stream('帮我重构这个函数')) {
 | `memory` | `SlidingWindowMemory(40)` | 自定义记忆实例 |
 | `strategy` | `'react'` | 执行策略: `'react'` 或 `'plan_and_execute'` |
 | `planAndExecuteOpts` | `{}` | PlanAndExecute 策略配置（见下方） |
+| `validateStreamCompletion` | `true` | 校验流式响应以非空 `finish_reason` 收尾；为 `false` 时容忍网关省略 `finish_reason` 的流（不再抛 `LlmStreamIncompleteError`）。`react` 与 `plan_and_execute` 两种策略下均生效 |
 
 ### IntentRecognizer
 
@@ -747,6 +759,596 @@ Browser Agent 继续 ReAct 循环
 想在自己的 Web 应用里复用：把 `demo/server.js` 里 `/mcp-tools` + `/mcp-call` 两段代码
 （约 40 行）抄过去即可；前端包装逻辑见 `demo/browser.html` 里的 `loadMcpTools()`。
 
+## Skill 系统
+
+一个 skill 是一个目录：`SKILL.md`（YAML frontmatter + Markdown 正文）加上可选的
+`scripts/` / `references/` 等捆绑文件，目录结构与 [Claude Code 的 skill 格式](https://docs.claude.com/en/docs/claude-code/skills)
+兼容，可直接复用已有的 Claude Code skill 包。
+
+```js
+import { Agent } from 'lll-web-agent'
+
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  model: 'gpt-4',
+  skills: {
+    providers: [
+      { type: 'local', dir: './skills' },              // 本地目录，每个子目录一个 skill
+      { type: 'http', baseUrl: 'https://example.com/skills' }, // 远程 manifest（见下）
+    ],
+    filter: { threshold: 50, topK: 20 },  // 可选，均为默认值
+  },
+})
+
+await agent.chat('帮我审查这个 PR')
+```
+
+`skills.providers` 为空或未配置时，Skill 系统完全不启用（零开销）。多个 provider 同时
+配置时按数组顺序聚合，重名 skill first-wins（后面的 provider 会被 warn 并跳过）。
+
+### 三级渐进披露（Progressive Disclosure）
+
+与 Claude Code 一致，skill 内容按需分三级注入上下文，避免一次性把所有 skill 正文塞进
+system prompt：
+
+| 级别 | 内容 | 注入方式 |
+|------|------|---------|
+| Level 1 | 清单：`name` + `description` | 每轮自动合并进 system 消息（`_withSkillListingNote`） |
+| Level 2 | `SKILL.md` 正文 | 模型调用内置 `skill` 元工具按需加载 |
+| Level 3 | 捆绑资源（`scripts/` / `references/` 等文件） | Node 下用现有 `read_file` / `shell_exec` 读取 `baseDir`；浏览器下用专用 `skill_resource` 工具 |
+
+`disable-model-invocation: true` 的 skill 不出现在 Level 1 清单里，但仍可通过
+`agent.skills.get(name)` 访问。
+
+#### `skill` 工具的参数（对齐 Claude Code）
+
+```js
+{ name: 'skill', parameters: { skill: string, args?: string } }  // 仅 skill 必填
+```
+
+`args` 是透传给 skill 的参数串，等价于斜杠命令 `/<name>` 后面那一截。SKILL.md 正文里
+用占位符消费它，注入上下文前完成展开：
+
+| 占位符 | 含义 |
+|--------|------|
+| `$ARGUMENTS` | 整个 `args` 串 |
+| `$1` … `$9` | 按空白切分的位置参数，缺失代入空串 |
+
+```markdown
+---
+name: review-pr
+description: Review a PR with priority and assignee
+argument-hint: [pr-number] [priority] [assignee]
+---
+
+Review pull request #$1 with priority level $2, then assign to $3.
+```
+
+模型发 `{ skill: 'review-pr', args: '123 high alice' }`，注入正文即
+`Review pull request #123 with priority level high, then assign to alice.`
+
+frontmatter 的 `argument-hint` 会以 `- name: description (args: <hint>)` 的形式写进
+Level 1 清单 —— 这是模型唯一的参数形状线索，不声明它则 `args` 对自主调用不可见。
+正文里没有任何占位符却传了 `args` 时，参数会作为 `Arguments: <args>` 附加在正文末尾，
+不会被静默丢弃。展开逻辑也单独导出为 `applySkillArgs(body, args)` 便于宿主复用。
+
+Skill 数量超过 `filter.threshold`（默认 50）时，才会触发一次 sidecar LLM 调用
+（`SkillFilter`，复用 `simpleModel` 配置）按用户消息做 Top-K 相关性排序；该调用在
+`_runPipeline` 里每条用户消息只跑一次（同一轮对话的多个 ReAct round 复用结果），
+失败时 fail-open —— 直接返回全量 skill 列表，与 `IntentRecognizer` 的失败策略一致。
+
+**已知限制**：Level 1 清单注入目前只在 ReAct 策略下生效；`strategy: 'plan_and_execute'`
+下 `PlanAndExecuteStrategy` 会为每个 step 构建独立的 system prompt，不会收到 skill 清单
+（`skill` 工具仍可调用，只是模型看不到清单）。
+
+### Node vs 浏览器运行时
+
+`skills.runtime` 默认 `'auto'`（根据是否存在 `process.versions.node` 判断）。Node
+运行时下，远程（HTTP provider）skill 会物化到本地磁盘缓存（默认
+`~/.lll-agent/skills-cache/<name>/`，可用 `skills.cacheDir` 覆盖），随后与本地
+provider 一样通过 `read_file` / `shell_exec` 访问 Level 3 资源。浏览器运行时不做任何
+磁盘物化，改为注入 `skill_resource` 工具，参数为 `{ skill, path }`。
+
+### HTTP provider 协议（自建 skill server）
+
+```
+GET {baseUrl}/manifest.json
+→ { "skills": [{ "name": "pdf-fill", "description": "...", "version": "1.0.0", "hash": "...", "files": ["SKILL.md", "scripts/fill.py"] }] }
+
+GET {baseUrl}/skills/{name}/{relPath}
+→ 文件原始内容
+```
+
+`hash` 字段可选，用于 `agent.refreshSkills()` 增量刷新（未变化的 skill 直接复用缓存的
+`Skill_Def`，跳过重新拉取 + 解析）。
+
+### 安全
+
+- HTTP provider 对 `name` 做 `^[a-z0-9-]{1,64}$` 校验，并对拼接进 URL 的每个路径分段做
+  编码 / 拒绝（空分段、`..` 一律拒绝），防止路径穿越。
+- `SkillRegistry.readResource` / 本地 provider 同样拒绝包含 `..` 的资源路径。
+- 网络来源（HTTP provider）的 skill 脚本最终通过宿主提供的 `shell_exec` 工具执行 ——
+  v1 没有沙箱。接入不受信任的 skill server 时，请通过工具授权 + `hooks.beforeToolCall`
+  自行把关。
+
+## Subagent 系统
+
+把一个明确、单一、描述完整的任务派给一个独立的 agent 实例去做，主 agent 只收结论。
+解决的是单 agent 运行时的老问题：要"读 8 个文件后给个结论"，主 agent 必须把全部中间
+产物吃进自己的上下文，压缩一次就丢一批事实。
+
+subagent 通过一个普通 `Tool_Def`（`agent` 工具）暴露给模型，因此自动获得
+`ToolFilter` / `ContextManager` / telemetry 的既有处理；它的特殊之处不在接口，而在
+`execute` 内部启动了一个能自己调工具、能在执行中收消息、能对外发事件的嵌套运行时。
+
+```js
+import { Agent } from 'lll-web-agent'
+
+const agent = new Agent({
+  provider: 'openai',
+  apiKey: process.env.OPENAI_API_KEY,
+  model: 'gpt-4o',
+  simpleModel: 'gpt-4o-mini',        // 成为 fast 别名（见"模型别名"）
+  tools: [readFile, keywordSearch],  // 主机自己的工具；子 agent 按类型裁剪后继承
+  subagents: {
+    types: [
+      {
+        name: 'explorer',
+        description: '只读检索：跨文件找定义、找用法、找配置，不改任何文件。',
+        systemPrompt: 'You are a read-only research subagent. Report what you found, with file paths.',
+        model: 'fast',
+        tools: ['read_file', 'keyword_search', 'project_tree', 'history_search'],
+      },
+    ],
+    maxConcurrent: 4,                // 每个 depth 层独立的并发槽数
+    maxDepth: 2,                     // 主 agent 是 depth 0；depth 2 的 agent 不能再派
+    artifacts: { policy: 'warn' },   // 'warn'（默认）| 'deny'
+    retainClosedGraphs: 5,           // 保留多少张已关闭的图（超出按 FIFO 整张淘汰）
+  },
+})
+
+await agent.chat('审一下认证链路，把 token 校验的每个位置都找出来')
+```
+
+未配置 `opts.subagents` 时 `agent.subagents` 恒为 `null`，不注入任何工具、不发任何新
+事件，行为与旧版本逐字节一致（零开销）。
+
+内置类型 `general-purpose` 始终可用且不可覆盖。类型也可以在运行时注册：
+
+```js
+import { registerAgentType, listAgentTypes, resetAgentTypes } from 'lll-web-agent'
+
+registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt: '...' })
+```
+
+> 类型注册表是**进程级全局**的（与 `BASE_TOOLS` 同）。多个 `Agent` 实例共享同一张表，
+> `resetAgentTypes()` 会把它清回内置类型。
+
+### 12 个元工具
+
+配置 `subagents` 后注入，且全部经 `registerBaseTool()` 注册为 base tool —— 否则开启
+`enableIntentRecognition` 时 `ToolFilter` 会把它们裁掉，而 system prompt 里的类型清单
+还在宣传它们（`skill` 已经踩过这个坑）。
+
+| 工具 | 用途 |
+|------|------|
+| `agent` | 派一个 subagent。`{ description, prompt, subagent_type?, model?, run_in_background?, isolation? }` |
+| `agent_status` | 查状态。`{ agent_id?, include_finished?, include_graph?, graph_id? }`（`graph_id: 'all'` 列出全部图，含已关闭的） |
+| `agent_cancel` | 取消在跑的 agent 或放弃一个图节点。`{ agent_id?, node_id?, graph_id?, reason? }` |
+| `agent_graph` | 声明依赖图（只声明，不创建）。`{ nodes, max_concurrent?, graph_id?, label? }` |
+| `graph_start` | 就绪节点的确认闸门，在这里给出最终契约。`{ node_id, graph_id?, prompt, ... }` |
+| `graph_close` | 任务结束时关掉它的图。`{ graph_id?, disposition, reason? }` |
+| `graph_reactivate` | 让已完成节点重跑（缓存失效）。`{ graph_id?, node_ids, reason? }` |
+| `send_message` | 给另一个 agent 发消息（不打断它正在执行的工具）。`{ to, message, summary? }` |
+| `artifact_write` / `artifact_list` | 产物记账与查询 |
+| `history_search` / `history_get` | 检索整个会话的**原始**事件轨（含已被压缩掉的内容） |
+
+四个图工具与 `agent_status` / `agent_cancel` 的 `graph_id` 都可省，省略即"当前在用的那张图"
+（见"一张图 = 一个任务"）。
+
+`agent` 工具的两个 "description" 是两回事，容易混：入参 `description` 是 3-8 词的**标签**
+（用于列表显示、agent 命名、日志），**不承载任务内容**；Task Contract 的唯一所在是入参
+`prompt` —— 子 agent 不继承对话历史，它看到的就只有这段文字。这条边界由
+`AGENT_TOOL_DESCRIPTION`（`src/agents/contract.js`）向模型讲清楚。
+
+子 agent 拿到哪些工具由它的 `Agent_Type.tools` 决定：`'*'`（内置
+`general-purpose` 的默认值）表示继承父 agent 的**整个**工具集，但两道剔除是恒定的 ——
+四个图工具 `agent_graph` / `graph_start` / `graph_close` / `graph_reactivate`
+**无条件**剔除（`canSpawn: true` 也不放行），`agent` 则由 `canSpawn` 把关（默认
+`false`，即也剔除）；给一个名字数组则保留数组里点到的工具，**外加一组固定的基础设施
+工具（floor）**：`artifact_write` / `artifact_list` / `history_search` / `history_get` /
+`send_message` / `ask_user` 无论数组里写没写都会带上（与父 agent 实际拥有的工具
+取交集 —— 父 agent 自己都没有的 floor 工具不会被凭空生造出来）。`explorer` 这样
+的窄类型不再需要把这些元工具显式写进 `tools` 数组：一个类型写 `tools:
+['read_file']` 的意思是"这个 agent 只读文件"，不是"它也不准写产物、搜历史、
+问用户" —— 与 `tool-filter.js` 的 `BASE_TOOLS`（`ToolFilter` 对任何意图过滤结果都
+恒定保留）同一思路。
+
+**`canSpawn: true` 给的是 `agent`，只有 `agent`。** 图工具作用于**编排者那一个**图
+容器：子 agent 拿到的是父 agent 的工具闭包，闭包捕获的是父的 runtime，工具本身没有
+"是谁在调"的概念。放行的后果不是权限宽一点，而是三件静默的错事 —— 子 agent 的
+`agent_graph` 会改写父的活跃图，它的 `graph_close` 能关掉父正在编排的任务，它起的
+节点全记在 `main` 名下；再加上按深度分池的并发槽会自我争抢（一个 depth-1 的子 agent
+调 `graph_start({ run_in_background: false })` 会 await 它自己正占着的那个池）。
+派生新 agent 的能力仍然只由 `canSpawn` 把关，`maxDepth` 与并发分池沿 `agent` 这条路
+照常成立（`agent` 工具自己算 `ctx.depth + 1`）。floor **不**包含这五个编排工具。
+
+### 后台派发与 keep-alive
+
+`run_in_background` 默认 `true`：`agent` 工具立刻返回一行 `[agent:<name> started]`，
+结果稍后在主 agent 的**轮边界**注入。轮边界（而不是任意时刻）是关键 —— 那时上一轮的
+`assistant(tool_calls)` 与全部 `tool` 结果消息已经成对落盘，插入 `user` 消息不会破坏
+工具调用配对。
+
+`keepAlive`（默认 `true`）补的是这个洞：模型说完"我派了三个 agent，等它们回来"就给出
+了一个无工具调用的回复，ReAct 循环照旧会立即 `return`，结果回来时已经没人读了。开启后
+这一轮不收尾，而是等下一个 subagent 事件回来、把结果带进上下文让模型继续决策。
+
+```js
+agent.on('agent.succeeded', ({ agentName, rounds, usage }) => { /* ... */ })
+agent.on('run.keep_alive.timeout', ({ pendingAgents, pendingNodes, waitedMs }) => { /* ... */ })
+
+// 每轮对话最多超时一次；超时后给模型留一条"收尾或 agent_cancel"的提示
+agent.lastKeepAliveTimedOut      // boolean
+agent.lastStopReason             // 取值集合未变：null | 'completed' | 'max_rounds'
+```
+
+轮次仍受 `maxRounds` 约束，因此不存在无界循环。`keepAlive: false` 时本轮直接结束，
+通知暂存到下一次 `chat()` / `stream()` 的第一个轮边界。
+
+等待的判据是"真的还有活在飞"（在跑的 agent、排队中的 agent、running 的图节点），
+**不包括 `blocked` 与 `awaiting_confirm` 的图节点** —— 那些等的是主 agent 自己的下一步
+动作，不会自行推进也不产生事件，按它们来等就是每轮干等到超时。所以一个就绪待确认的
+节点：它的就绪通知会被投进上下文（待注入的判断优先于在飞判断），但通知投完之后若没有
+别的活在飞，这一轮就正常收尾，把决定权交回主机与模型。
+
+判据与告知都是**跨全部图**的（含已关闭的图）：一个在飞的 agent 不因为它所属的图被关掉就
+停止存在。`run.keep_alive.timeout` 的 `pendingNodes` 同样跨图统计 —— 若未完成节点在另一
+张图里而这个数报成 0，模型正好会在它决定要不要收尾的那一刻拿到一个假数。
+
+### DAG 编排
+
+`agent_graph` 只声明与排队，**不创建任何实例**：`blocked` / `awaiting_confirm`
+的节点没有 handle、没有子 `Agent`、不占并发槽（没有一个停留态的 `ready`：依赖一满足，
+节点在同一次 `tick()` 里直接走到 `awaiting_confirm` 或 `queued`）。模型发出的调用形如：
+
+```json
+{
+  "nodes": [
+    { "node_id": "n1", "description": "Map the schema",
+      "prompt": "List every table and its columns.", "on_ready": "auto" },
+    { "node_id": "n2", "depends_on": ["n1"], "description": "Write the migration" }
+  ],
+  "max_concurrent": 2
+}
+```
+
+`n1` 的活儿事先就定死了，用 `on_ready: 'auto'` 直接跑。`n2` 走默认的
+`on_ready: 'confirm'`：`n1` 成功后框架**不**启动 `n2`，而是把上游结果注入回主 agent，
+由它看过 `n1` 实际产出之后再用 `graph_start` 写 `n2` 的最终契约（也可以在那里换类型、
+换模型，或者 `agent_cancel` 放弃它）。前序结果经常会改变后续该干什么，这个闸门就是
+"到了再创建、决策可变"的落点。
+
+声明时校验**同一张图内** `node_id` 唯一、`depends_on` 指向已知节点、Kahn 环检测（有环
+整批拒绝并回报环路径）、`on_ready: 'auto'` 的节点必须有 `prompt`。`agent_graph` 可多次
+调用增量追加，新节点可依赖旧节点，每次都重跑环检测。失败传播默认 `block`（下游既不自动
+取消也不自动启动，等主 agent 定夺），可按节点设 `on_upstream_failure: 'skip'`。
+
+#### 一张图 = 一个任务（多图共存）
+
+图跟的是**任务**，不是 `Agent` 实例：同一个任务始终往同一张图里加节点，图可以一直改；
+任务变了就换一张新图。因此一个主 agent 可以同时持有多张图，`node_id` 的唯一性也只到
+**图级**（第二个任务复用 `n1` 不再让整批声明被判重复而拒掉 —— 单图时代这是个真实缺陷，
+不是可有可无的放宽）。
+
+容器是惰性的：`agent.subagents.graphs` 是一张 `Map<graphId, GraphEntry>`，
+`activeGraphId` 起手为 `null`，第一次声明才建图。`agent.subagents.graph` 仍是指向"当前
+在用的那张图"的 getter，没有活跃图时返回 `null`（不抛）。`graphId` 由框架生成，形如
+`gph_00000001`（`gph_` + 单调计数器的 8 位十六进制，**不混时间位** —— 本项目已经在
+agentId 与 envelopeId 上各因时间戳撞号踩过一次）。
+
+模型开第二张图的入口是 `label`（任务名）：
+
+```json
+{ "nodes": [{ "node_id": "n1", "description": "Map the schema" }], "label": "订单导出重构" }
+```
+
+同一个 `label` 再声明就接着往那张图里加；换一个 `label` 就是另一张图，两张图各有独立的
+`node_id` 命名空间与独立的状态列表。`label` 与 `graph_id` 都不给时用当前活跃图（没有就
+新建一张）。跨图重名之后，"这个 `node_id` 不在这张图里"必须点名它在哪张图，否则模型无从
+自我纠正：
+
+```
+Error: node "x1" is not in graph gph_00000001; it lives in gph_00000002 ("登录埋点", open). Pass graph_id to act on it there.
+```
+
+`agent_status()` 默认只列活跃图；`agent_status({ graph_id: 'all' })` 列出全部（含已关闭
+的），每段带一行 `graph gph_00000001 "订单导出" [open, active]` 的抬头。
+
+#### 关闭与弃图协议
+
+任务结束就关掉它的图：`graph_close({ graph_id?, disposition, reason? })`。
+
+- `disposition: 'cancel_outstanding'` —— 每个未走到终态的节点都过一遍取消路径
+  （`cancelHandle`，连它挂在 `ask_user` 上的提问一起结算）。
+- `disposition: 'keep_running'` —— 图关掉不再收新节点，但已经在飞的 agent 继续跑到终态，
+  完成通知照旧投递，`hasInFlight()` 仍然算它们。
+
+`disposition` 是必填的，漏填会拿到一句列出两个取值的软失败（工具层刻意把 `undefined`
+换成 `null` 传下去，否则会命中"只标记"的默认值，静默关掉一张图）。关掉活跃图之后就没有
+活跃图了：下一次不带 `graph_id` 的 `agent_graph` 会新建一张。已关闭的图只有**声明**被拦
+（往一张随时可能被淘汰的图里加节点等于静默丢活）；`graph_start` / `agent_cancel` /
+`agent_status` / `graph_reactivate` 对它照旧可用 —— 一张已关闭的图里还在飞的节点必须仍
+能启动、取消、查看。`retainClosedGraphs`（默认 `5`）按 FIFO 整张淘汰多余的已关闭图，
+但**永不淘汰还有在飞节点的图**（那会让一个在跑 agent 的节点归属凭空消失）。
+
+**"任务结束了"这个判断只在 prompt 里，这是有意的设计边界，不是遗漏。** 框架分不清用户的
+新消息是同一个任务的续集还是另一个任务 —— 那是语义判断，只有看得见话题变化的模型（或有
+显式"新任务"入口的主机）做得出来。所以协议写在模型读得到的地方（`AGENT_GRAPH_DESCRIPTION`
+与 `graph_close` 的 `Tool_Def.description`）：话题变了就是上一个任务结束的信号；而关闭一张
+**仍有未完成节点**的图之前，必须先用 `ask_user` 点名那些节点、问用户是等它们跑完、取消掉、
+还是留着不管，拿到答复再调 `graph_close`。框架不强制，也无法强制：猜错的代价是取消掉别人
+跑了一半的活，那个代价该由用户决定要不要付。协议本身不需要新机制 —— 提问路由已经是一张带
+归属、可乱序应答的登记表。
+
+#### 节点重新激活（缓存失效）
+
+任务收尾之后用户又提了一个局部修改，正好命中某个**已完成**节点干过的活 —— 这时该做的不是
+重开一张图从头再来，而是把那个节点连同消费过它产物的下游一起送回去重跑：
+
+```json
+{ "graph_id": "gph_00000005", "node_ids": ["schema", "docs"], "reason": "用户改了字段命名" }
+```
+
+一个已完成节点的产物本质是一份**缓存**：输入变了，它与消费过它的下游都得重跑。
+`graph_reactivate` 把点名的节点送回 `blocked`（依赖已满足的会被 `tick()` 推到
+`awaiting_confirm`，由主 agent 用 `graph_start` 写**新**契约 —— 输入变了，旧契约多半也
+该变），清掉上一轮的 `agentId` / `result` / `error`，并自增该节点的 `generation`。
+**只接受终态节点**（`succeeded` / `failed` / `cancelled` / `skipped`）：一个还在跑的节点
+没有"过期产物"可言，想让它停下来是 `agent_cancel`。**已关闭的图也可以激活**，激活会把它
+重新置为 open 并成为当前在用的那张（下一句 `graph_start` 才落在对的图上）—— 不过关闭活跃
+图会清空 `activeGraphId`，所以这条最常见的路径要显式带上 `graph_id`，否则拿到的是
+`Error: no graph is active. Known graphs: gph_00000005 (closed).`（软失败里点名了图 id，
+模型一轮就能纠正）。
+
+**框架不自动扩散到下游 —— 失效范围由模型决定，但框架必须把它漏掉的摆到它面前。** 模型手工
+挑节点会漏（它得靠记忆推断"谁消费过这份产物"，而它的上下文可能已被压缩过），而漏掉的那个
+下游会拿着过期认知继续跑，**并且不报任何错**。所以返回值列出：下游有哪些节点、其中哪些读过
+刚被作废的产物 key、以及这些里哪些**没有**被本次点名：
+
+```
+reactivated 2 node(s) in graph gph_00000005: schema (generation 1), docs (generation 1).
+That graph was closed; it is open again.
+Graph gph_00000005 is now the one you are working in. ...
+
+Artifacts you just declared stale: db/schema.sql.
+
+Downstream of your selection — 3 node(s):
+- api [succeeded] read db/schema.sql — NOT reactivated
+- docs [blocked] read db/schema.sql — reactivated in this call
+- e2e [succeeded] further downstream (via api) — NOT reactivated
+
+Still to decide — not reactivated: api, e2e. ...
+```
+
+这段话是**机制而不是排版**：它只提供判断依据，决定权仍在模型 —— 把一个下游留在外面是一个
+"它的活仍然成立"的决定，而不是一次无声的遗忘。直接依赖的节点报出它当初真读到的 key（一个
+节点的契约 `inputs` 恰好就是其直接上游已登记的产物），更远的下游标 `further downstream
+(via …)`，不硬编一份它从未读过的 key。
+
+`prompt` 被刻意保留，所以 `on_ready: 'auto'` 的节点一被激活就带着原契约自己重新起飞（与
+`auto` 的语义一致：活儿事先就定死了）。激活**不动产物轨** —— 旧记录留着，好让重跑的结果能
+和它对比（代价见"已知限制"）。
+
+`generation` 这个计数器挡的是一处具体的 ABA，不是为了整齐：`agent_cancel`（或
+`graph_close` 的 `cancel_outstanding`）会把一个节点变成终态**而它的 agent 还在跑**，
+`graph_reactivate` 又把它从终态取出来 —— 于是那个被放弃的 agent 迟到的回报会穿过图原有的
+"终态节点不被迟到回报复活"守卫，把陈旧的 `succeeded` 写回去，并据此放行本该重跑的下游。
+启动时捕获的 generation 随回报一起带回来，对不上就丢弃并发 `graph.node.stale_report`。
+
+#### `depends_on` 是安全边界，不是调度提示
+
+图节点**共享同一个工作目录**，这是有意设计（见下文），且**没有任何 per-node 隔离兜底**。
+于是：**两个之间没有依赖路径的节点，一定会并行跑在同一个目录里。** 漏掉一条本该存在的
+边，不是"跑慢了"或"顺序不理想"，而是两个 subagent 同时改同一批文件、彼此都不知道对方
+改了什么 —— 静默产生冲突的代码，只剩产物轨事后告警。
+
+`AGENT_GRAPH_DESCRIPTION` 把这一点讲给模型：一个节点 = 一个单一、边界清晰的子任务；
+凡是 B 会读或写 A 产出/改动的东西就必须声明 `depends_on`（文件重叠本身就是依赖）；
+拿不准就把边加上（多一条边只损失并行度，少一条边损失正确性且不会报错，两种代价不对称）；
+但也不要编造不存在的顺序，把本可并行的活儿串成一条链，DAG 就退化成了顺序执行。
+
+### 提问路由
+
+多个 agent 可能同时向用户提问。每个问题拿一个 `askId` 并登记提问者，用户的回答按
+`askId` 定向送回对应的等待方 —— 主机因此可以乱序回答。主 agent 自己的提问也走同一张表
+（归属 `agentId: 'main'`）。
+
+主机有两条接法，可以只用一条，也可以同时用（两条**竞速，先到先赢**，后到者静默 no-op）：
+
+```js
+// 接法 1：hook。签名扩展为 (question, meta)，旧的单参数写法继续工作。
+const agent = new Agent({
+  /* ... */
+  subagents: {},
+  hooks: {
+    onAskUser: async (question, meta) => {
+      // meta = { askId, agentId, agentName, parentAgentId, nodeId, taskDescription, question, askedAt }
+      return await promptTheUser(`[${meta.agentName}] ${question}`)
+      // 返回 null / undefined = 不在这里答，留给接法 2
+    },
+  },
+})
+
+// 接法 2：命令式通道。Web UI / HTTP 服务端更顺手 —— 不需要在请求上下文里 await。
+for (const q of agent.pendingQuestions()) {
+  console.log(q.askId, q.agentName, q.taskDescription, q.question)
+}
+agent.answerQuestion(askId, 'prisma')             // → true 表示被这条通道接走了
+agent.cancelQuestion(askId, 'user closed the tab')
+```
+
+提问期间该 agent 状态转 `waiting_input`（在 `agent_status` 里可见），仍占并发槽。
+`ask.timeoutMs` 默认 `null`（永不超时）；配置后超时返回"用户未在 N 秒内回答"，由子
+agent 自己决定猜默认值还是放弃。
+
+### 产物轨 —— 跨 agent 安全的主方案
+
+`artifact_write` 把产出登记到共享的 `RuntimeHistory` `artifacts` 轨（只追加不覆盖，
+历史版本全留），记清楚谁产出了什么、指纹是多少。同 `key` 的最新记录属于**另一个** agent
+且本次写入未在 `supersedes` 中显式引用它时：
+
+- `policy: 'warn'`（默认）—— 允许写入，返回一句告警指名上一版的归属，并 emit
+  `artifact.conflict`；
+- `policy: 'deny'` —— 拒绝写入，返回 owner 与 sha，让模型改 key 或先协调。
+
+这两个值以外的 `policy`（`'DENY'`、拼错的值）在构造时**抛错**，不静默读成 `'warn'` ——
+浏览器里这条轨是唯一的跨 agent 护栏，降级掉它而调用方以为自己开了硬拦截，是这里最坏
+的失败形态。
+
+```js
+const rows = await agent.getArtifacts()                        // 全部
+const mine = await agent.getArtifacts({ agentId: 'agt_...' })  // 按 agent 过滤
+```
+
+`sha` 是 FNV-1a 32 位（8 位十六进制），零依赖、Node 与浏览器同实现，用途是**变更与冲突
+检测，非加密**。
+
+**它是主方案，不是退路。** 目标环境包含浏览器，而浏览器里既没有 git worktree 也没有
+`shell_exec`。产物轨（归属记录 + 同 key 跨 agent warn/deny）是唯一跨 Node 与浏览器都
+成立、每个 agent 都能用的跨 agent 护栏，这一层的强度就是这套系统跨 agent 安全的实际
+上限。同时它**是记账约定，不是强制隔离**：绕过 `artifact_write` 直接改文件的行为框架
+检测不到（见"已知限制"）。
+
+### 历史检索
+
+`history_search` / `history_get` 搜的是共享轨上的**原始事件**，所以被
+`SummarizingMemory` 压缩掉的内容照样能捞回来（摘要只影响投影时的跳过逻辑，不删原事件）。
+这也是子 agent 不必继承父上下文的前提 —— 缺什么自己去捞，而不是一开始就把整个上下文
+复制一份。子 agent 的消息只进 `internal` 与 `agent:<id>` 轨，**不进 `model` 轨**，
+因此不会污染主 agent 的对话投影。
+
+### 模型别名
+
+```js
+subagents: {
+  modelAliases: {
+    fast: { model: 'deepseek-chat', apiKey: process.env.DEEPSEEK_KEY, url: '...' },
+    main: { model: 'gpt-4o' },   // 省略的字段继承父 Agent
+  },
+}
+```
+
+不配置时默认两个别名：`fast` → 父 `Agent` 的 `simpleModel` / `simpleApiKey` /
+`simpleUrl` 三件套，`main` → 父的 `model` / `apiKey` / `url`。`agent` / `graph_start`
+的 `model` 参数 enum 在工具注入时由别名表的键生成（不写死型号 —— 本 SDK 是多供应商的），
+每个别名可独立指定 `apiKey` / `url`，因此快模型可以跨供应商。优先级：调用入参 `model`
+> `Agent_Type.model` > 继承父模型。
+
+### worktree 隔离（Node-only 实验特性，已搁置）
+
+> **状态：搁置，不作为推荐的隔离路径。** 实现完整、有测试覆盖、代码保留，但请不要把它
+> 当成"怎么防止多个 agent 互相踩"的答案 —— 那个答案是产物轨。
+>
+> 原因有二。其一，目标环境包含浏览器，那里没有 git worktree；一个在一半目标环境里不
+> 存在的机制不能承担隔离主方案。其二，它与 DAG 语义相冲突：一个 DAG 节点是一个子任务、
+> 由一个 subagent 执行，若每个 subagent 各自一个 worktree，下游节点看到的是上游动手
+> **之前**的仓库状态，据此产生的修改必然与上游错位且不会报错。流水线要成立，下游就必须
+> 看得见上游的改动 —— 所以 `agent_graph` / `graph_start` **有意不提供** `isolation`
+> 参数，图节点共享工作区是设计决策，不是缺口。
+>
+> 它仍然适用于一种情形：Node 环境下、经 `agent` 工具直接派发的、彼此独立且不需要看到
+> 对方改动的并行任务。
+
+`agent` 工具传 `isolation: 'worktree'` 时，框架 `git worktree add` 一个
+`<worktreeBaseDir>/agent-<agentId>` 与 `<branchPrefix><agentId>` 分支。收尾时
+`git status --porcelain` 为空则删除 worktree 与分支；非空则保留，并在 `Agent_Result`
+里报路径、分支与改动文件数，由主 agent 决定合并还是丢弃。非 git 仓库、`git` 不可用、
+或 `worktreeBaseDir` 未被 `.gitignore` 忽略时**软失败**（返回一句"不带 isolation 参数
+重试"，而不是炸掉这次派活）。
+
+```js
+subagents: {
+  isolation: { worktreeBaseDir: '.worktrees', branchPrefix: 'subagent/' },
+}
+```
+
+工作目录以两种**通告**方式传达给子 agent：写进它首条消息的上下文事实，以及工具执行时的
+`ctx.cwd`。**框架不重写工具入参** —— `read_file` / `shell_exec` 是主机提供的，框架无权
+改其语义；静默把路径重写进 worktree 会造出"看起来隔离、实际没隔离"的错觉，而那是最坏的
+结果，因为主机会信它。
+
+`isolation: 'remote'` 未实现，软失败。
+
+### 跑起来看看
+
+两个可以直接执行的集成入口：
+
+```bash
+# 命令行：7 幕跑完既有功能（工具 / Skill / MCP）+ subagent（后台派发 / DAG /
+# 产物轨 / 提问路由），末尾对若干关键事实做断言，不成立则非 0 退出
+OPENAI_API_KEY=sk-xxx node examples/subagents.js
+
+# 浏览器：服务端 Agent 与浏览器端 Agent 两个页面都带 subagent 面板
+OPENAI_API_KEY=sk-xxx node demo/server.js
+#   http://localhost:3000/        —— 服务端 Agent（提问走 /questions + /answer 命令式通道）
+#   http://localhost:3000/browser —— 浏览器端 Agent（提问走 hooks.onAskUser 弹层，Key 在页面里填）
+```
+
+面板会实时显示每个 subagent 的状态、每张图的节点与依赖边、以及产物轨；subagent 提问时
+页面会要求你回答，答案按 `askId` 定向送回提问的那一个 agent。细节见 `demo/README.md`。
+
+### 注意事项
+1. **后台 agent 跨 `chat()` 存活。** 它们不随 `chat()` 返回而终止，会一路跑到终态 ——
+   因此宿主进程在全部后台 agent settle 之前不会自然退出。
+2. **退出前调 `closeSubagents()`。** 它取消全部在跑的 agent、reject 全部待答提问
+   （避免悬挂 Promise 卡住进程退出）、清理未改动的 worktree。可重复调用；`reset()` 已
+   包含它；未配置 subagents 时是安全空操作。
+3. **产物轨是记账约定。** 见上文 —— 它是主方案，但拦不住绕过它的行为。
+4. **`hooks` 会转发给每个子 agent。** `beforeToolCall` / `afterToolCall` / `onError`
+   必须转发，否则主机的工具管控策略对子 agent 就失效了 —— 这是安全边界，不是便利。
+5. **`agent.subagents.graph` 起手是 `null`。** 图容器是惰性的，第一次声明才建图；主机若
+   直接读这个 getter（例如自己 `declare()`），要么先 `agent.subagents.newGraph()`，要么
+   判空。全部图在 `agent.subagents.graphs` 这张 Map 里，`closeGraph(graphId, { reason,
+   disposition })` 是主机侧的关图入口（`disposition` 缺省为 `'keep_running'`）。
+
+### 已知限制
+
+1. **只在 ReAct 策略下生效** —— 类型清单注入、轮边界注入、keep-alive、以及
+   `ctx` 的归属字段（`_toolContextExtra`）全都住在 `_reactLoop` / `_reactLoopStream`
+   里。`strategy: 'plan_and_execute'` 下这些一概没有：`agent` 工具仍可调用，但模型看不
+   到类型清单，后台 agent 的完成通知会滞留到下一次走 `react` 的调用，或只能经事件被主机
+   感知。与 skill 清单注入是同一个既有限制。
+2. **无沙箱** —— 子 agent 经主机提供的工具执行命令，与 skill 系统同一安全模型。主机须
+   用工具供给 + `hooks.beforeToolCall` 自行把关。
+3. **产物轨是记账而非强制** —— 一个绕过 `artifact_write`、直接改文件的 subagent，框架
+   检测不到。
+4. **`ctx.cwd` 是通告，不是保证** —— 主机工具认不认它由主机决定。框架**有意**不重写工具
+   入参：静默重写路径会造出"看起来隔离、实际没隔离"的错觉。
+5. **`isolation: 'remote'` 未实现** —— 协议与 transport 注册表已就位，但没有非 local
+   的 transport 随包发布，需第三方 `registerA2ATransport()`。
+6. **保留下来的 worktree 会在 `.git/worktrees/<name>` 留下管理项并逐渐累积** ——
+   主机应自行 `git worktree prune`；框架**有意**不做，因为 prune 是仓库级操作，会碰到
+   本 SDK 之外的 worktree。
+7. **父 memory 没有 `runtimeHistory` 时历史检索退化** —— runtime 自建一条独立
+   `RuntimeHistory` 兜底，此时 `history_search` 搜不到父历史，工具结果里会明确说明这一
+   点，不假装能搜。
+8. **"任务结束了"的判断只在 prompt 里** —— 弃图协议（话题变了 = 任务结束；关一张仍有未
+   完成节点的图之前必须先 `ask_user`）由 `AGENT_GRAPH_DESCRIPTION` 与 `graph_close` 的
+   描述讲给模型，框架不强制、也无法强制。这是设计边界而不是遗漏：区分"续集"与"新任务"是
+   语义判断。
+9. **重新激活不自动扩散到下游** —— 失效范围由模型决定，框架只把漏掉的下游摆出来。没被一并
+   激活的下游会拿着过期认知继续跑，**并且不报错**：图会在一个已经不成立的答案上报成功。
+10. **`agent_status` 的节点表不显示 `generation`** —— 一个正在重跑的节点与首次运行的节点
+    在表里长得一样。这个字段在节点快照里（主机读得到），但模型看图的那个窗口看不见它。
+11. **`label` 没有唯一性约束** —— `agent_graph({ label })` 取**第一张** open 的同名图，
+    所以两张图可以共用一个 label，而第二张就再也无法用 label 命中。
+12. **重跑与产物冲突策略的组合** —— 激活刻意不动产物轨（旧记录留着好做对比），因此在
+    `artifacts.policy: 'deny'` 下，重跑写同一个 `key` 时若上一代记录属于另一个 agent，
+    写入会被拒。这是既有语义，但"重跑 + deny"这个组合是新出现的。
+
 ## License
+
 
 MIT

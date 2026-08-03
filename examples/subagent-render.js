@@ -1,0 +1,171 @@
+/**
+ * 终端渲染器 —— 把并发 subagent 的进展画成一个活动区。
+ *
+ * 接终端(TTY)时底部维持一块原地刷新的区域,每个在跑的 agent 占一行;某个 agent
+ * 落终态就把它固化成一行打在活动区上方。被重定向到文件/管道时**整块降级**为逐行
+ * 追加,一个 ANSI 字节都不吐 —— 否则日志里全是转义序列,没法看。
+ *
+ * 拆成独立文件而不是内联进 examples/subagents.js:ANSI 光标算术和 CJK 宽度计算
+ * 是这里最容易写错的两处,内联进一个有顶层副作用的示例文件就没法写测试了。
+ */
+
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+/**
+ * 字符串的**显示宽度**。CJK / 全角字符占 2 列。
+ * 按字符数算会让中文行超宽,把活动区的行数算错,重绘的上移行数就跟着错,画面会烂。
+ */
+export function displayWidth(str) {
+  let w = 0
+  for (const ch of String(str ?? '')) {
+    const c = ch.codePointAt(0)
+    w += (
+      (c >= 0x1100 && c <= 0x115f) ||   // 韩文字母
+      (c >= 0x2e80 && c <= 0xa4cf) ||   // CJK 部首 · 汉字 · 假名
+      (c >= 0xac00 && c <= 0xd7a3) ||   // 韩文音节
+      (c >= 0xf900 && c <= 0xfaff) ||   // CJK 兼容汉字
+      (c >= 0xfe30 && c <= 0xfe6f) ||   // CJK 兼容标点
+      (c >= 0xff00 && c <= 0xff60) ||   // 全角 ASCII
+      (c >= 0xffe0 && c <= 0xffe6)      // 全角符号
+    ) ? 2 : 1
+  }
+  return w
+}
+
+/** 按显示宽度截断,超出时结尾补 `…`（省略号本身占 1 列，已计入）。 */
+export function truncateToWidth(str, cols) {
+  const s = String(str ?? '')
+  if (displayWidth(s) <= cols) return s
+  let out = ''
+  let w = 0
+  for (const ch of s) {
+    const cw = displayWidth(ch)
+    if (w + cw > cols - 1) break
+    out += ch
+    w += cw
+  }
+  return out + '…'
+}
+
+function fmtMs(ms) {
+  if (!ms) return ''
+  if (ms < 1000) return Math.round(ms) + 'ms'
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's'
+  return Math.floor(ms / 60000) + 'm' + Math.round((ms % 60000) / 1000) + 's'
+}
+
+function fmtTok(n) {
+  if (!n) return ''
+  return n >= 1000 ? (n / 1000).toFixed(1) + 'k tok' : n + ' tok'
+}
+
+function pad(label, cols) {
+  const w = displayWidth(label)
+  return label + ' '.repeat(Math.max(1, cols - w))
+}
+
+/** 固化行:`✓ modules    3 步 · 1.1k tok · 8.4s` */
+export function formatSettled({ label, rounds, tokens, ms, ok = true }) {
+  const bits = [rounds ? rounds + ' 步' : '', fmtTok(tokens), fmtMs(ms)].filter(Boolean)
+  return `${ok ? '✓' : '✗'} ${pad(String(label), 12)}${bits.join(' · ')}`
+}
+
+/** 活动行:`⠋ modules    read_note        4.2s` */
+export function formatLive({ label, detail, ms }, frame = 0) {
+  return `${SPINNER[frame % SPINNER.length]} ${pad(String(label), 12)}${pad(String(detail ?? ''), 18)}${fmtMs(ms)}`
+}
+
+/**
+ * @param {{ stream?: NodeJS.WriteStream, isTTY?: boolean, maxRows?: number }} [opts]
+ */
+export function createRenderer({ stream = process.stdout, isTTY = stream.isTTY, maxRows = 8 } = {}) {
+  let liveLines = 0        // 当前活动区占了几行
+  let frame = 0
+  let finished = false
+  /**
+   * 非 TTY 下每一行**各自**记住上次打过的 detail。
+   *
+   * 早先这里存的是整组行拼成的一个 key,于是任何一行变化都会把**所有**行重印一遍 ——
+   * 真跑并发 DAG 时日志里就出现了两遍 `[read-changelog] 启动中`,读起来像那个节点被启动了
+   * 两次。按行记才对:只打真的变了的那几行。
+   * @type {Map<string, string>}
+   */
+  const lastDetail = new Map()
+
+  const cols = () => stream.columns || 80
+
+  function clearLive() {
+    if (!isTTY || liveLines === 0) return
+    // 光标此刻在活动区下方一行:逐行上移并清除。
+    stream.write(`\x1b[${liveLines}A`)
+    for (let i = 0; i < liveLines; i++) stream.write('\x1b[2K\x1b[1B')
+    stream.write(`\x1b[${liveLines}A`)
+    liveLines = 0
+  }
+
+  function writeLive(rows) {
+    const shown = rows.slice(0, maxRows)
+    const lines = shown.map(r => truncateToWidth(formatLive(r, frame), cols()))
+    if (rows.length > shown.length) lines.push(`  …还有 ${rows.length - shown.length} 个在跑`)
+    for (const l of lines) stream.write(l + '\n')
+    liveLines = lines.length
+  }
+
+  /**
+   * 普通输出。必定落在活动区上方。
+   *
+   * 独立的顶层函数而不是返回对象上的方法：这个渲染器是设计给拷贝粘贴用的
+   * （见文件头注释），返回对象一旦被解构（`const { log, settle } =
+   * createRenderer()`）取出的方法就丢了闭包所在的 `this`。用方法 + `this.log()`
+   * 转发（旧写法）在这种解构后的自由调用下会直接抛 `Cannot read properties of
+   * undefined`。闭包在这几个局部变量（stream/isTTY/clearLive）上，不依赖 `this`，
+   * 解构出来单独调用也没问题。
+   */
+  function log(line = '') {
+    if (finished) return
+    clearLive()
+    stream.write(line + '\n')
+  }
+
+  return {
+    log,
+
+    /** 固化一行（某个 agent 落终态）。语义等同 log，单独开一个名字是为了读起来清楚。 */
+    settle(line) {
+      log(line)
+    },
+
+    /** 重绘活动区。rows: Array<{label, detail, ms}> */
+    update(rows = []) {
+      if (finished) return
+      if (!isTTY) {
+        // 降级:逐行追加,且只打**这一行**真的变了的。10fps 全量重印会把日志刷爆,
+        // 而按整组去重会让"任一行变化"重印所有行(见 lastDetail 的注释)。
+        // 空闲(rows.length === 0)要清空记忆 —— 否则活跃 → 空闲 → 同样内容恢复
+        // 会被当成"没变"而静默吞掉,即便中间确实经过了一整段空闲期。
+        if (rows.length === 0) { lastDetail.clear(); return }
+        for (const r of rows) {
+          const detail = r.detail || '进行中'
+          if (lastDetail.get(r.label) === detail) continue
+          lastDetail.set(r.label, detail)
+          stream.write(`[${r.label}] ${detail}\n`)
+        }
+        return
+      }
+      if (liveLines === 0) stream.write('\x1b[?25l')   // 隐藏光标
+      clearLive()
+      frame += 1
+      writeLive(rows)
+    },
+
+    /** 清空活动区并恢复光标。finally 与 SIGINT 都必须调,否则终端留残影。 */
+    done() {
+      if (finished) return
+      finished = true
+      if (isTTY) {
+        clearLive()
+        stream.write('\x1b[?25h')   // 恢复光标
+      }
+    },
+  }
+}

@@ -606,10 +606,11 @@ import { syncChat, streamChatIter, LlmApiError } from './llm-client.js'
 const _originalFetch = globalThis.fetch
 
 /** Build a minimal `Response`-shaped object returning a canned JSON body. */
-function mockJsonResponse(bodyObj, { status = 200 } = {}) {
+function mockJsonResponse(bodyObj, { status = 200, headers = {} } = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: new Headers(headers),
     async json() { return bodyObj },
     async text() { return typeof bodyObj === 'string' ? bodyObj : JSON.stringify(bodyObj) },
   }

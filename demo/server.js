@@ -33,9 +33,31 @@
  *     DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
  *     # 然后在对话里说:"联网搜一下 MCP 是什么" —— LLM 会自己调用 load_mcp_server
  *     # 加载内置搜索服务器(demo/mcp-servers/web-search.js),再用 search 回答
+ *
+ * Skill 系统(默认开启,demo/skills/ 目录存在即生效)
+ *   demo/skills/ 下每个含 SKILL.md 的子目录是一个技能。服务端 Agent 通过
+ *   local provider 加载;技能清单(Level 1)自动注入系统提示,LLM 用 `skill`
+ *   元工具按需加载正文(Level 2),再用 read_file 读取附带文件(Level 3)。
+ *
+ *   同时,server 按 HTTP SkillProvider 的 wire 协议暴露 /skill-source/* 接口,
+ *   浏览器端 Agent(browser.html)用 { type: 'http' } provider 从这里拉技能。
+ *
+ *   换技能目录: SKILLS_DIR=/path/to/skills node demo/server.js
+ *
+ * 可选：Subagent 系统(默认开启,SUBAGENTS=0 关闭)
+ *   服务端 Agent 会带上 12 个元工具(agent / agent_graph / graph_start / artifact_write ...)
+ *   以及两个演示用的 Agent_Type(explorer / interviewer)。相关接口:
+ *     GET  /agents     —— 当前所有 subagent、图节点、产物的快照(前端面板轮询它)
+ *     GET  /questions  —— subagent 通过 ask_user 提出、等待用户回答的问题
+ *     POST /answer     —— { askId, answer } 定向回答某一个提问
+ *   提问走的是**命令式通道**(pendingQuestions / answerQuestion),而不是 onAskUser hook ——
+ *   HTTP 服务端不需要在某个请求上下文里 await 一个可能几分钟才有的回答。
  */
 import { createServer } from 'http'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
+import { existsSync } from 'fs'
+import { resolve, sep } from 'path'
+import { fileURLToPath } from 'url'
 import {
   Agent,
   defineTool,
@@ -44,12 +66,39 @@ import {
   unregisterBaseTool,
   formatMcpToolSummary,
   serializeMcpToolForBrowser,
+  createSkillRegistry,
+  listAgentTypes,
+  SUBAGENT_TOOL_NAMES,
 } from '../src/index.js'
+import { createActivityLedger } from './lib/activity.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
-const API_KEY = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY
-const PROVIDER = process.env.PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'openai')
-const MODEL = process.env.MODEL || (PROVIDER === 'deepseek' ? 'deepseek-chat' : 'gpt-4')
+// 供应商与 Key 的解析 —— 与 examples/subagents.js 同一套。SDK 支持 6 家,只认两个 key
+// 会让 demo 在其余供应商上直接起不来(阿里百炼用 DASHSCOPE_API_KEY)。
+const KEY_BY_PROVIDER = {
+  openai: process.env.OPENAI_API_KEY,
+  deepseek: process.env.DEEPSEEK_API_KEY,
+  qwen: process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY,
+  moonshot: process.env.MOONSHOT_API_KEY,
+  zhipu: process.env.ZHIPU_API_KEY,
+  'x-grok': process.env.XAI_API_KEY || process.env.GROK_API_KEY,
+}
+const DEFAULT_MODEL_BY_PROVIDER = {
+  openai: 'gpt-4',
+  deepseek: 'deepseek-chat',
+  qwen: 'qwen-plus',
+  moonshot: 'moonshot-v1-8k',
+  zhipu: 'glm-4',
+  'x-grok': 'grok-2-latest',
+}
+const PROVIDER = process.env.PROVIDER
+  || Object.keys(KEY_BY_PROVIDER).find(p => KEY_BY_PROVIDER[p])
+  || 'openai'
+// 显式 PROVIDER 时也允许用通用的 LLM_API_KEY 传 key。
+const API_KEY = KEY_BY_PROVIDER[PROVIDER] || process.env.LLM_API_KEY
+const MODEL = process.env.MODEL || DEFAULT_MODEL_BY_PROVIDER[PROVIDER] || 'gpt-4'
+// 自定义 API 端点(OpenAI 兼容的代理/聚合服务);不设则用 provider 注册表里的默认地址。
+const LLM_URL = process.env.LLM_URL || undefined
 
 // MCP 集成 —— 可选。未设置 MCP_SERVER_CMD 时完全跳过,向后兼容。
 const MCP_SERVER_CMD = process.env.MCP_SERVER_CMD
@@ -139,6 +188,7 @@ if (!API_KEY) {
   console.warn('  • /browser 模式(浏览器端 Agent)不受影响 — LLM key 在浏览器页面里填')
   console.warn('  • / 模式(服务端 Agent)的 /chat 接口将无法使用')
   console.warn('  设置方式: OPENAI_API_KEY=sk-xxx node demo/server.js')
+  console.warn('  阿里百炼: PROVIDER=qwen DASHSCOPE_API_KEY=sk-xxx node demo/server.js')
 }
 
 const getCurrentTime = defineTool({
@@ -158,6 +208,121 @@ const calculate = defineTool({
   },
   execute: async ({ expression }) => String(Function(`"use strict"; return (${expression})`)()),
 })
+
+// ==================== Skill 系统(默认开启) ====================
+
+const SKILLS_DIR = process.env.SKILLS_DIR
+  ? resolve(process.env.SKILLS_DIR)
+  : fileURLToPath(new URL('./skills', import.meta.url))
+const ENABLE_SKILLS = existsSync(SKILLS_DIR)
+
+// server 侧独立的技能注册表 —— 供 /skills-status 与 /skill-source/*(浏览器端
+// HTTP provider 的数据源)使用。和 Agent 内部的注册表指向同一个目录,各自加载,
+// 互不干扰;这样没有 API Key(纯 browser 模式)时技能接口也可用。
+const skillSource = ENABLE_SKILLS
+  ? createSkillRegistry({ providers: [{ type: 'local', dir: SKILLS_DIR }] })
+  : null
+
+/**
+ * Level 3 文件读取工具 —— `skill` 工具的结果会给出技能的 base directory,
+ * LLM 用这个工具读取其中的 references/ 等附带文件。只允许读 SKILLS_DIR
+ * 之内的路径,demo 不做任意文件读取。
+ */
+const readSkillFile = defineTool({
+  name: 'read_file',
+  description: '读取技能目录下的文件。传入绝对路径(skill 工具的结果里会给出技能的 base directory)',
+  parameters: {
+    type: 'object',
+    properties: { path: { type: 'string', description: '文件绝对路径' } },
+    required: ['path'],
+  },
+  execute: async ({ path }) => {
+    const target = resolve(path)
+    if (target !== SKILLS_DIR && !target.startsWith(SKILLS_DIR + sep)) {
+      return `Error: 只允许读取 ${SKILLS_DIR} 下的文件`
+    }
+    return readFile(target, 'utf8')
+  },
+})
+
+/** 服务端 Agent 的本地基础工具(MCP 工具在 refreshAgentTools 里追加)。 */
+function getLocalBaseTools() {
+  return ENABLE_SKILLS ? [getCurrentTime, calculate, readSkillFile] : [getCurrentTime, calculate]
+}
+
+/** /skill-source/manifest.json 的响应体(HTTP SkillProvider wire 协议)。 */
+async function buildSkillManifest() {
+  const skills = []
+  for (const def of skillSource.list()) {
+    // hash 取 SKILL.md 的 size+mtime,让 http provider 的 refresh 能跳过未变更技能
+    let hash = null
+    try {
+      const s = await stat(resolve(SKILLS_DIR, def.name, 'SKILL.md'))
+      hash = `${s.size}-${Math.round(s.mtimeMs)}`
+    } catch { /* ignore */ }
+    skills.push({
+      name: def.name,
+      description: def.description,
+      version: def.version,
+      hash,
+      files: def.files,
+    })
+  }
+  return { skills }
+}
+// ==================== Subagent 演示素材 ====================
+//
+// 一份假的"项目笔记"。subagent 光有元工具是演示不出东西的 —— 它得有点真东西可读、
+// 可汇报、可登记成产物,面板上那几行状态才有意义。
+const NOTES = {
+  'error-handling': '# 错误处理约定（ERR-CONV-01）\n'
+    + '- 对外 API 一律返回软失败字符串,不 throw；throw 只留给编程错误。\n'
+    + '- 错误类构造函数只接受白名单标量字段,避免 apiKey 泄进 err.message。\n'
+    + '- 传输层错误重试,语义层错误不重试。',
+  modules: '# 模块清单（MOD-01）\n'
+    + 'agent.js / context-manager.js / memory.js / tool-filter.js / mcp / skills / agents',
+  changelog: '# 变更记录（CHG-01）\n- 0.5.0 引入 MCP 客户端\n- 0.5.1 引入 Skill 系统\n- 0.6.0 引入 Subagent 系统',
+}
+
+const readNote = defineTool({
+  name: 'read_note',
+  description: `读取项目笔记。可用的 name: ${Object.keys(NOTES).join(', ')}`,
+  parameters: {
+    type: 'object',
+    properties: { name: { type: 'string', description: '笔记名' } },
+    required: ['name'],
+  },
+  execute: async ({ name }) => NOTES[name] ?? `no note named "${name}"`,
+})
+
+/**
+ * 演示用的 Agent_Type。`tools` 只列任务工具就够 —— artifact_write / artifact_list /
+ * history_search / history_get / send_message / ask_user 是框架保证带上的基础设施 floor。
+ */
+const SUBAGENT_TYPES = [
+  {
+    name: 'explorer',
+    description: '只读检索：读项目笔记、汇报事实,不做任何修改。',
+    systemPrompt: '你是一个只读检索子 agent。用 read_note 找事实,'
+      + '用 artifact_write 把结论登记到产物轨,最后一条消息就是你交回去的报告 —— 先给结论,再给证据。',
+    model: 'fast',
+    tools: ['read_note'],
+    maxRounds: 8,
+  },
+  {
+    name: 'interviewer',
+    description: '需要用户拍板时,替编排者去问一个具体问题。',
+    systemPrompt: '你负责替编排者向用户问一个具体问题：'
+      + '用 ask_user 提问,拿到回答后把回答原样带回去,不要自行猜测。',
+    model: 'fast',
+    tools: [],
+    maxRounds: 6,
+  },
+]
+
+// 默认开启。关掉的方式是 SUBAGENTS=0 —— 关掉后 Agent 不注入那 12 个元工具,
+// 也不发任何 subagent 事件,行为与引入 subagent 之前一致。
+const ENABLE_SUBAGENTS = process.env.SUBAGENTS !== '0' && process.env.SUBAGENTS !== 'false'
 
 // ==================== MCP 工具加载(可选,支持多个并存) ====================
 
@@ -187,21 +352,33 @@ function getMcpPromptNote() {
   return '。当前已挂载 MCP 工具摘要: ' + summaries.join('；')
 }
 
+/**
+ * Agent 构造时注入、但不在本文件 `tools` 数组里的元工具。`refreshAgentTools` 必须
+ * 原样保留它们 —— 面板上挂载/卸载一次 MCP server 就把 subagent 的 12 个元工具和
+ * ask_user 冲掉,是最难发现的那种回归:system 消息里的 agent type 清单还在,模型照着
+ * 它去调 `agent`,却被告知没有这个工具。
+ */
+const META_TOOL_NAMES = new Set([...SUBAGENT_TOOL_NAMES, 'ask_user', 'skill'])
+
 /** 重建 agent 的 tools(不重建 agent 本身,保留对话历史) */
 function refreshAgentTools() {
   if (!agent) return
-  // 保留运行时动态加载相关的工具,避免被面板挂载/卸载操作覆盖丢失:
+  // 保留构造时注入 / 运行时动态加载的元工具,避免被面板挂载/卸载操作覆盖丢失:
+  //   - skill / skill_resource 元工具(skills 配置后构造时注入)
   //   - load_mcp_server 元工具(enableDynamicMCP 启用时注入)
   //   - LLM 通过 load_mcp_server 运行时加载、由 agent._managedClients 持有的工具
+  //   - ask_user 与 subagent 的 12 个元工具(见 META_TOOL_NAMES)
+  // 漏掉任何一组的后果都一样且难查:system prompt 里的清单还在宣传那个工具,
+  // 模型照着去调却被告知没有它。
   const dynamicNames = new Set()
   for (const entry of agent._managedClients?.values?.() ?? []) {
     for (const n of entry.toolNames) dynamicNames.add(n)
   }
   const preserved = agent.tools.filter(
-    (t) => t.name === 'load_mcp_server' || dynamicNames.has(t.name)
+    (t) => t.name === 'load_mcp_server' || t.name === 'skill' || t.name === 'skill_resource'
+      || dynamicNames.has(t.name) || META_TOOL_NAMES.has(t.name)
   )
-  agent.tools = [getCurrentTime, calculate, ...getAllMcpTools(), ...preserved]
-  // 如果有 hooks.onAskUser,ask_user 工具已经在构造时注入了,这里不重复
+  agent.tools = [...getLocalBaseTools(), readNote, ...getAllMcpTools(), ...preserved]
 }
 
 /**
@@ -287,6 +464,9 @@ async function loadMcpFromEnv() {
 
 let currentStrategy = 'react'
 
+// 活动账本 —— 见 demo/lib/activity.js 的头注释:框架不缓存工具流水,主机自己攒。
+const activityLedger = createActivityLedger()
+
 // 运行时动态 MCP 加载 —— 设 DYNAMIC_MCP=1 启用 load_mcp_server 元工具,
 // 让 LLM 在对话中自主决定加载 MCP 服务器(runtime-dynamic-mcp-loading 特性)。
 // 默认关闭,保持与既有 demo 行为一致。
@@ -295,28 +475,71 @@ const ENABLE_DYNAMIC_MCP = process.env.DYNAMIC_MCP === '1' || process.env.DYNAMI
 function createAgent(strategy) {
   currentStrategy = strategy || 'react'
   if (!API_KEY) return null  // browser 模式不需要服务端 agent
-  return new Agent({
+  const created = new Agent({
     provider: PROVIDER,
+    url: LLM_URL,
     apiKey: API_KEY,
     model: MODEL,
-    systemPrompt: '你是一个有用的助手,可以查询时间、做数学计算,并可使用当前已挂载的 MCP 工具'
+    // fast 别名的来源:subagent 的 `model: 'fast'` 解析到 simpleModel/simpleApiKey/simpleUrl 这三件套。
+    simpleModel: process.env.SIMPLE_MODEL || undefined,
+    systemPrompt: '你是一个有用的助手,可以查询时间、做数学计算、读项目笔记,并可使用当前已挂载的 MCP 工具'
       + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在'
       + getMcpPromptNote()
+      + (ENABLE_SKILLS
+        ? '。系统提示末尾会列出可用技能(skill);当用户请求与某个技能匹配时,先调用 skill 工具加载完整指令再作答'
+        : '')
       + (ENABLE_DYNAMIC_MCP
         ? '。你还可以用 load_mcp_server 工具在对话中按需加载新的 MCP 服务器'
           + `(例如 transport="stdio"、command="node"、args=["demo/mcp-servers/web-search.js"]、serverKey="web"、name="web" 可加载内置搜索服务器,得到 mcp__web__search / mcp__web__fetch_page)`
         : '')
+      + (ENABLE_SUBAGENTS
+        ? '。成块的、边界清晰的活可以用 `agent` 工具派给 subagent 去做;多件事之间有依赖时用 `agent_graph` 声明依赖图'
+        : '')
       + '。请用中文回答。',
-    tools: [getCurrentTime, calculate, ...getAllMcpTools()],
+    // getLocalBaseTools() 已含 get_current_time / calculate / (skills 启用时) read_file；
+    // readNote 是 subagent 演示素材，两边合并后一起给。
+    tools: [...getLocalBaseTools(), readNote, ...getAllMcpTools()],
     strategy: currentStrategy,
     // 启用后,Agent 工具集会多一个 load_mcp_server 元工具,LLM 可自主加载 MCP 服务器;
     // 连接/关闭超时沿用默认 30s/5s。运行时加载的客户端由 Agent 持有,reset()/
     // closeMCPClients() 时统一关闭。未启用时行为不变(向后兼容)。
     enableDynamicMCP: ENABLE_DYNAMIC_MCP,
+    // demo/skills/ 存在时启用 skill 系统:构造时注入 `skill` 元工具,首次
+    // chat/stream 前自动 loadSkills(),Level 1 清单每轮合并进系统提示。
+    ...(ENABLE_SKILLS ? {
+      skills: { providers: [{ type: 'local', dir: SKILLS_DIR }] },
+    } : {}),
+    // Subagent 系统。未配置时 agent.subagents 恒为 null,不注入任何元工具。
+    // 提问不接 hooks.onAskUser —— HTTP 服务端用 pendingQuestions()/answerQuestion()
+    // 这条命令式通道更顺手,不需要在某个请求上下文里 await 一个几分钟后才有的回答。
+    ...(ENABLE_SUBAGENTS
+      ? {
+        subagents: {
+          types: SUBAGENT_TYPES,
+          maxConcurrent: 2,
+          maxDepth: 2,
+          artifacts: { policy: 'warn' },
+          keepAlive: true,
+          // demo 场景等 10 分钟没意义,超时后模型会拿到一条"收尾或 agent_cancel"的提示。
+          keepAliveTimeoutMs: 60_000,
+          ask: { timeoutMs: 180_000 },
+        },
+      }
+      : {}),
     // Demo 场景下 8 轮已经够覆盖 ask_user + tool_call + synth 的典型组合；
-    // 默认值 300 太大，真跑起来会让用户以为卡住。
-    maxRounds: 8,
+    // 默认值 300 太大，真跑起来会让用户以为卡住。subagent 开启后一轮对话里可能要
+    // 「派活 → 等 → 收结果 → 起下一个节点 → 收尾」,8 轮不够用。
+    maxRounds: ENABLE_SUBAGENTS ? 16 : 8,
   })
+  // 账本跟着 Agent 走:每次重建(切策略 / 新会话)都清空,否则新会话会挂着上一轮的流水。
+  activityLedger.clear()
+  created.on('round.start', (p) => activityLedger.onRoundStart(p))
+  created.on('tool.call', (p) => activityLedger.onToolCall(p))
+  // 终态事件标记该 agent 可被淘汰——账本永不淘汰非终态条目(见 activity.js 头部注释)。
+  created.on('agent.succeeded', (p) => activityLedger.markTerminal(p.agentId))
+  created.on('agent.failed', (p) => activityLedger.markTerminal(p.agentId))
+  created.on('agent.cancelled', (p) => activityLedger.markTerminal(p.agentId))
+  return created
 }
 
 let agent = createAgent('react')
@@ -349,7 +572,16 @@ async function buildContextSnapshot(agent) {
  * 返回解绑函数。
  */
 function pipeTelemetry(agent, res) {
-  const types = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call']
+  const types = [
+    'session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call',
+    // subagent 系统的事件。列在这里而不是订阅 '*' —— 事件流面板是给人看的,
+    // 图的每一次 tick 都推过去会把真正重要的几条淹掉。
+    'agent.spawn', 'agent.state', 'agent.succeeded', 'agent.failed', 'agent.cancelled',
+    'graph.declared', 'graph.node.ready', 'graph.node.started', 'graph.node.settled', 'graph.closed',
+    'artifact.write', 'artifact.conflict',
+    'ask.user', 'ask.answered', 'ask.cancelled',
+    'run.keep_alive.timeout',
+  ]
   const listeners = []
   for (const t of types) {
     const fn = (payload) => {
@@ -363,6 +595,48 @@ function pipeTelemetry(agent, res) {
     listeners.push([t, fn])
   }
   return () => { for (const [t, fn] of listeners) agent.off(t, fn) }
+}
+
+/**
+ * subagent 面板要的一切:agent 列表、每张图的节点、产物轨、待回答的提问。
+ * 前端在一次对话进行中轮询它 —— 后台 agent 的进展不走 SSE 的 delta 通道,
+ * 只靠事件流的话面板上看不到"现在有几个在跑"。
+ */
+async function buildSubagentSnapshot(agent) {
+  if (!agent?.subagents) {
+    return { enabled: false, types: [], agents: [], graphs: [], artifacts: [], questions: [] }
+  }
+  const rt = agent.subagents
+  const graphs = [...rt.graphs.values()].map((entry) => ({
+    graphId: entry.graphId,
+    label: entry.label ?? null,
+    state: entry.state,
+    active: entry.graphId === rt.activeGraphId,
+    nodes: [...entry.graph.nodes.keys()].map((id) => {
+      const n = entry.graph.get(id)
+      return {
+        nodeId: n.nodeId,
+        description: n.description,
+        state: n.state,
+        dependsOn: n.dependsOn ?? [],
+        agentId: n.agentId ?? null,
+        blockedReason: n.blockedReason ?? null,
+      }
+    }),
+  }))
+  return {
+    enabled: true,
+    types: listAgentTypes().map(t => ({ name: t.name, description: t.description })),
+    // toStatus() 是一份不含函数、不含 apiKey 的快照 —— 直接下发给浏览器是安全的。
+    agents: rt.registry.list({ includeFinished: true }).map((h) => {
+      const status = h.toStatus()
+      return { ...status, activity: activityLedger.snapshot(status.agentId) }
+    }),
+    graphs,
+    artifacts: await agent.getArtifacts(),
+    questions: agent.pendingQuestions(),
+    main: activityLedger.snapshot('main'),
+  }
 }
 
 const server = createServer(async (req, res) => {
@@ -425,6 +699,10 @@ const server = createServer(async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: 'metrics', lastRun, session })}\n\n`)
       const context = await buildContextSnapshot(agent)
       res.write(`data: ${JSON.stringify({ type: 'context', context })}\n\n`)
+      // 一轮结束时再补一份 subagent 快照 —— 后台 agent 可能在这一轮里刚 settle,
+      // 面板不该停在最后一次轮询看到的中间态。
+      const subagents = await buildSubagentSnapshot(agent)
+      res.write(`data: ${JSON.stringify({ type: 'subagents', subagents })}\n\n`)
     } catch (err) {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`)
     } finally {
@@ -443,9 +721,53 @@ const server = createServer(async (req, res) => {
     return
   }
 
+  // ==================== Subagent 面板 ====================
+
+  // 全量快照:agent / 图节点 / 产物 / 待答提问。前端在对话进行中轮询。
+  if (req.method === 'GET' && req.url === '/agents') {
+    const snapshot = await buildSubagentSnapshot(agent)
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify(snapshot))
+    return
+  }
+
+  // 只要待答提问 —— 轮询频率比全量快照高,单独开一个省带宽。
+  if (req.method === 'GET' && req.url === '/questions') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify({ questions: agent?.pendingQuestions?.() ?? [] }))
+    return
+  }
+
+  // 定向回答某一个提问。`askId` 是必须的:多个 agent 可能同时在问,
+  // 按 askId 路由才能保证答案回到问它的那一个,也才允许乱序回答。
+  if (req.method === 'POST' && req.url === '/answer') {
+    let body = ''
+    for await (const chunk of req) body += chunk
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    try {
+      const { askId, answer, cancel, reason } = JSON.parse(body || '{}')
+      if (!askId) throw new Error('askId 必填')
+      const ok = cancel
+        ? agent.cancelQuestion(askId, reason ?? '用户放弃回答')
+        : agent.answerQuestion(askId, String(answer ?? ''))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      // ok=false 不是错误:两条应答通道是竞速的,后到的那条静默 no-op。
+      res.end(JSON.stringify({ ok, note: ok ? undefined : '该提问已被回答或已失效' }))
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: false, error: err?.message ?? String(err) }))
+    }
+    return
+  }
+
   // 重置会话
   if (req.method === 'POST' && req.url === '/reset') {
     agent.reset()
+    // 重建 Agent,而不是只 reset()。`reset()` 会取消在跑的 subagent,但 AgentRegistry
+    // 按 `retainCompleted` 保留已完成的 handle(这是设计:`send_message` 还能唤醒它们),
+    // 所以只 reset 的话"新会话"面板里会挂着上一轮那批 agent。对一个叫"新会话"的按钮来说
+    // 那是假象。
+    agent = createAgent(currentStrategy)
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
     res.end('{"ok":true}')
     return
@@ -590,6 +912,58 @@ const server = createServer(async (req, res) => {
     return
   }
 
+  // 技能状态(供前端徽章/面板展示)。enabled=false 时前端隐藏面板。
+  if (req.method === 'GET' && req.url === '/skills-status') {
+    const skills = skillSource
+      ? skillSource.list().map((d) => ({
+          name: d.name,
+          description: d.description,
+          version: d.version,
+          files: d.files.filter((f) => f !== 'SKILL.md'),
+          hidden: d.disableModelInvocation,
+        }))
+      : []
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify({ enabled: ENABLE_SKILLS, dir: SKILLS_DIR, count: skills.length, skills }))
+    return
+  }
+
+  // HTTP SkillProvider wire 协议 —— 浏览器端 Agent 的技能数据源。
+  //   GET /skill-source/manifest.json
+  //   GET /skill-source/skills/<name>/<relPath>
+  if (req.method === 'GET' && req.url === '/skill-source/manifest.json') {
+    if (!skillSource) {
+      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({ error: 'skills disabled (demo/skills not found)' }))
+      return
+    }
+    const manifest = await buildSkillManifest()
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify(manifest))
+    return
+  }
+
+  if (req.method === 'GET' && req.url.startsWith('/skill-source/skills/')) {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    try {
+      const rel = decodeURIComponent(req.url.slice('/skill-source/skills/'.length))
+      const target = resolve(SKILLS_DIR, rel)
+      // 防目录穿越:解析后必须仍在 SKILLS_DIR 内
+      if (!skillSource || rel.length === 0 || (target !== SKILLS_DIR && !target.startsWith(SKILLS_DIR + sep))) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' })
+        res.end('Not Found')
+        return
+      }
+      const content = await readFile(target, 'utf8')
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end(content)
+    } catch (_err) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Not Found')
+    }
+    return
+  }
+
   // 当前会话的累计指标（Session_Metrics）
   if (req.method === 'GET' && req.url === '/metrics') {
     const session = agent.getSessionMetrics()
@@ -619,6 +993,16 @@ const server = createServer(async (req, res) => {
 // 对向后兼容无影响。connectMcp 内部已重建 agent。
 await loadMcpFromEnv()
 
+// 加载 server 侧技能注册表(/skills-status 与 /skill-source/* 的数据源)。
+// 失败不阻塞启动 —— 单技能解析失败注册表内部已 warn+skip。
+if (skillSource) {
+  try {
+    await skillSource.load()
+  } catch (err) {
+    console.warn(`[skills] 技能目录加载失败: ${err.message}`)
+  }
+}
+
 // 启动 HTTP server —— 端口被占时自动 +1 重试(最多试 10 次)
 function startServer(port, retries = 10) {
   server.once('error', (err) => {
@@ -644,6 +1028,22 @@ function startServer(port, retries = 10) {
       console.log(`MCP: 未挂载 (可从浏览器面板一键挂载,或设置 MCP_SERVER_CMD 环境变量)`)
     }
     console.log(`动态 MCP (load_mcp_server 元工具): ${ENABLE_DYNAMIC_MCP ? '已启用 (LLM 可在对话中自主加载)' : '未启用 (设 DYNAMIC_MCP=1 开启)'}`)
+    if (ENABLE_SKILLS) {
+      const names = skillSource.list().map((d) => d.name).join(', ') || '(空)'
+      console.log(`Skills: 已加载 ${skillSource.list().length} 个技能 (${names}),目录: ${SKILLS_DIR}`)
+    } else {
+      console.log(`Skills: 未启用 (技能目录不存在: ${SKILLS_DIR})`)
+    }
+    if (!ENABLE_SUBAGENTS) {
+      console.log('Subagent: 未启用 (SUBAGENTS=0)')
+    } else if (!agent) {
+      // 没有 key 就没有服务端 Agent,类型也就没被注册过 —— 这时候报"已启用"
+      // 会让人对着一个不存在的 agent 找问题。
+      console.log('Subagent: 配置已开启,但服务端 Agent 未创建(缺 API Key);/browser 页面里的 Agent 不受影响')
+    } else {
+      console.log(`Subagent: 已启用 —— ${SUBAGENT_TOOL_NAMES.length} 个元工具, `
+        + `类型: ${listAgentTypes().map(t => t.name).join(', ')} (设 SUBAGENTS=0 关闭)`)
+    }
   })
 }
 startServer(PORT)
@@ -653,6 +1053,9 @@ async function shutdown() {
   await disconnectMcp()  // 卸载全部面板/环境变量挂载的 MCP server
   // 关闭 LLM 通过 load_mcp_server 运行时加载的 MCP client(enableDynamicMCP 启用时)
   try { await agent?.closeMCPClients?.() } catch { /* ignore */ }
+  // 后台 subagent 会跨 chat() 存活,不收尾进程不会自然退出;同时 reject 掉所有
+  // 待答提问,避免悬挂的 Promise 卡住退出。
+  try { await agent?.closeSubagents?.() } catch { /* ignore */ }
   process.exit(0)
 }
 process.on('SIGINT', shutdown)
