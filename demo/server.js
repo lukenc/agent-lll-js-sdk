@@ -56,6 +56,7 @@ import {
   listAgentTypes,
   SUBAGENT_TOOL_NAMES,
 } from '../src/index.js'
+import { createActivityLedger } from './lib/activity.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
 const API_KEY = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY
@@ -362,6 +363,9 @@ async function loadMcpFromEnv() {
 
 let currentStrategy = 'react'
 
+// 活动账本 —— 见 demo/lib/activity.js 的头注释:框架不缓存工具流水,主机自己攒。
+const activityLedger = createActivityLedger()
+
 // 运行时动态 MCP 加载 —— 设 DYNAMIC_MCP=1 启用 load_mcp_server 元工具,
 // 让 LLM 在对话中自主决定加载 MCP 服务器(runtime-dynamic-mcp-loading 特性)。
 // 默认关闭,保持与既有 demo 行为一致。
@@ -370,7 +374,7 @@ const ENABLE_DYNAMIC_MCP = process.env.DYNAMIC_MCP === '1' || process.env.DYNAMI
 function createAgent(strategy) {
   currentStrategy = strategy || 'react'
   if (!API_KEY) return null  // browser 模式不需要服务端 agent
-  return new Agent({
+  const created = new Agent({
     provider: PROVIDER,
     url: LLM_URL,
     apiKey: API_KEY,
@@ -416,6 +420,11 @@ function createAgent(strategy) {
     // 「派活 → 等 → 收结果 → 起下一个节点 → 收尾」,8 轮不够用。
     maxRounds: ENABLE_SUBAGENTS ? 16 : 8,
   })
+  // 账本跟着 Agent 走:每次重建(切策略 / 新会话)都清空,否则新会话会挂着上一轮的流水。
+  activityLedger.clear()
+  created.on('round.start', (p) => activityLedger.onRoundStart(p))
+  created.on('tool.call', (p) => activityLedger.onToolCall(p))
+  return created
 }
 
 let agent = createAgent('react')
@@ -504,10 +513,14 @@ async function buildSubagentSnapshot(agent) {
     enabled: true,
     types: listAgentTypes().map(t => ({ name: t.name, description: t.description })),
     // toStatus() 是一份不含函数、不含 apiKey 的快照 —— 直接下发给浏览器是安全的。
-    agents: rt.registry.list({ includeFinished: true }).map(h => h.toStatus()),
+    agents: rt.registry.list({ includeFinished: true }).map((h) => {
+      const status = h.toStatus()
+      return { ...status, activity: activityLedger.snapshot(status.agentId) }
+    }),
     graphs,
     artifacts: await agent.getArtifacts(),
     questions: agent.pendingQuestions(),
+    main: activityLedger.snapshot('main'),
   }
 }
 
