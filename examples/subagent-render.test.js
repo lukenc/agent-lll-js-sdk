@@ -138,3 +138,45 @@ test('done 恢复光标显示', () => {
   r.done()
   assert.match(s.out(), /\x1b\[\?25h/)
 })
+
+test('TTY:连续两次等行数重绘的净垂直位移必须是 0（clearLive 的两次上移必须配对）', () => {
+  // clearLive() 先 \x1b[nA 上移到活动区顶部，逐行清除+下移回到底部，再 \x1b[nA
+  // 上移回顶部，writeLive() 才重新逐行写入并下移。四步走完，光标应当落在与
+  // 上一帧相同的相对位置——净位移为 0。如果收尾那次上移被删掉，clearLive()
+  // 会把光标留在活动区*下方*，writeLive() 再从那里往下写 N 行，于是每重绘一次
+  // 活动区就整体下沉 N 行，10fps 下终端会持续滚屏。
+  const s = fakeStream(true)
+  const r = createRenderer({ stream: s, isTTY: true })
+  const rows = [{ label: 'a', detail: '', ms: 0 }, { label: 'b', detail: '', ms: 0 }]
+  r.update(rows)                 // 第一次：liveLines 从 0 起，clearLive 提前 return，不产生位移噪音
+  const before = s.out()
+  r.update(rows)                 // 第二次：liveLines=2，clearLive 真正执行清除
+  const chunk = s.out().slice(before.length)
+
+  // 净垂直位移：\x1b[nB 与 '\n' 记 +n / +1（向下），\x1b[nA 记 -n（向上）。
+  let net = 0
+  const re = /\x1b\[(\d+)([AB])|\n/g
+  let m
+  while ((m = re.exec(chunk))) {
+    if (m[2] === 'A') net -= Number(m[1])
+    else if (m[2] === 'B') net += Number(m[1])
+    else net += 1 // '\n'
+  }
+  assert.strictEqual(net, 0,
+    `两行活动区连续重绘一次后光标净位移应为 0，实测 ${net}（chunk=${JSON.stringify(chunk)}）`)
+})
+
+test('返回对象可以被解构后自由调用，不依赖 this（拷贝粘贴场景）', () => {
+  // settle() 内部若写成 this.log(line)，`const { settle } = createRenderer()`
+  // 解构出来单独调用时 this 是 undefined，会直接抛 TypeError。
+  const s = fakeStream(true)
+  const { log, settle, update, done } = createRenderer({ stream: s, isTTY: true })
+  assert.doesNotThrow(() => {
+    update([{ label: 'a', detail: 'read_note', ms: 0 }])
+    log('普通输出')
+    settle('✓ 固化输出')
+    done()
+  })
+  assert.match(s.out(), /普通输出/)
+  assert.match(s.out(), /✓ 固化输出/)
+})
