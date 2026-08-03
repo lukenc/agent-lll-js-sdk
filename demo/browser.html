@@ -63,6 +63,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .telemetry .events-head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;padding:6px 10px;border-bottom:1px solid #e0e0e0;display:flex;align-items:center;justify-content:space-between}
 .telemetry .events-head button{background:transparent;border:1px solid #ddd;color:#666;padding:1px 8px;border-radius:4px;cursor:pointer;font-size:10px}
 .telemetry .events{flex:1;overflow-y:auto;padding:6px 10px;display:flex;flex-direction:column;gap:3px}
+.telemetry .subagents{border-bottom:1px solid #e0e0e0;padding:8px 10px;max-height:30vh;min-height:90px;overflow-y:auto;flex:none}
+.telemetry .subagents .head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666;font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between}
+.telemetry .sa-empty{color:#999;font-size:11px}
+.sa-row{display:flex;align-items:center;gap:6px;font-family:'SF Mono',Menlo,monospace;font-size:11px;padding:3px 0;border-bottom:1px dashed #eee}
+.sa-row .sa-name{font-weight:600;color:#1a1a2e}
+.sa-row .sa-meta{color:#888}
+.sa-state{padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;background:#eee;color:#555}
+.sa-state.running,.sa-state.queued{background:#fff4d6;color:#8a5a00}
+.sa-state.succeeded{background:#e3f7e8;color:#1a7f37}
+.sa-state.failed,.sa-state.cancelled{background:#fde8e8;color:#b42318}
+.sa-state.waiting_input,.sa-state.awaiting_confirm{background:#e6f0ff;color:#1f4fd8}
+.sa-state.blocked{background:#f0f0f0;color:#777}
+.sa-graph{margin-top:6px}
+.sa-graph .sa-graph-head{font-size:11px;color:#444;font-weight:600;margin:6px 0 2px}
+.sa-node{padding-left:10px}
 .telemetry .event{padding:5px 7px;border-radius:5px;background:#fff;border:1px solid #e8e8e8;font-family:'SF Mono',Menlo,monospace;font-size:11px;line-height:1.3;display:flex;flex-direction:column;gap:2px}
 .telemetry .event .evt-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .telemetry .event .evt-name{font-weight:600;padding:1px 5px;border-radius:3px;font-size:10px}
@@ -136,6 +151,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <label>API Key
     <input type="text" id="apikey" placeholder="sk-xxx" autocomplete="off">
   </label>
+  <label>自定义 API URL
+    <input type="text" id="apiUrl" placeholder="留空用供应商默认地址" autocomplete="off">
+  </label>
   <label>执行策略
     <select id="strategy">
       <option value="react">ReAct（默认）</option>
@@ -165,6 +183,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </label>
   <label class="check">
     <input type="checkbox" id="enableAskUser" checked> 注入 ask_user 工具（允许 LLM 向你发问）
+  </label>
+  <label class="check">
+    <input type="checkbox" id="enableSubagents" checked> 启用 Subagent（注入 agent / agent_graph 等 12 个元工具）
   </label>
 
   <button onclick="initAgent()">连接</button>
@@ -217,6 +238,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         </div>
       </div>
     </div>
+    <div class="subagents" id="subagentPanel" style="display:none">
+      <div class="head">
+        <span>🤖 Subagents</span>
+        <span id="saSummary">—</span>
+      </div>
+      <div id="saBody"><div class="sa-empty">还没派出 subagent。试试「派一个 agent 去查北京天气」。</div></div>
+    </div>
     <div class="events-head">
       <span>事件流</span>
       <button onclick="clearEvents()">清空</button>
@@ -239,6 +267,44 @@ var defineTool = LllWebAgent.defineTool
 var registerBaseTool = LllWebAgent.registerBaseTool
 var unregisterBaseTool = LllWebAgent.unregisterBaseTool
 var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
+
+/**
+ * 浏览器端的 Agent_Type。`tools` 只列任务工具 —— artifact_write / artifact_list /
+ * history_search / history_get / send_message / ask_user 是框架保证带上的 floor。
+ *
+ * 浏览器里没有 git worktree、没有 shell_exec,跨 agent 的护栏只有产物轨,
+ * 所以这里的类型都刻意做成"只读 + 登记产物"的窄类型。
+ */
+var BROWSER_SUBAGENT_TYPES = [
+  {
+    name: 'researcher',
+    description: '查一件具体的事（天气 / 单位换算 / 计算）并把结论带回来,不改页面。',
+    systemPrompt: '你是一个只读的调查子 agent。用给你的工具查清楚一件事,'
+      + '用 artifact_write 把结论登记到产物轨,最后一条消息就是你交回去的报告：先给结论,再给依据。',
+    tools: ['get_weather', 'convert_unit', 'calculate', 'get_current_time'],
+    maxRounds: 8,
+  },
+  {
+    name: 'scribe',
+    description: '把给定内容写进记事本,并登记成产物。',
+    systemPrompt: '你负责把编排者交代的内容用 notepad 记下来,'
+      + '再用 artifact_write 登记一条产物,最后回报你记了什么。',
+    tools: ['notepad', 'process_text'],
+    maxRounds: 6,
+  },
+  {
+    name: 'interviewer',
+    description: '需要用户拍板时,替编排者去问一个具体问题。',
+    systemPrompt: '你负责替编排者向用户问一个具体问题：'
+      + '用 ask_user 提问,拿到回答后把回答原样带回去,不要自行猜测。',
+    // 任务工具一个都不要:`ask_user` 由 floor 保证带上 —— 配了 subagents 之后
+    // 主 agent 一定有这个工具(不取决于上面那个勾选框,那个框控制的是**谁来答**:
+    // 勾上才装 hooks.onAskUser 弹层,不勾就只能等 ask.timeoutMs 超时)。
+    tools: [],
+    maxRounds: 6,
+  },
+]
+
 var agent = null
 var sending = false
 var chat = document.getElementById('chat')
@@ -723,12 +789,14 @@ function initAgent() {
   var provider = document.getElementById('provider').value
   var model = document.getElementById('model').value
   var apiKey = document.getElementById('apikey').value.trim()
+  var apiUrl = document.getElementById('apiUrl').value.trim()
   var strategy = document.getElementById('strategy').value
   var simpleProvider = document.getElementById('simpleProvider').value
   var simpleModel = document.getElementById('simpleModel').value.trim()
   var simpleApiKey = document.getElementById('simpleApiKey').value.trim()
   var enableIntent = document.getElementById('enableIntent').checked
   var enableAskUser = document.getElementById('enableAskUser').checked
+  var enableSubagents = document.getElementById('enableSubagents').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
   var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
@@ -755,13 +823,37 @@ function initAgent() {
   if (simpleProvider) agentOpts.simpleProvider = simpleProvider
   if (simpleModel) agentOpts.simpleModel = simpleModel
   if (simpleApiKey) agentOpts.simpleApiKey = simpleApiKey
+  if (apiUrl) agentOpts.url = apiUrl
   if (enableAskUser) {
     agentOpts.hooks = {
-      onAskUser: function(question) {
-        addMsg('phase', '❓ ask_user: ' + question)
-        return askUserDialog(question)
+      onAskUser: function(question, meta) {
+        // 签名扩展成 (question, meta) 之后,提问可能来自某个 subagent ——
+        // 不把 meta.agentName 显示出来的话,用户不知道是谁在问、为什么问。
+        var who = meta && meta.agentName && meta.agentName !== 'main'
+          ? meta.agentName + '（' + (meta.taskDescription || '') + '）'
+          : ''
+        addMsg('phase', '❓ ask_user' + (who ? ' from ' + who : '') + ': ' + question)
+        return askUserDialog(who ? '[' + who + '] ' + question : question)
       },
     }
+  }
+  if (enableSubagents) {
+    // 浏览器里没有 git worktree、没有 shell_exec —— 跨 agent 的护栏只有产物轨,
+    // 所以这里显式把它调成 deny:同一个 key 被另一个 agent 覆盖时直接拒绝。
+    agentOpts.subagents = {
+      types: BROWSER_SUBAGENT_TYPES,
+      maxConcurrent: 2,
+      maxDepth: 2,
+      artifacts: { policy: 'deny' },
+      keepAlive: true,
+      keepAliveTimeoutMs: 60000,
+      // 必须设。`ask.timeoutMs` 默认 null = 永不超时,而这个页面**只有** hook 一条
+      // 应答通道:上面那个"注入 ask_user 工具"没勾时 hook 不装,一个 interviewer
+      // 子 agent 的提问就永远没人答 —— 它会一直占着并发槽挂到页面关掉。
+      ask: { timeoutMs: 120000 },
+    }
+    // subagent 一轮对话里要「派活 → 等 → 收结果 → 收尾」,12 轮容易不够。
+    agentOpts.maxRounds = 20
   }
 
   agent = new Agent(agentOpts)
@@ -770,9 +862,20 @@ function initAgent() {
   // 说明：监听器为空时 Agent 也会维护 getLastRunMetrics / getSessionMetrics，
   // 这里显式订阅以做 UI 可视化。失败时通过 console.warn 暴露。
   var telemetryTypes = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call']
+  if (enableSubagents) {
+    telemetryTypes = telemetryTypes.concat([
+      'agent.spawn', 'agent.state', 'agent.succeeded', 'agent.failed', 'agent.cancelled',
+      'graph.declared', 'graph.node.ready', 'graph.node.settled', 'graph.closed',
+      'artifact.write', 'artifact.conflict', 'ask.user',
+    ])
+  }
   telemetryTypes.forEach(function(t) {
     agent.on(t, function(payload) { renderTelemetry(t, payload) })
   })
+  if (enableSubagents) {
+    // 后台 agent 的进展不走 delta 通道 —— 不定时刷新的话面板会停在派活那一刻。
+    startBrowserSubagentPolling()
+  }
   // 'warn' 也接入一下，便于发现监听器 bug
   agent.on('warn', function(w) { console.warn('[telemetry warn]', w) })
 
@@ -968,6 +1071,84 @@ function tag(text, extraCls) {
 
 // 交互式 ask_user：LLM 调用 ask_user 工具时，弹出对话框由真人回答。
 // 这里做成 Promise，resolve 后把用户回答回传给 Agent。
+// ==== Subagent 面板（浏览器端）====
+//
+// 服务端 demo 靠轮询 /agents;这里 Agent 就在页面里,直接读它的 runtime 快照即可。
+// 读的都是 toStatus() / graph.get() 这类不含函数、不含 apiKey 的快照。
+
+var saTimer = null
+
+function startBrowserSubagentPolling() {
+  document.getElementById('subagentPanel').style.display = ''
+  if (saTimer) clearInterval(saTimer)
+  renderBrowserSubagents()
+  saTimer = setInterval(renderBrowserSubagents, 1000)
+}
+
+function saEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+  })
+}
+
+async function renderBrowserSubagents() {
+  var panel = document.getElementById('subagentPanel')
+  var body = document.getElementById('saBody')
+  var summary = document.getElementById('saSummary')
+  if (!agent || !agent.subagents) { panel.style.display = 'none'; return }
+  panel.style.display = ''
+
+  var rt = agent.subagents
+  var agents = rt.registry.list({ includeFinished: true }).map(function(h) { return h.toStatus() })
+  var running = agents.filter(function(a) {
+    return a.state === 'running' || a.state === 'queued' || a.state === 'waiting_input'
+  }).length
+  summary.textContent = running + ' 在跑 / ' + agents.length + ' 总计'
+
+  var artifacts = []
+  try { artifacts = await agent.getArtifacts() } catch (e) { artifacts = [] }
+
+  var graphs = []
+  rt.graphs.forEach(function(entry) {
+    var nodes = []
+    entry.graph.nodes.forEach(function(_v, id) { nodes.push(entry.graph.get(id)) })
+    graphs.push({ entry: entry, nodes: nodes })
+  })
+
+  if (agents.length === 0 && graphs.length === 0) {
+    body.innerHTML = '<div class="sa-empty">还没派出 subagent。试试「派一个 agent 去查北京天气」。</div>'
+    return
+  }
+
+  var parts = []
+  agents.forEach(function(a) {
+    var meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.metrics && a.metrics.rounds ? 'rounds=' + a.metrics.rounds : null]
+      .filter(Boolean).join(' · ')
+    parts.push('<div class="sa-row"><span class="sa-state ' + saEsc(a.state) + '">' + saEsc(a.state) + '</span>'
+      + '<span class="sa-name">' + saEsc(a.name) + '</span><span class="sa-meta">' + saEsc(meta) + '</span></div>')
+  })
+  graphs.forEach(function(g) {
+    parts.push('<div class="sa-graph"><div class="sa-graph-head">图 ' + saEsc(g.entry.graphId)
+      + (g.entry.label ? ' 「' + saEsc(g.entry.label) + '」' : '') + ' [' + saEsc(g.entry.state) + ']</div>')
+    g.nodes.forEach(function(n) {
+      var dep = n.dependsOn && n.dependsOn.length ? ' ← ' + n.dependsOn.join(', ') : ''
+      parts.push('<div class="sa-row sa-node"><span class="sa-state ' + saEsc(n.state) + '">' + saEsc(n.state) + '</span>'
+        + '<span class="sa-name">' + saEsc(n.nodeId) + '</span>'
+        + '<span class="sa-meta">' + saEsc(n.description + dep) + '</span></div>')
+    })
+    parts.push('</div>')
+  })
+  if (artifacts.length > 0) {
+    parts.push('<div class="sa-graph"><div class="sa-graph-head">产物轨</div>')
+    artifacts.slice(-8).forEach(function(a) {
+      parts.push('<div class="sa-row sa-node"><span class="sa-name">' + saEsc(a.key) + '</span>'
+        + '<span class="sa-meta">sha:' + saEsc(a.sha || '') + ' by ' + saEsc(a.agentName || '') + '</span></div>')
+    })
+    parts.push('</div>')
+  }
+  body.innerHTML = parts.join('')
+}
+
 function askUserDialog(question) {
   return new Promise(function(resolve) {
     var overlay = document.createElement('div')
@@ -1036,6 +1217,29 @@ function renderTelemetry(name, payload) {
   if (name === 'session.end') {
     updateRunMetricsFromSessionEnd(payload)
     if (agent) updateSessionMetricsFromAgent()
+  }
+
+  // subagent 的几件大事直接落到主聊天区 —— 事件流面板是排查用的,
+  // 「派了谁、谁回来了」是用户要跟的主线。
+  if (name === 'agent.spawn') {
+    addMsg('phase', '🤖 派出 subagent ' + (payload.name || payload.agentName || '') + '（' + (payload.type || '?') + '）')
+    renderBrowserSubagents()
+  }
+  if (name === 'agent.succeeded') {
+    addMsg('phase', '✅ subagent ' + payload.agentName + ' 完成（rounds=' + (payload.rounds != null ? payload.rounds : '—') + '）')
+    renderBrowserSubagents()
+  }
+  if (name === 'agent.failed') {
+    addMsg('error', '❌ subagent ' + payload.agentName + ' 失败：' + (payload.failureKind || ''))
+  }
+  if (name === 'graph.declared') {
+    addMsg('phase', '🕸 依赖图已声明：' + (payload.accepted || []).join(' → ') + '（共 ' + payload.total + ' 个节点）')
+  }
+  if (name === 'graph.node.settled') {
+    addMsg('phase', (payload.state === 'succeeded' ? '✅' : '⚠️') + ' 节点 ' + payload.nodeId + ' → ' + payload.state)
+  }
+  if (name === 'artifact.conflict') {
+    addMsg('error', '⚠️ 产物冲突：' + payload.key + ' 已属于 ' + payload.owner + '（policy=' + payload.policy + '）')
   }
 
   // 同 demo/index.html：round.start 时在主聊天区垫一条 "思考中" 消息，
@@ -1107,6 +1311,31 @@ function formatDetail(name, p) {
       var errPart2 = p.ok === false ? '  ✗ ' + p.errorKind : ''
       return p.name + '  ' + dur2 + 'ms  ' + p.bytes + 'B' + errPart2
     }
+    // ---- subagent ----
+    case 'agent.spawn':
+      return (p.name || p.agentName || '') + '  type=' + (p.type || '—') + '  depth=' + (p.depth != null ? p.depth : '—')
+    case 'agent.state':
+      return (p.agentName || p.name || '') + '  ' + (p.from || '?') + ' → ' + (p.to || p.state || '?')
+    case 'agent.succeeded':
+      return p.agentName + '  rounds=' + (p.rounds != null ? p.rounds : '—')
+    case 'agent.failed':
+      return p.agentName + '  ' + (p.failureKind || '')
+    case 'agent.cancelled':
+      return p.agentName + '  ' + (p.reason || '')
+    case 'graph.declared':
+      return 'accepted=' + (p.accepted || []).join(', ') + '  total=' + p.total
+    case 'graph.node.ready':
+      return p.nodeId + '  等 graph_start 给契约'
+    case 'graph.node.settled':
+      return p.nodeId + ' → ' + p.state
+    case 'graph.closed':
+      return p.graphId + '  ' + (p.disposition || '')
+    case 'artifact.write':
+      return p.key + '  sha:' + p.sha + '  by ' + p.agentName
+    case 'artifact.conflict':
+      return p.key + '  与 ' + p.owner + ' 冲突  policy=' + p.policy
+    case 'ask.user':
+      return p.agentName + ': ' + String(p.question || '').slice(0, 50)
     default:
       return ''
   }

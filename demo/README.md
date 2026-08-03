@@ -265,6 +265,64 @@ demo 会在每轮对话结束后展示当前 Agent 的 RuntimeHistory 轨道快�
 | POST | `/mcp-disconnect` | 卸载 MCP server，body `{ name }`（不传则全卸） |
 | GET | `/mcp-tools` | 列出所有已挂载 MCP 工具（含 title/icons/outputSchema/execution/annotations/modelDescription，供浏览器端代理调用） |
 | POST | `/mcp-call` | 代理执行某个 MCP 工具，body `{ name, arguments }` |
+| GET | `/agents` | Subagent 快照：agent 列表、每张图的节点、产物轨、待答提问 |
+| GET | `/questions` | 只取待答提问（面板高频轮询用） |
+| POST | `/answer` | 定向回答一个提问，body `{ askId, answer }` 或 `{ askId, cancel: true, reason }` |
+
+---
+
+## 用法四：Subagent（派活给子 agent / DAG 编排）
+
+默认**开启**（`SUBAGENTS=0` 关闭）。开启后服务端 Agent 会带上 12 个元工具
+（`agent` / `agent_status` / `agent_cancel` / `agent_graph` / `graph_start` /
+`graph_close` / `graph_reactivate` / `send_message` / `artifact_write` /
+`artifact_list` / `history_search` / `history_get`），以及两个演示用的
+Agent_Type：
+
+| 类型 | 能做什么 | 拿到的工具 |
+|---|---|---|
+| `explorer` | 只读检索：读项目笔记、汇报事实 | `read_note` + 基础设施 floor |
+| `interviewer` | 替编排者向用户问一个具体问题 | 只有 floor（含 `ask_user`） |
+
+> 窄类型不需要把 `artifact_write` / `history_search` / `ask_user` 写进 `tools` ——
+> 它们是框架保证带上的 floor（与父 agent 实际拥有的工具取交集）。
+
+右侧面板会实时显示每个 subagent 的状态、每张图的节点与依赖、以及产物轨。
+subagent 通过 `ask_user` 提问时，页面底部会弹出黄色横幅，回答按 `askId` 定向送回
+提问的那一个 agent（所以多个 agent 同时提问也不会串）。
+
+服务端用的是**命令式提问通道**（`agent.pendingQuestions()` / `agent.answerQuestion()`），
+不是 `hooks.onAskUser` —— HTTP 服务端不需要在某个请求上下文里 `await` 一个几分钟后
+才有的回答。浏览器端 demo 相反，用的是 hook + 弹层（签名已扩展为
+`onAskUser(question, meta)`，`meta.agentName` 会显示在弹层标题里）。
+
+**「新会话」会重建 Agent**，而不是只 `reset()`：`AgentRegistry` 按 `retainCompleted`
+保留已完成的 handle（设计如此，`send_message` 还能唤醒它们），只 reset 的话面板里会
+挂着上一轮那批 agent。
+
+---
+
+## 试试这些话术
+
+启动后（`OPENAI_API_KEY=sk-xxx node demo/server.js`）在页面里输入：
+
+| 说 | 会走到 |
+|---|---|
+| 现在几点 / 算一下 (17+25)*3 | 普通工具调用 |
+| 用一个 explorer 在后台调研这个仓库的错误处理约定 | 后台 subagent + keep-alive + 轮边界注入 |
+| 用 agent_graph 声明一张依赖图：并行统计模块清单和变更记录，第三个节点汇总 | DAG：两个 auto 上游 + 一个 confirm 闸门 → `graph_start` → `graph_close` |
+| 用 artifact_list 把产物列出来 | 产物轨 |
+| 派一个 interviewer 问我发布窗口定在什么时候 | 提问路由（服务端横幅 / 浏览器端弹层） |
+| 北京天气怎么样、帮我记一条笔记… | `/browser` 那 10 个工具（既有能力） |
+
+同一套集成也有一个纯命令行的版本：
+
+```bash
+OPENAI_API_KEY=sk-xxx node examples/subagents.js
+```
+
+7 幕跑完既有功能（工具 / Skill / MCP）与 subagent（后台派发 / DAG / 产物轨 / 提问路由），
+末尾对若干关键事实做断言，任一条不成立以非 0 退出 —— 可以直接当回归脚本用。
 
 ---
 
@@ -275,7 +333,8 @@ demo 会在每轮对话结束后展示当前 Agent 的 RuntimeHistory 轨道快�
 
 **`/chat` 不工作 / 提示没有 API Key**
 服务端 Agent 需要 `OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY`。浏览器端 Agent
-（`/browser`）不受影响，Key 在页面里填。
+（`/browser`）不受影响，Key 在页面里填。用 OpenAI 兼容的代理/聚合服务时，
+服务端设 `LLM_URL=https://.../v1/chat/completions`，浏览器端填页面上的「自定义 API URL」。
 
 **端口 3000 被占用**
 server 会自动尝试 3001、3002……最多试 10 次。也可以用 `PORT=8080` 指定。

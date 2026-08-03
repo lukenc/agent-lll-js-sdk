@@ -138,9 +138,57 @@ Key test files and what they cover:
 
 All tests mock HTTP calls; no real API keys needed to run tests.
 
+## Demo / example integration
+
+`demo/` and `examples/` are consumer-facing: an integration reference for people wiring
+this SDK into their own host, and a showcase for end users. They talk to a **real
+provider** — no stub/fake model lives in either tree, and none should be added. Both
+entry points therefore need `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` (or a
+`LLM_URL`-pointed OpenAI-compatible endpoint) to run.
+
+- `examples/subagents.js` — 7 acts covering existing features (tools + memory +
+  knowledge base, Skill, MCP) and the subagent system (background spawn + keep-alive,
+  DAG, artifacts + history search, ask routing). Each act asserts *what happened* (was
+  an agent spawned, did every graph node reach `succeeded`, is anything on the artifact
+  track) rather than how the model worded its reply, and exits non-zero on any failure.
+  Doubles as the regression script for the Definition of Done below.
+- `demo/` — `node demo/server.js` serves both `/` (server-side Agent, ask routing via
+  the imperative `/questions` + `/answer` channel) and `/browser` (browser-side Agent,
+  ask routing via `hooks.onAskUser`). New endpoints: `/agents`, `/questions`,
+  `/answer`. `SUBAGENTS=0` turns the subagent system off.
+
+Two demo-side details that are load-bearing rather than cosmetic: `refreshAgentTools()`
+must preserve `META_TOOL_NAMES` (mounting an MCP server from the panel would otherwise
+wipe the 12 subagent meta-tools while the system prompt still advertises the agent-type
+listing), and `/reset` rebuilds the Agent instead of only calling `reset()` (the
+`AgentRegistry` retains finished handles by design, so "新会话" would otherwise show the
+previous session's agents).
+
+Note that `SummarizingMemory` is the Agent's default memory: a long demo session
+compacts earlier turns away, so anything that reads raw history (including the host's
+own UI logic) must tolerate the original instruction no longer being present as a
+`user` message.
+
 ## Key Conventions
 
 - Pure ESM (`"type": "module"` in package.json) — use `import`/`export`, not `require`.
 - No TypeScript, no transpilation — plain JavaScript with esbuild for bundling only.
 - No linter or formatter configured.
 - `todo.md` tracks known bugs by severity (P0–P3) and regression fixes (R-1 to R-4). Consult it before working on bug fixes.
+
+## Definition of Done — 硬性要求（MANDATORY，不可跳过）
+
+任何任务在被判定为"完成"之前，**必须**完成 `demo/` 与 `examples/` 两侧的集成验证。单元测试通过（`npm test`）**不等于**任务完成，只是完成的前置条件之一。
+
+**验收清单（每一条都必须真实执行并给出证据，不允许推断或假设）：**
+
+1. **`examples/` 集成** — 新增或更新一个 example，覆盖本次改动的功能。用真实命令跑通（如 `node examples/<name>.js`），确认进程正常启动、无未捕获异常、能完成一轮完整对话并产出预期结果。
+2. **`demo/` 集成** — 在 `demo/`（Node 侧 `demo/server.js` 与浏览器侧 `demo/index.html` / `demo/browser.html`）中接入本次改动。必须实际启动 demo 服务、在页面上完成一次真实对话，确认可正常启动、可正常使用、可对话。涉及浏览器打包路径的改动，先跑 `npm run build` 再验证 demo 页面。
+3. **新旧功能同场验证** — 例子必须是一个**综合用例**：既包含本次新增的功能，也包含此前已有的关键功能（如 memory 策略、tool 调用、MCP、skills、intent/tool filter、plan_and_execute 等中与本次改动相关的部分），用来证明旧功能没有被本次修改破坏。
+4. **失败即回退重审** — 如果集成做不进去，或任何旧功能在集成中出现异常/退化，**不允许**通过改 demo/example 去迁就、绕过或注释掉问题。必须回到本次改动本身重新审视设计与实现并修复，然后重跑第 1–3 步。
+5. **循环直到全绿** — 重复"修复 → 重新集成 → 重新验证"，直到 example 与 demo 全部集成成功、新旧功能均可正常使用为止。在此之前，任务状态一律是"未完成"。
+
+**报告要求**：交付时必须如实说明实际执行了哪些命令、demo/example 的运行结果，以及任何被跳过或未覆盖的部分及原因。禁止在未真实运行的情况下声称"已验证"。
+
+**不要往 `demo/` 或 `examples/` 里塞假模型。** 它们是给使用方的集成参考、给用户的展示，一个 stub LLM 出现在里面会误导两类读者。验收必须打真实供应商；没有 Key 就找人要，而不是造一个假的绕过去。
+
