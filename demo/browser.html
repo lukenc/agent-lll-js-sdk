@@ -287,15 +287,27 @@ function createActivityLedger(maxTools, maxAgents) {
   maxTools = maxTools || 20
   maxAgents = maxAgents || 50
   var byAgent = new Map()
+  // 已知处于终态（succeeded/failed/cancelled）的 agentId 集合。
+  var terminalIds = new Set()
   function entry(id) {
     var e = byAgent.get(id)
     if (!e) {
       e = { rounds: 0, tools: [], truncated: 0 }
       byAgent.set(id, e)
+      // Map 保持插入顺序，从头扫起找到的第一个终态 key 就是最旧的终态条目。
+      // 非终态条目永不淘汰，所以找不到终态条目时就不删——账本允许暂时超过上限。
       while (byAgent.size > maxAgents) {
-        var oldest = byAgent.keys().next().value
-        if (oldest === id) break
-        byAgent.delete(oldest)
+        var oldestTerminal = null
+        var keys = byAgent.keys()
+        var next = keys.next()
+        while (!next.done) {
+          var key = next.value
+          if (key !== id && terminalIds.has(key)) { oldestTerminal = key; break }
+          next = keys.next()
+        }
+        if (oldestTerminal == null) break
+        byAgent.delete(oldestTerminal)
+        terminalIds.delete(oldestTerminal)
       }
     }
     return e
@@ -320,7 +332,15 @@ function createActivityLedger(maxTools, maxAgents) {
       var e = byAgent.get(id)
       return e ? { rounds: e.rounds, tools: e.tools.slice(), truncated: e.truncated } : null
     },
-    clear: function() { byAgent.clear() },
+    /**
+     * 把 agentId 标记为终态（succeeded/failed/cancelled），使其成为下次淘汰时的候选。
+     * 未知 agentId 是无害的 no-op —— 不会替它创建一条空条目。
+     */
+    markTerminal: function(id) {
+      if (!byAgent.has(id)) return
+      terminalIds.add(id)
+    },
+    clear: function() { byAgent.clear(); terminalIds.clear() },
   }
 }
 
@@ -1175,7 +1195,9 @@ function saExpanded(a) {
 function saCost(a) {
   var m = a.metrics || {}
   var running = ['succeeded', 'failed', 'cancelled'].indexOf(a.state) === -1
-  var ms = running && a.startedAt ? Date.now() - a.startedAt : m.wallClockMs
+  // Math.max(0, …)：这里的时钟是本机的，理论上不会算出负数，但和 demo/index.html
+  // 的 saCost（浏览器时钟 vs 服务端 startedAt，两台机器真的会偏移）保持实现一致。
+  var ms = running && a.startedAt ? Math.max(0, Date.now() - a.startedAt) : m.wallClockMs
   var u = m.usage || {}
   var tok = (u.input_tokens || 0) + (u.output_tokens || 0)
   var parts = []
@@ -1264,13 +1286,15 @@ async function renderBrowserSubagents() {
     parts.push('</div>')
   })
   graphs.forEach(function(g) {
+    var active = g.entry.graphId === rt.activeGraphId
     parts.push('<div class="sa-graph"><div class="sa-graph-head">图 ' + saEsc(g.entry.graphId)
-      + (g.entry.label ? ' 「' + saEsc(g.entry.label) + '」' : '') + ' [' + saEsc(g.entry.state) + ']</div>')
+      + (g.entry.label ? ' 「' + saEsc(g.entry.label) + '」' : '') + ' [' + saEsc(g.entry.state) + (active ? ', active' : '') + ']</div>')
     g.nodes.forEach(function(n) {
       var dep = n.dependsOn && n.dependsOn.length ? ' ← ' + n.dependsOn.join(', ') : ''
+      var why = n.blockedReason ? ' (' + n.blockedReason + ')' : ''
       parts.push('<div class="sa-row sa-node"><span class="sa-state ' + saEsc(n.state) + '">' + saEsc(n.state) + '</span>'
         + '<span class="sa-name">' + saEsc(n.nodeId) + '</span>'
-        + '<span class="sa-meta">' + saEsc(n.description + dep) + '</span></div>')
+        + '<span class="sa-meta">' + saEsc(n.description + dep + why) + '</span></div>')
     })
     parts.push('</div>')
   })
@@ -1367,17 +1391,19 @@ function renderTelemetry(name, payload) {
     renderBrowserSubagents()
   }
   if (name === 'agent.succeeded') {
+    activityLedger.markTerminal(payload.agentId)
     addMsg('phase', '✅ subagent ' + payload.agentName + ' 完成（rounds=' + (payload.rounds != null ? payload.rounds : '—') + '）')
     renderBrowserSubagents()
   }
   if (name === 'agent.failed') {
+    activityLedger.markTerminal(payload.agentId)
     addMsg('error', '❌ subagent ' + payload.agentName + ' 失败：' + (payload.failureKind || ''))
+  }
+  if (name === 'agent.cancelled') {
+    activityLedger.markTerminal(payload.agentId)
   }
   if (name === 'graph.declared') {
     addMsg('phase', '🕸 依赖图已声明：' + (payload.accepted || []).join(' → ') + '（共 ' + payload.total + ' 个节点）')
-  }
-  if (name === 'graph.node.settled') {
-    addMsg('phase', (payload.state === 'succeeded' ? '✅' : '⚠️') + ' 节点 ' + payload.nodeId + ' → ' + payload.state)
   }
   if (name === 'artifact.conflict') {
     addMsg('error', '⚠️ 产物冲突：' + payload.key + ' 已属于 ' + payload.owner + '（policy=' + payload.policy + '）')
@@ -1385,11 +1411,15 @@ function renderTelemetry(name, payload) {
 
   // 同 demo/index.html：round.start 时在主聊天区垫一条 "思考中" 消息，
   // round.end 时原地替换成耗时。防止用户误以为 Qwen 长思考是卡死。
-  if (name === 'round.start') {
+  // 但框架会把**每个 subagent** 的 round.start/round.end 也转发到父总线上——
+  // 三个 DAG 节点并跑时聊天区会被一堆不带归属的 "Round 0 思考中…" 淹没，
+  // 挤在主 agent 自己的 "Round 5" 旁边，读者会以为主 agent 重开了。
+  // 只有主 agent 自己的 round 事件才没有 agentId，用这个当守卫。
+  if (name === 'round.start' && !payload.agentId) {
     var r = addMsg('phase', '⏳ Round ' + payload.round + ' 思考中…')
     r.dataset.roundSpan = payload.spanId
   }
-  if (name === 'round.end') {
+  if (name === 'round.end' && !payload.agentId) {
     var r2 = chat.querySelector('[data-round-span="' + payload.spanId + '"]')
     if (r2) r2.textContent = '✓ Round ' + payload.round + ' 完成 (' + formatDuration(payload.durationMs) + ')'
   }
@@ -1412,6 +1442,15 @@ function renderTelemetry(name, payload) {
   detail.className = 'evt-detail'
   detail.textContent = formatDetail(name, payload)
   row.appendChild(detail)
+
+  // 主 agent 的事件不带 agentName（缺省即主），只给子 agent 转发上来的事件打标记。
+  if (payload.agentName) {
+    var who = document.createElement('span')
+    who.className = 'evt-meta'
+    who.textContent = '@' + payload.agentName
+    row.appendChild(who)
+  }
+
   el.appendChild(row)
 
   var meta = buildMeta(payload)
