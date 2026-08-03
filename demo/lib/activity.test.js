@@ -42,14 +42,52 @@ test('失败的工具调用记 ok:false', () => {
   assert.deepStrictEqual(led.snapshot('a').tools, [{ name: 'boom', ok: false, ms: 5 }])
 })
 
-test('agent 数超过 maxAgents 时按插入顺序淘汰最旧的', () => {
+test('agent 数超过 maxAgents 时按插入顺序淘汰最旧的终态 agent', () => {
   const led = createActivityLedger({ maxAgents: 2 })
   led.onToolCall({ agentId: 'a', name: 'x', ok: true, durationMs: 1 })
   led.onToolCall({ agentId: 'b', name: 'x', ok: true, durationMs: 1 })
+  led.markTerminal('a')
   led.onToolCall({ agentId: 'c', name: 'x', ok: true, durationMs: 1 })
   assert.strictEqual(led.snapshot('a'), null)
   assert.ok(led.snapshot('b'))
   assert.ok(led.snapshot('c'))
+})
+
+test('非终态 agent 永不淘汰:更旧的非终态条目在过了 maxAgents 后依然存活,反而淘汰更旧的终态条目', () => {
+  const led = createActivityLedger({ maxAgents: 2 })
+  led.onToolCall({ agentId: 'main', name: 'x', ok: true, durationMs: 1 }) // 非终态,永不淘汰
+  led.onToolCall({ agentId: 'b', name: 'x', ok: true, durationMs: 1 })
+  led.markTerminal('b') // b 是终态,比 main 晚插入但是唯一的淘汰候选
+  led.onToolCall({ agentId: 'c', name: 'x', ok: true, durationMs: 1 })
+  assert.ok(led.snapshot('main'), 'main 是非终态,即便是插入顺序里最旧的也不该被淘汰')
+  assert.strictEqual(led.snapshot('b'), null, 'b 是唯一的终态条目,该被淘汰')
+  assert.ok(led.snapshot('c'))
+})
+
+test('全部条目都是非终态时,超过 maxAgents 也不淘汰任何条目', () => {
+  const led = createActivityLedger({ maxAgents: 2 })
+  led.onToolCall({ agentId: 'a', name: 'x', ok: true, durationMs: 1 })
+  led.onToolCall({ agentId: 'b', name: 'x', ok: true, durationMs: 1 })
+  led.onToolCall({ agentId: 'c', name: 'x', ok: true, durationMs: 1 })
+  assert.ok(led.snapshot('a'), '没有终态候选时账本允许暂时超过 maxAgents')
+  assert.ok(led.snapshot('b'))
+  assert.ok(led.snapshot('c'))
+})
+
+test('markTerminal 对未知 agentId 是无害 no-op,不会创建条目', () => {
+  const led = createActivityLedger()
+  led.markTerminal('ghost')
+  assert.strictEqual(led.snapshot('ghost'), null)
+})
+
+test('markTerminal 不影响已有条目的 rounds/tools/truncated', () => {
+  const led = createActivityLedger({ maxTools: 3 })
+  led.onRoundStart({ agentId: 'a', round: 1 })
+  led.onToolCall({ agentId: 'a', name: 'x', ok: true, durationMs: 1 })
+  const before = led.snapshot('a')
+  led.markTerminal('a')
+  const after = led.snapshot('a')
+  assert.deepStrictEqual(after, before)
 })
 
 test('未知 agentId 返回 null，不返回空壳', () => {

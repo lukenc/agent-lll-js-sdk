@@ -424,6 +424,10 @@ function createAgent(strategy) {
   activityLedger.clear()
   created.on('round.start', (p) => activityLedger.onRoundStart(p))
   created.on('tool.call', (p) => activityLedger.onToolCall(p))
+  // 终态事件标记该 agent 可被淘汰——账本永不淘汰非终态条目(见 activity.js 头部注释)。
+  created.on('agent.succeeded', (p) => activityLedger.markTerminal(p.agentId))
+  created.on('agent.failed', (p) => activityLedger.markTerminal(p.agentId))
+  created.on('agent.cancelled', (p) => activityLedger.markTerminal(p.agentId))
   return created
 }
 
