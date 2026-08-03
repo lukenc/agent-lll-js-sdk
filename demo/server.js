@@ -59,9 +59,30 @@ import {
 import { createActivityLedger } from './lib/activity.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
-const API_KEY = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY
-const PROVIDER = process.env.PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'openai')
-const MODEL = process.env.MODEL || (PROVIDER === 'deepseek' ? 'deepseek-chat' : 'gpt-4')
+// 供应商与 Key 的解析 —— 与 examples/subagents.js 同一套。SDK 支持 6 家,只认两个 key
+// 会让 demo 在其余供应商上直接起不来(阿里百炼用 DASHSCOPE_API_KEY)。
+const KEY_BY_PROVIDER = {
+  openai: process.env.OPENAI_API_KEY,
+  deepseek: process.env.DEEPSEEK_API_KEY,
+  qwen: process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY,
+  moonshot: process.env.MOONSHOT_API_KEY,
+  zhipu: process.env.ZHIPU_API_KEY,
+  'x-grok': process.env.XAI_API_KEY || process.env.GROK_API_KEY,
+}
+const DEFAULT_MODEL_BY_PROVIDER = {
+  openai: 'gpt-4',
+  deepseek: 'deepseek-chat',
+  qwen: 'qwen-plus',
+  moonshot: 'moonshot-v1-8k',
+  zhipu: 'glm-4',
+  'x-grok': 'grok-2-latest',
+}
+const PROVIDER = process.env.PROVIDER
+  || Object.keys(KEY_BY_PROVIDER).find(p => KEY_BY_PROVIDER[p])
+  || 'openai'
+// 显式 PROVIDER 时也允许用通用的 LLM_API_KEY 传 key。
+const API_KEY = KEY_BY_PROVIDER[PROVIDER] || process.env.LLM_API_KEY
+const MODEL = process.env.MODEL || DEFAULT_MODEL_BY_PROVIDER[PROVIDER] || 'gpt-4'
 // 自定义 API 端点(OpenAI 兼容的代理/聚合服务);不设则用 provider 注册表里的默认地址。
 const LLM_URL = process.env.LLM_URL || undefined
 
@@ -153,6 +174,7 @@ if (!API_KEY) {
   console.warn('  • /browser 模式(浏览器端 Agent)不受影响 — LLM key 在浏览器页面里填')
   console.warn('  • / 模式(服务端 Agent)的 /chat 接口将无法使用')
   console.warn('  设置方式: OPENAI_API_KEY=sk-xxx node demo/server.js')
+  console.warn('  阿里百炼: PROVIDER=qwen DASHSCOPE_API_KEY=sk-xxx node demo/server.js')
 }
 
 const getCurrentTime = defineTool({
