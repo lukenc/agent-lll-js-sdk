@@ -589,7 +589,11 @@ function saExpanded(a) {
 function saCost(a) {
   const m = a.metrics || {}
   const running = !['succeeded', 'failed', 'cancelled'].includes(a.state)
-  const ms = running && a.startedAt ? Date.now() - a.startedAt : m.wallClockMs
+  // Date.now() 是浏览器本机时钟，a.startedAt 是服务端时钟经 HTTP /agents 传来的——
+  // 两台机器的时钟有偏移是常态。不 clamp 的话偏移够大时这里会算出负数，
+  // formatDuration(-30000) 会原样吐出 "-30000ms"，把耗时列显示成明显的坏数据。
+  // 不要把这个 Math.max(0, …) “简化”掉。
+  const ms = running && a.startedAt ? Math.max(0, Date.now() - a.startedAt) : m.wallClockMs
   const u = m.usage || {}
   const tok = (u.input_tokens || 0) + (u.output_tokens || 0)
   const parts = []

@@ -303,8 +303,9 @@ subagent 通过 `ask_user` 提问时，页面底部会弹出黄色横幅，回�
 ### 事件带归属，攒成 UI 状态是主机的活
 
 `runner._forwardTelemetry` 把每个 subagent 的 `llm.call` / `tool.call` /
-`round.start` / `round.end` 转发到**父 agent 的同一条总线**上，并补上 `agentId`
-与 `agentName`。主 agent 自己发的事件不带这两个字段 —— 所以归属规则只有一条：
+`round.start` / `round.end` 转发到**父 agent 的同一条总线**上，并补上 `agentId`、
+`agentName` 与 `parentAgentId`（后者是做深度感知的归属 UI 时需要的那个字段）。
+主 agent 自己发的事件不带这些字段 —— 所以归属规则只有一条：
 
 ```js
 const owner = payload.agentId ?? 'main'
