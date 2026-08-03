@@ -54,3 +54,21 @@ export {
   SkillMaterializeError,
   SkillProviderError,
 } from './skills/index.js'
+export {
+  createSubagentRuntime,
+  registerAgentType,
+  getAgentType,
+  listAgentTypes,
+  unregisterAgentType,
+  resetAgentTypes,
+  AGENT_TYPE_NAME_RE,
+  INITIAL_AGENT_TYPES,
+  registerA2ATransport,
+  RESERVED_A2A_TRANSPORTS,
+  SUBAGENT_TOOL_NAMES,
+  SubagentError,
+  AgentTypeError,
+  AgentGraphError,
+  A2AError,
+  WorktreeIsolationError,
+} from './agents/index.js'

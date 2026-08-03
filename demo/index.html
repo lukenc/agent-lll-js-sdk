@@ -118,6 +118,62 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   flex-direction: column;
   gap: 4px;
 }
+/* ==== Subagent 面板 ==== */
+.subagents {
+  border-bottom: 1px solid #e0e0e0;
+  padding: 10px 12px;
+  max-height: 34vh;
+  min-height: 90px;
+  overflow-y: auto;
+  /* flex:none —— 面板在 flex 列里会被 .events(flex:1) 挤没，窗口一矮就只剩一行标题 */
+  flex: none;
+}
+.subagents .head {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+  color: #666; font-weight: 600; margin-bottom: 6px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.subagents .sa-empty { color: #999; font-size: 11px; }
+.sa-row {
+  display: flex; align-items: center; gap: 6px;
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px;
+  padding: 3px 0; border-bottom: 1px dashed #eee;
+}
+.sa-row .sa-name { font-weight: 600; color: #1a1a2e; }
+.sa-row .sa-meta { color: #888; }
+.sa-state {
+  padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600;
+  background: #eee; color: #555;
+}
+.sa-state.running, .sa-state.queued { background: #fff4d6; color: #8a5a00; }
+.sa-state.succeeded { background: #e3f7e8; color: #1a7f37; }
+.sa-state.failed, .sa-state.cancelled { background: #fde8e8; color: #b42318; }
+.sa-state.waiting_input, .sa-state.awaiting_confirm { background: #e6f0ff; color: #1f4fd8; }
+.sa-state.blocked { background: #f0f0f0; color: #777; }
+.sa-graph { margin-top: 8px; }
+.sa-graph .sa-graph-head { font-size: 11px; color: #444; font-weight: 600; margin: 6px 0 2px; }
+.sa-node { padding-left: 10px; }
+.sa-head { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 4px 0; }
+.sa-head .sa-caret { color: #999; width: 10px; display: inline-block; }
+.sa-head .sa-cost { margin-left: auto; color: #888; font-size: 10px; font-family: 'SF Mono', Menlo, monospace; }
+.sa-tools { padding: 2px 0 4px 20px; }
+.sa-tool { display: flex; gap: 6px; font-family: 'SF Mono', Menlo, monospace; font-size: 11px; color: #555; padding: 1px 0; }
+.sa-tool .sa-tool-ms { margin-left: auto; color: #aaa; }
+.sa-tool.bad { color: #b42318; }
+.sa-thinking { color: #8a5a00; font-style: italic; }
+.sa-truncated { color: #aaa; font-size: 10px; padding-left: 20px; }
+.sa-fail { color: #b42318; font-size: 10px; }
+/* 提问横幅 —— 放在输入区上方,因为它是"必须先处理"的东西 */
+.ask-banner {
+  background: #fff8e1; border-top: 1px solid #ffe082; padding: 10px 20px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.ask-banner .ask-q { font-size: 13px; color: #5d4037; }
+.ask-banner .ask-q b { color: #1a1a2e; }
+.ask-banner .ask-form { display: flex; gap: 8px; }
+.ask-banner input { flex: 1; padding: 8px 10px; border: 1px solid #ffd54f; border-radius: 6px; font-size: 13px; }
+.ask-banner button { padding: 8px 14px; border: none; border-radius: 6px; background: #f9a825; color: #fff; cursor: pointer; font-size: 13px; }
+.ask-banner button.ghost { background: transparent; color: #8d6e63; border: 1px solid #ffd54f; }
 .telemetry .events-head {
   font-size: 10px;
   text-transform: uppercase;
@@ -236,6 +292,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         </div>
       </div>
     </div>
+    <div class="subagents" id="subagentPanel">
+      <div class="head">
+        <span>🤖 Subagents</span>
+        <span id="saSummary">—</span>
+      </div>
+      <div id="saBody"><div class="sa-empty">未派出任何 subagent。试试「派一个子 agent 调研错误处理约定」或「并行统计模块和变更记录」。</div></div>
+    </div>
     <div class="events-head">
       <span>事件流</span>
       <button onclick="clearEvents()">清空</button>
@@ -244,6 +307,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       <div class="empty">发送一条消息，即可看到 llm.call / tool.call / round.* / session.* 实时事件流</div>
     </div>
   </aside>
+</div>
+<div class="ask-banner" id="askBanner" style="display:none">
+  <div class="ask-q" id="askQuestion"></div>
+  <div class="ask-form">
+    <input id="askInput" placeholder="回答这个 subagent 的提问..." autocomplete="off" />
+    <button onclick="submitAnswer()">回答</button>
+    <button class="ghost" onclick="submitAnswer(true)">放弃</button>
+  </div>
 </div>
 <div class="input-area">
   <input id="input" placeholder="输入消息..." autocomplete="off" />
@@ -268,6 +339,8 @@ async function send() {
   input.value = ''
   sending = true
   sendBtn.disabled = true
+  // 一轮对话里后台 agent 的进展不走 delta 通道 —— 不轮询的话面板要等整轮结束才动。
+  startSubagentPolling()
 
   addMsg('user', msg)
   let assistantEl = null
@@ -360,6 +433,9 @@ async function send() {
             case 'context':
               renderContextSnapshot(event.context)
               break
+            case 'subagents':
+              renderSubagents(event.subagents)
+              break
           }
         } catch {}
       }
@@ -372,8 +448,225 @@ async function send() {
   if (assistantEl && !assistantEl.textContent) assistantEl.remove()
   sending = false
   sendBtn.disabled = false
+  stopSubagentPolling()
   input.focus()
 }
+
+// ==== Subagent 面板 ====
+
+let saTimer = null
+
+function startSubagentPolling() {
+  if (saTimer) return
+  refreshSubagents()
+  saTimer = setInterval(refreshSubagents, 1000)
+}
+
+function stopSubagentPolling() {
+  if (saTimer) { clearInterval(saTimer); saTimer = null }
+  // 停止轮询后再拉一次:最后一次定时拉取和本轮真正结束之间还可能有状态变化。
+  refreshSubagents()
+}
+
+async function refreshSubagents() {
+  try {
+    const res = await fetch('/agents')
+    renderSubagents(await res.json())
+  } catch { /* 请求期间服务端可能正忙,下一次轮询会补上 */ }
+}
+
+function renderSubagents(snap) {
+  const body = document.getElementById('saBody')
+  const summary = document.getElementById('saSummary')
+  if (!snap || !snap.enabled) {
+    summary.textContent = '未启用'
+    body.innerHTML = '<div class="sa-empty">Subagent 未启用（服务端 SUBAGENTS=0）。</div>'
+    renderAskBanner([])
+    return
+  }
+
+  const agents = snap.agents || []
+  const graphs = snap.graphs || []
+  const artifacts = snap.artifacts || []
+  const running = agents.filter(a => a.state === 'running' || a.state === 'queued' || a.state === 'waiting_input').length
+  summary.textContent = `${running} 在跑 / ${agents.length} 总计`
+
+  if (agents.length === 0 && graphs.length === 0) {
+    body.innerHTML = '<div class="sa-empty">未派出任何 subagent。试试「派一个子 agent 调研错误处理约定」或「并行统计模块和变更记录」。</div>'
+    renderAskBanner(snap.questions || [])
+    return
+  }
+
+  const parts = []
+  for (const a of agents) {
+    const expanded = saExpanded(a)
+    const meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.attempt > 1 ? 'attempt ' + a.attempt : null]
+      .filter(Boolean).join(' · ')
+    const fail = saFailure(a)
+    const terminal = ['succeeded', 'failed', 'cancelled'].includes(a.state)
+    parts.push(
+      // 不用内联 onclick：agentId 拼进 '单引号 JS 字符串' 又嵌在双引号 HTML 属性里，
+      // esc() 只转义 & < > "，转义不了单引号——今天 agentId 恒为 agt_+8位十六进制，
+      // 碰不到，但这是个脆弱假设。改成 data-* + 渲染后绑定监听器，直接不进入那个嵌套语境。
+      `<div class="sa-head" data-agent-id="${esc(a.agentId)}" data-default-expanded="${terminal ? '0' : '1'}">`
+      + `<span class="sa-caret">${expanded ? '▼' : '▶'}</span>`
+      + `<span class="sa-state ${esc(a.state)}">${esc(a.state)}</span>`
+      + `<span class="sa-name">${esc(a.name)}</span>`
+      + `<span class="sa-meta">${esc(meta)}</span>`
+      + (fail ? `<span class="sa-fail">${esc(fail)}</span>` : '')
+      + `<span class="sa-cost">${esc(saCost(a))}</span></div>`
+    )
+    if (!expanded) continue
+    const act = a.activity
+    parts.push('<div class="sa-tools">')
+    if (act && act.truncated > 0) {
+      parts.push(`<div class="sa-truncated">…前 ${act.truncated} 条已省略</div>`)
+    }
+    for (const t of (act ? act.tools : [])) {
+      const mark = t.ok === false ? '✗' : '✓'
+      parts.push(`<div class="sa-tool${t.ok === false ? ' bad' : ''}">`
+        + `<span>${mark} ${esc(t.name)}</span>`
+        + `<span class="sa-tool-ms">${t.ms == null ? '' : t.ms + 'ms'}</span></div>`)
+    }
+    // tool.call 是执行完才发的，所以没有"进行中"的工具行。运行中而流水没长出新条目
+    // 时，agent 大多数情况下是在等 LLM —— 用一行"思考中"表达，不伪造一条工具行。
+    // waiting_input 是例外：那不是模型在想，是模型已经问完、卡在等人类回答。
+    if (a.state === 'waiting_input') {
+      parts.push('<div class="sa-tool sa-thinking">⏸ 等你回答…</div>')
+    } else if (!terminal) {
+      parts.push('<div class="sa-tool sa-thinking">● 思考中…</div>')
+    }
+    parts.push('</div>')
+  }
+
+  for (const g of graphs) {
+    parts.push(`<div class="sa-graph"><div class="sa-graph-head">图 ${esc(g.graphId)}`
+      + `${g.label ? ' 「' + esc(g.label) + '」' : ''} [${esc(g.state)}${g.active ? ', active' : ''}]</div>`)
+    for (const n of g.nodes) {
+      const dep = n.dependsOn && n.dependsOn.length ? ` ← ${n.dependsOn.join(', ')}` : ''
+      const why = n.blockedReason ? ` (${n.blockedReason})` : ''
+      parts.push(
+        `<div class="sa-row sa-node"><span class="sa-state ${esc(n.state)}">${esc(n.state)}</span>`
+        + `<span class="sa-name">${esc(n.nodeId)}</span>`
+        + `<span class="sa-meta">${esc(n.description + dep + why)}</span></div>`
+      )
+    }
+    parts.push('</div>')
+  }
+
+  if (artifacts.length > 0) {
+    parts.push('<div class="sa-graph"><div class="sa-graph-head">产物轨</div>')
+    for (const a of artifacts.slice(-8)) {
+      parts.push(
+        `<div class="sa-row sa-node"><span class="sa-name">${esc(a.key)}</span>`
+        + `<span class="sa-meta">sha:${esc(a.sha || '')} by ${esc(a.agentName || '')}</span></div>`
+      )
+    }
+    parts.push('</div>')
+  }
+
+  body.innerHTML = parts.join('')
+  // 内联 onclick 会把 agentId 拼进 HTML 属性里的 JS 字符串字面量，esc() 覆盖不到
+  // 那个语境；渲染完再绑监听器，直接不进入需要转义的嵌套上下文。
+  body.querySelectorAll('.sa-head').forEach(el => {
+    el.onclick = () => saToggle(el.dataset.agentId, el.dataset.defaultExpanded === '1')
+  })
+  renderAskBanner(snap.questions || [])
+}
+
+// 用户手动切换过的 agentId。1s 一次的轮询会重绘整块 DOM —— 不记住手动选择，
+// 用户刚展开的卡片下一秒就被默认策略折回去了。
+const saManual = new Map()   // agentId -> boolean(expanded)
+
+function saToggle(agentId, defaultExpanded) {
+  const cur = saManual.has(agentId) ? saManual.get(agentId) : defaultExpanded
+  saManual.set(agentId, !cur)
+  refreshSubagents()
+}
+
+function saExpanded(a) {
+  const terminal = ['succeeded', 'failed', 'cancelled'].includes(a.state)
+  return saManual.has(a.agentId) ? saManual.get(a.agentId) : !terminal
+}
+
+/** 耗时 · token · 步数。运行中 wallClockMs 还没落定，用 startedAt 现算。 */
+function saCost(a) {
+  const m = a.metrics || {}
+  const running = !['succeeded', 'failed', 'cancelled'].includes(a.state)
+  // Date.now() 是浏览器本机时钟，a.startedAt 是服务端时钟经 HTTP /agents 传来的——
+  // 两台机器的时钟有偏移是常态。不 clamp 的话偏移够大时这里会算出负数，
+  // formatDuration(-30000) 会原样吐出 "-30000ms"，把耗时列显示成明显的坏数据。
+  // 不要把这个 Math.max(0, …) “简化”掉。
+  const ms = running && a.startedAt ? Math.max(0, Date.now() - a.startedAt) : m.wallClockMs
+  const u = m.usage || {}
+  const tok = (u.input_tokens || 0) + (u.output_tokens || 0)
+  const parts = []
+  if (ms) parts.push(formatDuration(ms))
+  if (tok) parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + 'k tok' : tok + ' tok')
+  if (m.rounds) parts.push(m.rounds + ' 步')
+  return parts.length ? parts.join(' · ') : '—'
+}
+
+/** failureKind 不在 toStatus() 顶层，在 attempts[] 里逐次记录，取最后一条。 */
+function saFailure(a) {
+  const last = (a.attempts || []).at(-1)
+  return last && last.failureKind ? last.failureKind : null
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+  ))
+}
+
+// ==== 提问路由：一次只展示一个,按 askId 定向应答 ====
+
+let currentAsk = null
+
+function renderAskBanner(questions) {
+  const banner = document.getElementById('askBanner')
+  const pending = (questions || []).filter(q => q.state === 'pending')
+  if (pending.length === 0) {
+    currentAsk = null
+    banner.style.display = 'none'
+    return
+  }
+  const q = pending[0]
+  // 已经在答同一个问题就别重绘,否则会把用户正在输入的字清掉。
+  if (currentAsk && currentAsk.askId === q.askId) return
+  currentAsk = q
+  document.getElementById('askQuestion').innerHTML =
+    `❓ <b>${esc(q.agentName)}</b>（${esc(q.taskDescription || '')}）问你：${esc(q.question)}`
+    + (pending.length > 1 ? `　<span style="color:#8d6e63">还有 ${pending.length - 1} 个提问排队</span>` : '')
+  banner.style.display = 'flex'
+  document.getElementById('askInput').focus()
+}
+
+async function submitAnswer(cancel) {
+  if (!currentAsk) return
+  const el = document.getElementById('askInput')
+  const answer = el.value.trim()
+  if (!cancel && !answer) return
+  const askId = currentAsk.askId
+  el.value = ''
+  currentAsk = null
+  document.getElementById('askBanner').style.display = 'none'
+  addMsg('phase', cancel ? `🚫 放弃回答 ${askId}` : `💬 已回答 ${askId}: ${answer}`)
+  try {
+    await fetch('/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ askId, answer, cancel: !!cancel }),
+    })
+  } catch (err) {
+    addMsg('error', `回答失败: ${err.message}`)
+  }
+  refreshSubagents()
+}
+
+document.getElementById('askInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); submitAnswer() }
+})
 
 function addMsg(role, text) {
   const el = document.createElement('div')
@@ -421,13 +714,40 @@ function renderTelemetry(name, payload) {
   // 没有 tool_call 的轮次（例如开场白）会让主区域看起来完全没反应；这里拿
   // round.start 时垫一条消息，round.end 时原地替换成耗时，既不污染事件流
   // 面板，也能让用户看到"还在跑"。
-  if (name === 'round.start') {
+  // 只给**主 agent** 画轮次气泡。框架把每个 subagent 的 round.start/round.end 也转发到
+  // 同一条总线上（带 agentId），不挡住的话：三个 DAG 节点在跑时，聊天区会插进一串没有归属的
+  // 「⏳ Round 0 思考中…」，紧挨着主 agent 的「Round 5」—— 读起来像主 agent 重启了。
+  // subagent 的逐轮活动属于右侧面板，不属于对话流。
+  if (name === 'round.start' && !payload.agentId) {
     const r = addMsg('phase', `⏳ Round ${payload.round} 思考中…`)
     r.dataset.roundSpan = payload.spanId
   }
-  if (name === 'round.end') {
+  // round.end 同样要挡：否则某个 subagent 的 round.end 会去改写主 agent 的那条气泡。
+  if (name === 'round.end' && !payload.agentId) {
     const r = chat.querySelector(`[data-round-span="${payload.spanId}"]`)
     if (r) r.textContent = `✓ Round ${payload.round} 完成 (${formatDuration(payload.durationMs)})`
+  }
+
+  // subagent 的几件大事直接落到主聊天区。放在这里而不是只进事件流面板:
+  // 「派了谁、谁回来了、谁在问你」是用户真正要跟的线索,而事件流是给排查用的。
+  if (name === 'agent.spawn') {
+    addMsg('phase', `🤖 派出 subagent ${payload.agentName ?? ''}（${payload.type ?? '?'}）`)
+  }
+  if (name === 'agent.succeeded') {
+    addMsg('phase', `✅ subagent ${payload.agentName} 完成（rounds=${payload.rounds ?? '—'}）`)
+  }
+  if (name === 'agent.failed') {
+    addMsg('error', `❌ subagent ${payload.agentName} 失败：${payload.failureKind ?? ''}`)
+  }
+  if (name === 'graph.declared') {
+    addMsg('plan', `🕸 依赖图已声明：${(payload.accepted || []).join(' → ')}（共 ${payload.total} 个节点）`)
+  }
+  if (name === 'graph.node.ready') {
+    addMsg('step', `⏸ 节点 ${payload.nodeId} 就绪，等编排者用 graph_start 给出最终契约`)
+  }
+  if (name === 'ask.user') {
+    addMsg('phase', `❓ ${payload.agentName} 提问：${payload.question}`)
+    refreshSubagents()
   }
 
   const row = document.createElement('div')
@@ -446,6 +766,14 @@ function renderTelemetry(name, payload) {
   detail.className = 'evt-detail'
   detail.textContent = formatDetail(name, payload)
   row.appendChild(detail)
+
+  // 主 agent 的事件不带 agentId（缺省即主），只给子 agent 的事件打标记。
+  if (payload.agentName) {
+    const who = document.createElement('span')
+    who.className = 'evt-meta'
+    who.textContent = '@' + payload.agentName
+    row.appendChild(who)
+  }
 
   el.appendChild(row)
 
@@ -501,6 +829,39 @@ function formatDetail(name, p) {
       const errPart = !ok ? `  ✗ ${p.errorKind}` : ''
       return `${name}  ${dur}ms  ${bytes}B${errPart}`
     }
+    // ---- subagent ----
+    case 'agent.spawn':
+      return `${p.name ?? p.agentName ?? ''}  type=${p.type ?? '—'}  depth=${p.depth ?? '—'}${p.background === false ? '  (前台)' : ''}`
+    case 'agent.state':
+      return `${p.agentName ?? p.name ?? ''}  ${p.from ?? '?'} → ${p.to ?? p.state ?? '?'}`
+    case 'agent.succeeded':
+      return `${p.agentName}  rounds=${p.rounds ?? '—'}  tools=${p.toolCalls ?? '—'}`
+    case 'agent.failed':
+      return `${p.agentName}  ${p.failureKind ?? ''} ${String(p.error ?? '').slice(0, 40)}`
+    case 'agent.cancelled':
+      return `${p.agentName}  ${p.reason ?? ''}`
+    case 'graph.declared':
+      return `accepted=${(p.accepted || []).join(', ')}  total=${p.total}`
+    case 'graph.node.ready':
+      return `${p.nodeId}  等你用 graph_start 给契约`
+    case 'graph.node.started':
+      return `${p.nodeId}  type=${p.subagentType ?? '—'}`
+    case 'graph.node.settled':
+      return `${p.nodeId} → ${p.state}`
+    case 'graph.closed':
+      return `${p.graphId}  ${p.disposition ?? ''} ${p.reason ?? ''}`
+    case 'artifact.write':
+      return `${p.key}  sha:${p.sha}  by ${p.agentName}`
+    case 'artifact.conflict':
+      return `${p.key}  与 ${p.owner} 冲突  policy=${p.policy}`
+    case 'ask.user':
+      return `${p.agentName}: ${String(p.question ?? '').slice(0, 50)}`
+    case 'ask.answered':
+      return `${p.askId}  via=${p.via}`
+    case 'ask.cancelled':
+      return `${p.askId}  ${p.reason ?? ''}`
+    case 'run.keep_alive.timeout':
+      return `等了 ${Math.round(p.waitedMs)}ms  agents=${p.pendingAgents}  nodes=${p.pendingNodes}`
     default:
       return JSON.stringify(p).slice(0, 60)
   }
@@ -567,6 +928,11 @@ async function resetChat() {
     document.getElementById(id).textContent = '0'
   }
   addMsg('assistant', '会话已重置，请开始新的对话。')
+  // reset() 会连带 closeSubagents() —— 面板必须跟着清,否则会留着一批已经不存在的 agent。
+  // saManual 也要清:新会话的 agentId 是全新分配的,留着旧的手动展开/折叠状态没有意义,
+  // 而且理论上（虽然目前不会）可能撞上新会话里复用的 agentId。
+  saManual.clear()
+  refreshSubagents()
 }
 
 async function switchStrategy(strategy) {
@@ -603,6 +969,12 @@ fetch('/metrics').then(r => r.json()).then(({ lastRun, session }) => {
   renderMetrics(lastRun, session)
 }).catch(() => {})
 fetch('/context').then(r => r.json()).then(renderContextSnapshot).catch(() => {})
+
+// Subagent 面板初值 + 空闲时的低频提问轮询。
+// 空闲也要轮询的原因:后台 agent 跨 chat() 存活,它可能在这一轮结束之后才提问,
+// 只在发送期间轮询的话那条提问永远不会出现在界面上,而它正等着人回答。
+fetch('/agents').then(r => r.json()).then(renderSubagents).catch(() => {})
+setInterval(() => { if (!sending) refreshSubagents() }, 3000)
 
 // 查询当前 MCP 挂载状态，渲染左上角徽章
 fetch('/mcp-status').then(r => r.json()).then((s) => {
