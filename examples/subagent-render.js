@@ -121,8 +121,11 @@ export function createRenderer({ stream = process.stdout, isTTY = stream.isTTY, 
       if (finished) return
       if (!isTTY) {
         // 降级:只在"某一行的内容真的变了"时追加一条，否则 10fps 会把日志刷爆。
+        // 空闲(rows.length === 0)要清掉 lastKey —— 否则活跃 → 空闲 → 相同 key 恢复
+        // 会被当成"没变"而静默吞掉,即便中间确实经过了一整段空闲期。
+        if (rows.length === 0) { lastKey = ''; return }
         const key = rows.map(r => `${r.label}|${r.detail}`).join(';')
-        if (key === lastKey || rows.length === 0) return
+        if (key === lastKey) return
         lastKey = key
         for (const r of rows) stream.write(`[${r.label}] ${r.detail || '进行中'}\n`)
         return
