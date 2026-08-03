@@ -68,6 +68,19 @@ test('非 TTY:update 不重复刷屏，只在内容变化时追加一行', () =>
   assert.strictEqual(s.out().match(/artifact_write/g).length, 1)
 })
 
+test('非 TTY:并发多行时，只重打真的变了的那一行', () => {
+  // 真跑并发 DAG 时暴露的:按"整组行拼成的 key"去重，会让任何一行的变化把所有行重印一遍，
+  // 日志里于是出现两遍 `[b] 启动中`，读起来像 b 被启动了两次。
+  const s = fakeStream(false)
+  const r = createRenderer({ stream: s, isTTY: false })
+  r.update([{ label: 'a', detail: '启动中', ms: 1 }, { label: 'b', detail: '启动中', ms: 1 }])
+  // 只有 a 变了，b 原样 —— b 不该再被打一次
+  r.update([{ label: 'a', detail: 'read_note', ms: 2 }, { label: 'b', detail: '启动中', ms: 2 }])
+  assert.strictEqual(s.out().match(/\[b\] 启动中/g).length, 1, 'b 没变化，不该重复打印')
+  assert.strictEqual(s.out().match(/\[a\] 启动中/g).length, 1)
+  assert.strictEqual(s.out().match(/\[a\] read_note/g).length, 1)
+})
+
 test('非 TTY:活跃 → 空闲 → 相同 key 恢复应重新打印（空闲要清掉 lastKey）', () => {
   const s = fakeStream(false)
   const r = createRenderer({ stream: s, isTTY: false })

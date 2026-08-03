@@ -82,7 +82,15 @@ export function createRenderer({ stream = process.stdout, isTTY = stream.isTTY, 
   let liveLines = 0        // 当前活动区占了几行
   let frame = 0
   let finished = false
-  let lastKey = ''         // 非 TTY 下用来抑制重复行
+  /**
+   * 非 TTY 下每一行**各自**记住上次打过的 detail。
+   *
+   * 早先这里存的是整组行拼成的一个 key,于是任何一行变化都会把**所有**行重印一遍 ——
+   * 真跑并发 DAG 时日志里就出现了两遍 `[read-changelog] 启动中`,读起来像那个节点被启动了
+   * 两次。按行记才对:只打真的变了的那几行。
+   * @type {Map<string, string>}
+   */
+  const lastDetail = new Map()
 
   const cols = () => stream.columns || 80
 
@@ -131,14 +139,17 @@ export function createRenderer({ stream = process.stdout, isTTY = stream.isTTY, 
     update(rows = []) {
       if (finished) return
       if (!isTTY) {
-        // 降级:只在"某一行的内容真的变了"时追加一条，否则 10fps 会把日志刷爆。
-        // 空闲(rows.length === 0)要清掉 lastKey —— 否则活跃 → 空闲 → 相同 key 恢复
+        // 降级:逐行追加,且只打**这一行**真的变了的。10fps 全量重印会把日志刷爆,
+        // 而按整组去重会让"任一行变化"重印所有行(见 lastDetail 的注释)。
+        // 空闲(rows.length === 0)要清空记忆 —— 否则活跃 → 空闲 → 同样内容恢复
         // 会被当成"没变"而静默吞掉,即便中间确实经过了一整段空闲期。
-        if (rows.length === 0) { lastKey = ''; return }
-        const key = rows.map(r => `${r.label}|${r.detail}`).join(';')
-        if (key === lastKey) return
-        lastKey = key
-        for (const r of rows) stream.write(`[${r.label}] ${r.detail || '进行中'}\n`)
+        if (rows.length === 0) { lastDetail.clear(); return }
+        for (const r of rows) {
+          const detail = r.detail || '进行中'
+          if (lastDetail.get(r.label) === detail) continue
+          lastDetail.set(r.label, detail)
+          stream.write(`[${r.label}] ${detail}\n`)
+        }
         return
       }
       if (liveLines === 0) stream.write('\x1b[?25l')   // 隐藏光标
