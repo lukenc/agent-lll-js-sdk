@@ -33,9 +33,22 @@
  *     DYNAMIC_MCP=1 OPENAI_API_KEY=sk-xxx node demo/server.js
  *     # 然后在对话里说:"联网搜一下 MCP 是什么" —— LLM 会自己调用 load_mcp_server
  *     # 加载内置搜索服务器(demo/mcp-servers/web-search.js),再用 search 回答
+ *
+ * Skill 系统(默认开启,demo/skills/ 目录存在即生效)
+ *   demo/skills/ 下每个含 SKILL.md 的子目录是一个技能。服务端 Agent 通过
+ *   local provider 加载;技能清单(Level 1)自动注入系统提示,LLM 用 `skill`
+ *   元工具按需加载正文(Level 2),再用 read_file 读取附带文件(Level 3)。
+ *
+ *   同时,server 按 HTTP SkillProvider 的 wire 协议暴露 /skill-source/* 接口,
+ *   浏览器端 Agent(browser.html)用 { type: 'http' } provider 从这里拉技能。
+ *
+ *   换技能目录: SKILLS_DIR=/path/to/skills node demo/server.js
  */
 import { createServer } from 'http'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
+import { existsSync } from 'fs'
+import { resolve, sep } from 'path'
+import { fileURLToPath } from 'url'
 import {
   Agent,
   defineTool,
@@ -44,6 +57,7 @@ import {
   unregisterBaseTool,
   formatMcpToolSummary,
   serializeMcpToolForBrowser,
+  createSkillRegistry,
 } from '../src/index.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
@@ -159,6 +173,68 @@ const calculate = defineTool({
   execute: async ({ expression }) => String(Function(`"use strict"; return (${expression})`)()),
 })
 
+// ==================== Skill 系统(默认开启) ====================
+
+const SKILLS_DIR = process.env.SKILLS_DIR
+  ? resolve(process.env.SKILLS_DIR)
+  : fileURLToPath(new URL('./skills', import.meta.url))
+const ENABLE_SKILLS = existsSync(SKILLS_DIR)
+
+// server 侧独立的技能注册表 —— 供 /skills-status 与 /skill-source/*(浏览器端
+// HTTP provider 的数据源)使用。和 Agent 内部的注册表指向同一个目录,各自加载,
+// 互不干扰;这样没有 API Key(纯 browser 模式)时技能接口也可用。
+const skillSource = ENABLE_SKILLS
+  ? createSkillRegistry({ providers: [{ type: 'local', dir: SKILLS_DIR }] })
+  : null
+
+/**
+ * Level 3 文件读取工具 —— `skill` 工具的结果会给出技能的 base directory,
+ * LLM 用这个工具读取其中的 references/ 等附带文件。只允许读 SKILLS_DIR
+ * 之内的路径,demo 不做任意文件读取。
+ */
+const readSkillFile = defineTool({
+  name: 'read_file',
+  description: '读取技能目录下的文件。传入绝对路径(skill 工具的结果里会给出技能的 base directory)',
+  parameters: {
+    type: 'object',
+    properties: { path: { type: 'string', description: '文件绝对路径' } },
+    required: ['path'],
+  },
+  execute: async ({ path }) => {
+    const target = resolve(path)
+    if (target !== SKILLS_DIR && !target.startsWith(SKILLS_DIR + sep)) {
+      return `Error: 只允许读取 ${SKILLS_DIR} 下的文件`
+    }
+    return readFile(target, 'utf8')
+  },
+})
+
+/** 服务端 Agent 的本地基础工具(MCP 工具在 refreshAgentTools 里追加)。 */
+function getLocalBaseTools() {
+  return ENABLE_SKILLS ? [getCurrentTime, calculate, readSkillFile] : [getCurrentTime, calculate]
+}
+
+/** /skill-source/manifest.json 的响应体(HTTP SkillProvider wire 协议)。 */
+async function buildSkillManifest() {
+  const skills = []
+  for (const def of skillSource.list()) {
+    // hash 取 SKILL.md 的 size+mtime,让 http provider 的 refresh 能跳过未变更技能
+    let hash = null
+    try {
+      const s = await stat(resolve(SKILLS_DIR, def.name, 'SKILL.md'))
+      hash = `${s.size}-${Math.round(s.mtimeMs)}`
+    } catch { /* ignore */ }
+    skills.push({
+      name: def.name,
+      description: def.description,
+      version: def.version,
+      hash,
+      files: def.files,
+    })
+  }
+  return { skills }
+}
+
 // ==================== MCP 工具加载(可选,支持多个并存) ====================
 
 /**
@@ -190,7 +266,8 @@ function getMcpPromptNote() {
 /** 重建 agent 的 tools(不重建 agent 本身,保留对话历史) */
 function refreshAgentTools() {
   if (!agent) return
-  // 保留运行时动态加载相关的工具,避免被面板挂载/卸载操作覆盖丢失:
+  // 保留构造时注入 / 运行时动态加载的元工具,避免被面板挂载/卸载操作覆盖丢失:
+  //   - skill / skill_resource 元工具(skills 配置后构造时注入)
   //   - load_mcp_server 元工具(enableDynamicMCP 启用时注入)
   //   - LLM 通过 load_mcp_server 运行时加载、由 agent._managedClients 持有的工具
   const dynamicNames = new Set()
@@ -198,9 +275,10 @@ function refreshAgentTools() {
     for (const n of entry.toolNames) dynamicNames.add(n)
   }
   const preserved = agent.tools.filter(
-    (t) => t.name === 'load_mcp_server' || dynamicNames.has(t.name)
+    (t) => t.name === 'load_mcp_server' || t.name === 'skill' || t.name === 'skill_resource'
+      || dynamicNames.has(t.name)
   )
-  agent.tools = [getCurrentTime, calculate, ...getAllMcpTools(), ...preserved]
+  agent.tools = [...getLocalBaseTools(), ...getAllMcpTools(), ...preserved]
   // 如果有 hooks.onAskUser,ask_user 工具已经在构造时注入了,这里不重复
 }
 
@@ -302,17 +380,25 @@ function createAgent(strategy) {
     systemPrompt: '你是一个有用的助手,可以查询时间、做数学计算,并可使用当前已挂载的 MCP 工具'
       + '。注意:可用工具会在对话中动态变化(可能被挂载或卸载),请始终以本轮实际提供给你的工具列表为准,不要凭历史记录假设某个工具仍然存在'
       + getMcpPromptNote()
+      + (ENABLE_SKILLS
+        ? '。系统提示末尾会列出可用技能(skill);当用户请求与某个技能匹配时,先调用 skill 工具加载完整指令再作答'
+        : '')
       + (ENABLE_DYNAMIC_MCP
         ? '。你还可以用 load_mcp_server 工具在对话中按需加载新的 MCP 服务器'
           + `(例如 transport="stdio"、command="node"、args=["demo/mcp-servers/web-search.js"]、serverKey="web"、name="web" 可加载内置搜索服务器,得到 mcp__web__search / mcp__web__fetch_page)`
         : '')
       + '。请用中文回答。',
-    tools: [getCurrentTime, calculate, ...getAllMcpTools()],
+    tools: [...getLocalBaseTools(), ...getAllMcpTools()],
     strategy: currentStrategy,
     // 启用后,Agent 工具集会多一个 load_mcp_server 元工具,LLM 可自主加载 MCP 服务器;
     // 连接/关闭超时沿用默认 30s/5s。运行时加载的客户端由 Agent 持有,reset()/
     // closeMCPClients() 时统一关闭。未启用时行为不变(向后兼容)。
     enableDynamicMCP: ENABLE_DYNAMIC_MCP,
+    // demo/skills/ 存在时启用 skill 系统:构造时注入 `skill` 元工具,首次
+    // chat/stream 前自动 loadSkills(),Level 1 清单每轮合并进系统提示。
+    ...(ENABLE_SKILLS ? {
+      skills: { providers: [{ type: 'local', dir: SKILLS_DIR }] },
+    } : {}),
     // Demo 场景下 8 轮已经够覆盖 ask_user + tool_call + synth 的典型组合；
     // 默认值 300 太大，真跑起来会让用户以为卡住。
     maxRounds: 8,
@@ -590,6 +676,58 @@ const server = createServer(async (req, res) => {
     return
   }
 
+  // 技能状态(供前端徽章/面板展示)。enabled=false 时前端隐藏面板。
+  if (req.method === 'GET' && req.url === '/skills-status') {
+    const skills = skillSource
+      ? skillSource.list().map((d) => ({
+          name: d.name,
+          description: d.description,
+          version: d.version,
+          files: d.files.filter((f) => f !== 'SKILL.md'),
+          hidden: d.disableModelInvocation,
+        }))
+      : []
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify({ enabled: ENABLE_SKILLS, dir: SKILLS_DIR, count: skills.length, skills }))
+    return
+  }
+
+  // HTTP SkillProvider wire 协议 —— 浏览器端 Agent 的技能数据源。
+  //   GET /skill-source/manifest.json
+  //   GET /skill-source/skills/<name>/<relPath>
+  if (req.method === 'GET' && req.url === '/skill-source/manifest.json') {
+    if (!skillSource) {
+      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({ error: 'skills disabled (demo/skills not found)' }))
+      return
+    }
+    const manifest = await buildSkillManifest()
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    res.end(JSON.stringify(manifest))
+    return
+  }
+
+  if (req.method === 'GET' && req.url.startsWith('/skill-source/skills/')) {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    try {
+      const rel = decodeURIComponent(req.url.slice('/skill-source/skills/'.length))
+      const target = resolve(SKILLS_DIR, rel)
+      // 防目录穿越:解析后必须仍在 SKILLS_DIR 内
+      if (!skillSource || rel.length === 0 || (target !== SKILLS_DIR && !target.startsWith(SKILLS_DIR + sep))) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' })
+        res.end('Not Found')
+        return
+      }
+      const content = await readFile(target, 'utf8')
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end(content)
+    } catch (_err) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Not Found')
+    }
+    return
+  }
+
   // 当前会话的累计指标（Session_Metrics）
   if (req.method === 'GET' && req.url === '/metrics') {
     const session = agent.getSessionMetrics()
@@ -619,6 +757,16 @@ const server = createServer(async (req, res) => {
 // 对向后兼容无影响。connectMcp 内部已重建 agent。
 await loadMcpFromEnv()
 
+// 加载 server 侧技能注册表(/skills-status 与 /skill-source/* 的数据源)。
+// 失败不阻塞启动 —— 单技能解析失败注册表内部已 warn+skip。
+if (skillSource) {
+  try {
+    await skillSource.load()
+  } catch (err) {
+    console.warn(`[skills] 技能目录加载失败: ${err.message}`)
+  }
+}
+
 // 启动 HTTP server —— 端口被占时自动 +1 重试(最多试 10 次)
 function startServer(port, retries = 10) {
   server.once('error', (err) => {
@@ -644,6 +792,12 @@ function startServer(port, retries = 10) {
       console.log(`MCP: 未挂载 (可从浏览器面板一键挂载,或设置 MCP_SERVER_CMD 环境变量)`)
     }
     console.log(`动态 MCP (load_mcp_server 元工具): ${ENABLE_DYNAMIC_MCP ? '已启用 (LLM 可在对话中自主加载)' : '未启用 (设 DYNAMIC_MCP=1 开启)'}`)
+    if (ENABLE_SKILLS) {
+      const names = skillSource.list().map((d) => d.name).join(', ') || '(空)'
+      console.log(`Skills: 已加载 ${skillSource.list().length} 个技能 (${names}),目录: ${SKILLS_DIR}`)
+    } else {
+      console.log(`Skills: 未启用 (技能目录不存在: ${SKILLS_DIR})`)
+    }
   })
 }
 startServer(PORT)

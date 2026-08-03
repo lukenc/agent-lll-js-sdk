@@ -53,7 +53,7 @@ Supporting modules:
   3. `src/context-manager.js` changes its local `const BASE_TOOLS` to `import { BASE_TOOLS } from './tool-filter.js'` (fixes a pre-existing 5-vs-6 inconsistency AND ensures CRUD mutations are immediately visible to `trimTools`).
   No change to `agent.js`, `tool.js`, or any other existing module. `defineTool` signature and Tool_Def shape contract are unchanged.
 - **`skills/` — Skill System**: Entry point is `skills/index.js`, re-exporting the pieces below plus `SkillLoadError`/`SkillParseError`/`SkillMaterializeError`/`SkillProviderError`. Internal layout:
-  - `skills/model.js` — `parseFrontmatter` (zero-dependency handwritten YAML-subset parser: scalars, single-level maps, string lists) and `parseSkillMd(text, ctx): Skill_Def` (dir name is the authoritative `name`; a mismatched frontmatter `name` warns and is overridden; requires non-empty `description`, truncated at `MAX_DESCRIPTION` (1024 chars) with a warn). `NAME_RE = /^[a-z0-9-]{1,64}$/`.
+  - `skills/model.js` — `parseFrontmatter` (zero-dependency handwritten YAML-subset parser: scalars, single-level maps, string lists), `parseSkillMd(text, ctx): Skill_Def` (dir name is the authoritative `name`; a mismatched frontmatter `name` warns and is overridden; requires non-empty `description`, truncated at `MAX_DESCRIPTION` (1024 chars) with a warn; `argument-hint` → `argumentHint`), and `applySkillArgs(body, args): { text, applied }` (single-pass `$ARGUMENTS` / `$1`..`$9` expansion, function-style replacer so `$&`-like text in args isn't reinterpreted). `NAME_RE = /^[a-z0-9-]{1,64}$/`.
   - `skills/provider.js` — `SkillProvider` contract (`listSkills()` + `fetchSkill(name)`, optional `readResource(name, relPath)`) and factory registry: `registerSkillProvider(type, factory)` for custom types, `resolveProvider(config)` accepting either a provider instance or a `{ type, ...opts }` config. Reserved types `local`/`http` cannot be overridden.
   - `skills/providers/local.js` — scans a directory for subdirectories containing `SKILL.md`; `fetchSkill` returns `{ baseDir }` (zero-copy — registry skips materialization). `readResource` resolves the target path and rejects anything that escapes the skill directory.
   - `skills/providers/http.js` — wire protocol: `GET {baseUrl}/manifest.json` → `{ skills: [{ name, description, version, hash, files }] }`; `GET {baseUrl}/skills/{name}/{relPath}` → file content. Validates skill names against `NAME_RE` and rejects/percent-encodes path segments (`..`/empty segments throw) before building resource URLs.
@@ -64,7 +64,7 @@ Supporting modules:
 
   **Zero new runtime dependencies** — pure Node 18+ builtins (`node:fs/promises`, `node:path`, `node:os`) plus `fetch`. The local provider imports `node:fs/promises` dynamically so `skills/` still bundles safely for browser builds.
 
-  **Agent touchpoints** (`agent.js`): `opts.skills` (`providers`, `runtime`, `cacheDir`, `filter.threshold` default 50, `filter.topK` default 20) creates `this.skills` (a `SkillRegistry`); `loadSkills()`/`refreshSkills()` trigger eager load/refresh; the sidecar `SkillFilter` runs once per user message inside `_runPipeline` (not per ReAct round — the user message doesn't change between rounds), with the result cached and reused for every round of that turn; `_withSkillListingNote` injects the Level 1 skill listing into the system message each round; the `skill` meta-tool injects a skill's full body (Level 2) on invocation; a browser-only `skill_resource` tool exposes Level 3 bundled-resource reads (Node relies on the existing `read_file`/`shell_exec` base tools instead).
+  **Agent touchpoints** (`agent.js`): `opts.skills` (`providers`, `runtime`, `cacheDir`, `filter.threshold` default 50, `filter.topK` default 20) creates `this.skills` (a `SkillRegistry`); `loadSkills()`/`refreshSkills()` trigger eager load/refresh; the sidecar `SkillFilter` runs once per user message inside `_runPipeline` (not per ReAct round — the user message doesn't change between rounds), with the result cached and reused for every round of that turn; `_withSkillListingNote` injects the Level 1 skill listing into the system message each round (`- name: description`, plus ` (args: <hint>)` when the skill declares `argument-hint`); the `skill` meta-tool takes Claude Code's parameter shape `{ skill, args? }` (`name` accepted as a lenient alias) and injects a skill's full body (Level 2) on invocation, expanding `args` into the body's placeholders — or appending `Arguments: <args>` when the body has none, so args are never silently dropped; a browser-only `skill_resource` tool exposes Level 3 bundled-resource reads (Node relies on the existing `read_file`/`shell_exec` base tools instead).
 
   **Security caveat**: network-sourced skill scripts run via the host-provided `shell_exec` tool — there is no sandbox in v1. Hosts consuming remote (HTTP) skill providers must gate execution themselves via tool provisioning and `hooks.beforeToolCall`.
 
@@ -88,3 +88,17 @@ All tests mock HTTP calls; no real API keys needed to run tests.
 - No TypeScript, no transpilation — plain JavaScript with esbuild for bundling only.
 - No linter or formatter configured.
 - `todo.md` tracks known bugs by severity (P0–P3) and regression fixes (R-1 to R-4). Consult it before working on bug fixes.
+
+## Definition of Done — 硬性要求（MANDATORY，不可跳过）
+
+任何任务在被判定为"完成"之前，**必须**完成 `demo/` 与 `examples/` 两侧的集成验证。单元测试通过（`npm test`）**不等于**任务完成，只是完成的前置条件之一。
+
+**验收清单（每一条都必须真实执行并给出证据，不允许推断或假设）：**
+
+1. **`examples/` 集成** — 新增或更新一个 example，覆盖本次改动的功能。用真实命令跑通（如 `node examples/<name>.js`），确认进程正常启动、无未捕获异常、能完成一轮完整对话并产出预期结果。
+2. **`demo/` 集成** — 在 `demo/`（Node 侧 `demo/server.js` 与浏览器侧 `demo/index.html` / `demo/browser.html`）中接入本次改动。必须实际启动 demo 服务、在页面上完成一次真实对话，确认可正常启动、可正常使用、可对话。涉及浏览器打包路径的改动，先跑 `npm run build` 再验证 demo 页面。
+3. **新旧功能同场验证** — 例子必须是一个**综合用例**：既包含本次新增的功能，也包含此前已有的关键功能（如 memory 策略、tool 调用、MCP、skills、intent/tool filter、plan_and_execute 等中与本次改动相关的部分），用来证明旧功能没有被本次修改破坏。
+4. **失败即回退重审** — 如果集成做不进去，或任何旧功能在集成中出现异常/退化，**不允许**通过改 demo/example 去迁就、绕过或注释掉问题。必须回到本次改动本身重新审视设计与实现并修复，然后重跑第 1–3 步。
+5. **循环直到全绿** — 重复"修复 → 重新集成 → 重新验证"，直到 example 与 demo 全部集成成功、新旧功能均可正常使用为止。在此之前，任务状态一律是"未完成"。
+
+**报告要求**：交付时必须如实说明实际执行了哪些命令、demo/example 的运行结果，以及任何被跳过或未覆盖的部分及原因。禁止在未真实运行的情况下声称"已验证"。

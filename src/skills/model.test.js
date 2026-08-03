@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
-import { parseFrontmatter, parseSkillMd } from './model.js'
+import { parseFrontmatter, parseSkillMd, applySkillArgs } from './model.js'
 import { SkillParseError } from './errors.js'
 
 test('parseFrontmatter splits block and body', () => {
@@ -79,4 +79,56 @@ test('parseSkillMd preserves commas in description (regression)', () => {
   const def = parseSkillMd(text, { dirName: 'pdf', source: {}, files: [], baseDir: null })
   assert.strictEqual(def.description, 'Create new skills, modify and improve existing skills')
   assert.strictEqual(typeof def.description, 'string')
+})
+
+test('parseSkillMd exposes argument-hint as argumentHint (null when absent)', () => {
+  const withHint = '---\nname: pdf\ndescription: d\nargument-hint: [pr-number] [priority]\n---\nb'
+  const def = parseSkillMd(withHint, { dirName: 'pdf', source: {}, files: [], baseDir: null })
+  assert.strictEqual(def.argumentHint, '[pr-number] [priority]')
+  // known key => not leaked into metadata.extra
+  assert.strictEqual(def.metadata.extra['argument-hint'], undefined)
+
+  const without = '---\nname: pdf\ndescription: d\n---\nb'
+  const bare = parseSkillMd(without, { dirName: 'pdf', source: {}, files: [], baseDir: null })
+  assert.strictEqual(bare.argumentHint, null)
+})
+
+test('applySkillArgs substitutes $ARGUMENTS and $1..$9', () => {
+  const body = 'Review PR #$1 at priority $2, assign $3.\nAll: $ARGUMENTS'
+  const { text, applied } = applySkillArgs(body, '123 high alice')
+  assert.strictEqual(applied, true)
+  assert.match(text, /Review PR #123 at priority high, assign alice\./)
+  assert.match(text, /All: 123 high alice/)
+})
+
+test('applySkillArgs fills missing positionals with empty string', () => {
+  const { text } = applySkillArgs('a=$1 b=$2 c=$3', 'only')
+  assert.strictEqual(text, 'a=only b= c=')
+})
+
+test('applySkillArgs leaves placeholders empty when no args given', () => {
+  const { text, applied } = applySkillArgs('x=$1 all=$ARGUMENTS', '')
+  assert.strictEqual(text, 'x= all=')
+  assert.strictEqual(applied, true) // placeholders consumed the (empty) args
+})
+
+test('applySkillArgs reports applied=false when body has no placeholders', () => {
+  const { text, applied } = applySkillArgs('no placeholders here', 'a b')
+  assert.strictEqual(text, 'no placeholders here')
+  assert.strictEqual(applied, false)
+})
+
+test('applySkillArgs treats missing/nullish args as empty', () => {
+  assert.strictEqual(applySkillArgs('x=$1', undefined).text, 'x=')
+  assert.strictEqual(applySkillArgs('plain', null).text, 'plain')
+})
+
+test('applySkillArgs collapses whitespace runs when splitting positionals', () => {
+  const { text } = applySkillArgs('[$1][$2]', '  a \t  b  ')
+  assert.strictEqual(text, '[a][b]')
+})
+
+test('applySkillArgs does not touch $0 or $10 second digit (only $1..$9)', () => {
+  const { text } = applySkillArgs('$0 $10', 'a b')
+  assert.strictEqual(text, '$0 a0')
 })

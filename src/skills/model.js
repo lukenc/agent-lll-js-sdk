@@ -12,7 +12,7 @@ export const MAX_DESCRIPTION = 1024
 
 const KNOWN_KEYS = new Set([
   'name', 'description', 'version', 'license', 'allowed-tools',
-  'disable-model-invocation', 'metadata',
+  'disable-model-invocation', 'metadata', 'argument-hint',
 ])
 
 /** 解析标量:去引号、识别 true/false。 */
@@ -146,6 +146,9 @@ export function parseSkillMd(text, { dirName, source, files, baseDir }) {
     version: frontmatter.version ?? null,
     license: frontmatter.license ?? null,
     allowedTools: normalizeAllowedTools(frontmatter['allowed-tools']),
+    argumentHint: typeof frontmatter['argument-hint'] === 'string' && frontmatter['argument-hint'].trim()
+      ? frontmatter['argument-hint'].trim()
+      : null,
     disableModelInvocation: frontmatter['disable-model-invocation'] === true,
     metadata,
     body,
@@ -153,4 +156,32 @@ export function parseSkillMd(text, { dirName, source, files, baseDir }) {
     baseDir: baseDir ?? null,
     source: source ?? {},
   }
+}
+
+// `$ARGUMENTS`(整串)与 `$1`..`$9`(位置参数)。合并为单条正则一次扫完,
+// 避免两遍替换时先替进去的文本被后一遍二次识别(如某个位置参数本身
+// 含有 "$ARGUMENTS" 字面量)。
+const ARG_PLACEHOLDER_RE = /\$ARGUMENTS(?![A-Za-z0-9_])|\$([1-9])/g
+
+/**
+ * 把 skill 调用参数代入正文占位符(对齐 Claude Code 斜杠命令的展开规则)。
+ * `$ARGUMENTS` 取整串;`$1`..`$9` 取按空白切分的第 N 个 token,缺失代入空串。
+ * 注意:替换一律用函数式 replacer,故参数里的 `$&` / `$1` 等不会被二次解释。
+ *
+ * @param {string} body SKILL.md 正文
+ * @param {string} [args] 调用方传入的参数串
+ * @returns {{ text: string, applied: boolean }} `applied` 表示正文里确实存在占位符
+ *   —— 为 false 时调用方应把参数另行附加为上下文,否则参数会被静默丢弃。
+ */
+export function applySkillArgs(body, args) {
+  const src = String(body ?? '')
+  const raw = String(args ?? '').trim()
+  const tokens = raw.length > 0 ? raw.split(/\s+/) : []
+  let applied = false
+  const text = src.replace(ARG_PLACEHOLDER_RE, (_m, digit) => {
+    applied = true
+    if (digit === undefined) return raw
+    return tokens[Number(digit) - 1] ?? ''
+  })
+  return { text, applied }
 }

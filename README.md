@@ -801,6 +801,38 @@ system prompt：
 `disable-model-invocation: true` 的 skill 不出现在 Level 1 清单里，但仍可通过
 `agent.skills.get(name)` 访问。
 
+#### `skill` 工具的参数（对齐 Claude Code）
+
+```js
+{ name: 'skill', parameters: { skill: string, args?: string } }  // 仅 skill 必填
+```
+
+`args` 是透传给 skill 的参数串，等价于斜杠命令 `/<name>` 后面那一截。SKILL.md 正文里
+用占位符消费它，注入上下文前完成展开：
+
+| 占位符 | 含义 |
+|--------|------|
+| `$ARGUMENTS` | 整个 `args` 串 |
+| `$1` … `$9` | 按空白切分的位置参数，缺失代入空串 |
+
+```markdown
+---
+name: review-pr
+description: Review a PR with priority and assignee
+argument-hint: [pr-number] [priority] [assignee]
+---
+
+Review pull request #$1 with priority level $2, then assign to $3.
+```
+
+模型发 `{ skill: 'review-pr', args: '123 high alice' }`，注入正文即
+`Review pull request #123 with priority level high, then assign to alice.`
+
+frontmatter 的 `argument-hint` 会以 `- name: description (args: <hint>)` 的形式写进
+Level 1 清单 —— 这是模型唯一的参数形状线索，不声明它则 `args` 对自主调用不可见。
+正文里没有任何占位符却传了 `args` 时，参数会作为 `Arguments: <args>` 附加在正文末尾，
+不会被静默丢弃。展开逻辑也单独导出为 `applySkillArgs(body, args)` 便于宿主复用。
+
 Skill 数量超过 `filter.threshold`（默认 50）时，才会触发一次 sidecar LLM 调用
 （`SkillFilter`，复用 `simpleModel` 配置）按用户消息做 Top-K 相关性排序；该调用在
 `_runPipeline` 里每条用户消息只跑一次（同一轮对话的多个 ReAct round 复用结果），

@@ -170,3 +170,68 @@ test('skill and skill_resource tools are registered as base tools (immune to Too
   assert.ok(node.tools.find(t => t.name === 'skill'))
   assert.strictEqual(isBaseTool('skill'), true)
 })
+
+test('skill tool schema matches Claude Code: { skill, args }, only skill required', () => {
+  const agent = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'browser' })
+  const tool = agent.tools.find(t => t.name === 'skill')
+  assert.deepStrictEqual(Object.keys(tool.parameters.properties), ['skill', 'args'])
+  assert.deepStrictEqual(tool.parameters.required, ['skill'])
+  assert.strictEqual(tool.parameters.properties.args.type, 'string')
+})
+
+test('skill tool execute routes the skill param through _invokeSkill', async () => {
+  const agent = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'browser' })
+  await agent.loadSkills()
+  const tool = agent.tools.find(t => t.name === 'skill')
+  assert.match(await tool.execute({ skill: 'alpha' }), /Instructions for alpha/)
+  // tolerate a model that emits the legacy `name` key rather than `skill`
+  assert.match(await tool.execute({ name: 'alpha' }), /Instructions for alpha/)
+})
+
+function hintProvider(name, hint, body) {
+  return {
+    name: 'mem', origin: 'mem:test',
+    async listSkills() { return [{ name, description: 'D' }] },
+    async fetchSkill() {
+      return { files: [{ path: 'SKILL.md', content: `---\nname: ${name}\ndescription: D\nargument-hint: ${hint}\n---\n${body}` }] }
+    },
+  }
+}
+
+test('_invokeSkill substitutes args into $ARGUMENTS / $N placeholders', async () => {
+  const agent = makeAgent({ providers: [hintProvider('deploy', '[app] [env]', 'Deploy $1 to $2. Raw: $ARGUMENTS')], runtime: 'node' })
+  await agent.loadSkills()
+  const out = await agent._invokeSkill('deploy', 'api staging')
+  assert.match(out, /Deploy api to staging\. Raw: api staging/)
+  assert.ok(!out.includes('Arguments:')) // consumed by placeholders, not appended
+})
+
+test('_invokeSkill appends args as context when body has no placeholders', async () => {
+  const agent = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'browser' })
+  await agent.loadSkills()
+  const out = await agent._invokeSkill('alpha', 'some free text')
+  assert.match(out, /Instructions for alpha/)
+  assert.match(out, /Arguments: some free text/)
+})
+
+test('_invokeSkill with no args leaves a placeholder body substituted empty and appends nothing', async () => {
+  const agent = makeAgent({ providers: [hintProvider('deploy', '[app]', 'Deploy $1.')], runtime: 'node' })
+  await agent.loadSkills()
+  const out = await agent._invokeSkill('deploy')
+  assert.match(out, /Deploy \./)
+  assert.ok(!out.includes('Arguments:'))
+})
+
+test('listing surfaces argument-hint so the model knows what to pass in args', async () => {
+  const agent = makeAgent({ providers: [hintProvider('deploy', '[app] [env]', 'body')], runtime: 'node' })
+  await agent.loadSkills()
+  const out = agent._withSkillListingNote([{ role: 'system', content: '' }])
+  assert.match(out[0].content, /- deploy: D \(args: \[app\] \[env\]\)/)
+})
+
+test('listing omits the args suffix for skills without argument-hint', async () => {
+  const agent = makeAgent({ providers: [memProvider({ alpha: 'Does A' })], runtime: 'browser' })
+  await agent.loadSkills()
+  const out = agent._withSkillListingNote([{ role: 'system', content: '' }])
+  assert.match(out[0].content, /- alpha: Does A$/m)
+})
