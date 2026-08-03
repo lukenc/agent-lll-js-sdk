@@ -11,6 +11,9 @@
  *   OPENAI_API_KEY=sk-xxx node examples/subagents.js
  *   DEEPSEEK_API_KEY=sk-xxx node examples/subagents.js
  *   MODEL=gpt-4o SIMPLE_MODEL=gpt-4o-mini OPENAI_API_KEY=sk-xxx node examples/subagents.js
+ *   DEBUG=1 OPENAI_API_KEY=sk-xxx node examples/subagents.js   # 逐条打印带归属的事件
+ *
+ * 终端进度条的实现在同目录的 subagent-render.js —— 拷贝这个示例时两个文件一起拷。
  *
  * 每一幕结束后会断言若干关键事实（工具被调到、subagent 真的跑起来了、图节点走完、
  * 产物落轨、提问被路由回来），任一条不成立以非 0 退出 —— 所以它可以直接当回归脚本用。
@@ -30,6 +33,7 @@ import {
   registerBaseTool,
   listAgentTypes,
 } from '../src/index.js'
+import { createRenderer, formatSettled } from './subagent-render.js'
 
 const HERE = new URL('.', import.meta.url).pathname
 
@@ -44,6 +48,25 @@ if (!API_KEY) {
   console.error('  DEEPSEEK_API_KEY=sk-xxx node examples/subagents.js')
   process.exit(1)
 }
+
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true'
+const render = createRenderer()
+/** agentId -> { label, detail, ms, startedAt } —— 只放**在跑**的，落终态即移除 */
+const live = new Map()
+let ticker = null
+
+function startTicker() {
+  if (ticker) return
+  ticker = setInterval(() => {
+    const now = Date.now()
+    render.update([...live.values()].map(v => ({ label: v.label, detail: v.detail, ms: now - v.startedAt })))
+    if (live.size === 0) { clearInterval(ticker); ticker = null; render.update([]) }
+  }, 100)
+  ticker.unref?.()
+}
+
+// Ctrl-C 也要清活动区并恢复光标，否则终端留残影、光标可能一直是隐藏的。
+process.on('SIGINT', () => { render.done(); process.exit(130) })
 
 const PROVIDER = process.env.PROVIDER
   || (process.env.DEEPSEEK_API_KEY && !process.env.OPENAI_API_KEY ? 'deepseek' : 'openai')
@@ -139,18 +162,18 @@ const SUBAGENT_TYPES = [
 const checks = []
 function check(label, ok, detail = '') {
   checks.push({ label, ok: !!ok, detail })
-  console.log(`  ${ok ? '✅' : '❌'} ${label}${detail ? ` — ${detail}` : ''}`)
+  render.log(`  ${ok ? '✅' : '❌'} ${label}${detail ? ` — ${detail}` : ''}`)
 }
 
 function section(title) {
-  console.log(`\n${'━'.repeat(72)}\n${title}\n${'━'.repeat(72)}`)
+  render.log(`\n${'━'.repeat(72)}\n${title}\n${'━'.repeat(72)}`)
 }
 
 // ---------------------------------------------------------------------------
 // 4. 组装
 // ---------------------------------------------------------------------------
 
-console.log(`[llm] ${PROVIDER} / ${MODEL}（fast 别名: ${SIMPLE_MODEL}）\n`)
+render.log(`[llm] ${PROVIDER} / ${MODEL}（fast 别名: ${SIMPLE_MODEL}）\n`)
 
 // MCP：挂上仓库自带的 stdio mock MCP server（既有功能；它是 MCP 协议的测试桩，
 // 与 LLM 无关，提供 echo / add 两个工具）
@@ -167,9 +190,9 @@ try {
   // 开了 enableIntentRecognition 之后 ToolFilter 会按意图裁工具，MCP 工具不注册成
   // base tool 就可能在需要它的那一轮被裁掉。
   mcpTools.forEach(t => registerBaseTool(t.name))
-  console.log(`[mcp] 已挂载 ${mcpTools.length} 个工具: ${mcpTools.map(t => t.name).join(', ')}`)
+  render.log(`[mcp] 已挂载 ${mcpTools.length} 个工具: ${mcpTools.map(t => t.name).join(', ')}`)
 } catch (err) {
-  console.warn(`[mcp] 挂载失败（本幕将跳过）: ${err.message}`)
+  render.log(`[mcp] 挂载失败（本幕将跳过）: ${err.message}`)
 }
 
 // 知识库（既有功能）
@@ -214,36 +237,77 @@ const agent = new Agent({
 
 // 遥测（既有功能 + subagent 的新事件）
 const seen = { spawn: 0, succeeded: 0, failed: 0, artifacts: 0, graphNodes: 0, asks: 0, toolCalls: 0 }
-agent.on('tool.call', (p) => { seen.toolCalls++; console.log(`    · [tool.call] ${p.name} ${p.ok === false ? '✗' : ''}`) })
-agent.on('agent.spawn', (p) => { seen.spawn++; console.log(`    · [agent.spawn] ${p.name ?? p.agentName ?? ''} (${p.type ?? ''})`) })
-agent.on('agent.succeeded', (p) => { seen.succeeded++; console.log(`    · [agent.succeeded] ${p.agentName} rounds=${p.rounds}`) })
-agent.on('agent.failed', (p) => { seen.failed++; console.log(`    · [agent.failed] ${p.agentName} ${p.failureKind ?? ''}`) })
-agent.on('artifact.write', (p) => { seen.artifacts++; console.log(`    · [artifact.write] ${p.key} sha:${p.sha} by ${p.agentName}`) })
-agent.on('graph.node.settled', (p) => { seen.graphNodes++; console.log(`    · [graph.node.settled] ${p.nodeId} → ${p.state}`) })
-agent.on('ask.user', (p) => { seen.asks++ })
-agent.on('run.keep_alive.timeout', (p) => console.log(`    · [keep_alive.timeout] 等了 ${Math.round(p.waitedMs)}ms`))
+agent.on('tool.call', (p) => {
+  seen.toolCalls++
+  if (p.agentId && live.has(p.agentId)) live.get(p.agentId).detail = p.name
+  if (DEBUG) render.log(`    · [tool.call] ${p.name} ${p.ok === false ? '✗ ' + p.errorKind : ''} @${p.agentName ?? 'main'}`)
+})
+agent.on('round.start', (p) => {
+  if (DEBUG) render.log(`    · [round.start] #${p.round} @${p.agentName ?? 'main'}`)
+})
+agent.on('llm.call', (p) => {
+  if (DEBUG) {
+    render.log(`    · [llm.call] ${p['gen_ai.usage.input_tokens'] ?? '—'}↓/${p['gen_ai.usage.output_tokens'] ?? '—'}↑ @${p.agentName ?? 'main'}`)
+  }
+})
+agent.on('agent.spawn', (p) => {
+  seen.spawn++
+  // payload 的字段名是 agentName（不是 name），且一定带 agentId。
+  live.set(p.agentId, { label: p.nodeId ?? p.agentName, detail: '启动中', startedAt: Date.now() })
+  render.log(`🤖 派出 ${p.agentName}（${p.type ?? '?'}）`)
+  startTicker()
+})
+agent.on('agent.succeeded', (p) => {
+  seen.succeeded++
+  live.delete(p.agentId)
+  const u = p.usage || {}
+  render.settle(formatSettled({
+    label: p.agentName, rounds: p.rounds,
+    tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
+    ms: p.wallClockMs, ok: true,
+  }))
+})
+agent.on('agent.failed', (p) => {
+  seen.failed++
+  live.delete(p.agentId)
+  // 注意：`agent.failed` 的 payload 与 `agent.succeeded` **不同构** —— 它只有
+  // { agentId, agentName, parentAgentId, failureKind, attempts, lastError }，
+  // 没有 rounds / usage / wallClockMs。照着成功那条抄会渲染出一串 undefined。
+  // 另外这里的 `attempts` 是**数字**（第几次尝试），而 `toStatus().attempts` 是
+  // 数组，名字撞了但类型不同，别混用。
+  render.settle(`✗ ${p.agentName}  ${p.failureKind ?? '失败'}（尝试 ${p.attempts} 次）`)
+  if (p.lastError) render.log(`    · ${String(p.lastError).slice(0, 120)}`)
+})
+agent.on('agent.cancelled', (p) => { live.delete(p.agentId) })
+agent.on('artifact.write', (p) => {
+  seen.artifacts++
+  render.log(`    · 产物 ${p.key} sha:${p.sha} by ${p.agentName}`)
+})
+agent.on('graph.node.settled', (p) => { seen.graphNodes++ })
+agent.on('ask.user', () => { seen.asks++ })
+agent.on('run.keep_alive.timeout', (p) => render.log(`    · keep-alive 等了 ${Math.round(p.waitedMs)}ms`))
 
 // 提问路由的**命令式通道**（Web 服务端最常用的接法）：不在 hook 里 await，
 // 而是轮询 pendingQuestions() 再 answerQuestion()。
 const answerPoller = setInterval(() => {
   for (const q of agent.pendingQuestions()) {
-    console.log(`    · [ask] ${q.agentName} 问: ${q.question}`)
+    render.log(`    · [ask] ${q.agentName} 问: ${q.question}`)
     agent.answerQuestion(q.askId, '定在本周四晚上 22:00，走灰度发布。')
   }
 }, 200)
 answerPoller.unref?.()
 
 await agent.loadSkills()
-console.log(`[skills] 可用 skill: ${agent.skills.list().map(s => s.name).join(', ') || '(无)'}`)
-console.log(`[types] 可用 agent type: ${listAgentTypes().map(t => t.name).join(', ')}`)
+render.log(`[skills] 可用 skill: ${agent.skills.list().map(s => s.name).join(', ') || '(无)'}`)
+render.log(`[types] 可用 agent type: ${listAgentTypes().map(t => t.name).join(', ')}`)
 
 async function act(title, message) {
   section(title)
-  console.log(`> ${message}\n`)
+  render.log(`> ${message}\n`)
   const reply = await agent.chat(message)
   const m = agent.getLastRunMetrics()
-  console.log(`\nAgent: ${reply}`)
-  console.log(`  (rounds=${m.totalRounds} stop=${agent.lastStopReason} keepAliveTimeout=${agent.lastKeepAliveTimedOut})\n`)
+  render.log(`\nAgent: ${reply}`)
+  render.log(`  (rounds=${m.totalRounds} stop=${agent.lastStopReason} keepAliveTimeout=${agent.lastKeepAliveTimedOut})\n`)
   return reply
 }
 
@@ -327,16 +391,18 @@ try {
   const model = await agent.getHistory('model')
   const all = await agent.getHistory('all')
   const visible = await agent.getHistory('visible')
-  console.log(`RuntimeHistory 轨道: all=${all.length} visible=${visible.length} model=${model.length} artifacts=${artifacts.length}`)
+  render.log(`RuntimeHistory 轨道: all=${all.length} visible=${visible.length} model=${model.length} artifacts=${artifacts.length}`)
   check('subagent 的消息没有污染主对话的 model 轨',
     !model.some(m => typeof m?.content === 'string' && m.content.includes('只读检索子 agent')))
 
   const session = agent.getSessionMetrics()
-  console.log(`会话指标: runs=${session.totalRuns} rounds=${session.totalRounds} `
+  render.log(`会话指标: runs=${session.totalRuns} rounds=${session.totalRounds} `
     + `llmCalls=${session.totalLlmCalls} toolCalls=${session.totalToolCalls} `
     + `tokens(in/out)=${session.usage.input_tokens}/${session.usage.output_tokens}`)
-  console.log(`事件计数: ${JSON.stringify(seen)}`)
+  render.log(`事件计数: ${JSON.stringify(seen)}`)
 } finally {
+  if (ticker) clearInterval(ticker)
+  render.done()
   clearInterval(answerPoller)
   // 后台 agent 会跨 chat() 存活；不收尾进程不会自然退出。
   await agent.closeSubagents()
@@ -348,8 +414,10 @@ try {
 // 5. 退出码
 // ---------------------------------------------------------------------------
 
+// render 已经在 finally 里 done() 了（之后的调用全是 no-op），这一段收尾
+// 打印必须看得见，所以直接走原生 console，不经过 section()/render.log。
 const failed = checks.filter(c => !c.ok)
-section(`断言：${checks.length - failed.length}/${checks.length} 通过`)
+console.log(`\n${'━'.repeat(72)}\n断言：${checks.length - failed.length}/${checks.length} 通过\n${'━'.repeat(72)}`)
 if (failed.length > 0) {
   for (const f of failed) console.error(`  ❌ ${f.label}${f.detail ? ` — ${f.detail}` : ''}`)
   console.error('\n断言判的是"发生了什么"，不是模型的措辞 —— 挂了说明集成有回归，'
