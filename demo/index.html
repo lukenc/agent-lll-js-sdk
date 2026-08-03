@@ -499,8 +499,12 @@ function renderSubagents(snap) {
     const meta = [a.type, a.nodeId ? 'node=' + a.nodeId : null, a.attempt > 1 ? 'attempt ' + a.attempt : null]
       .filter(Boolean).join(' · ')
     const fail = saFailure(a)
+    const terminal = ['succeeded', 'failed', 'cancelled'].includes(a.state)
     parts.push(
-      `<div class="sa-head" onclick="saToggle('${esc(a.agentId)}', ${!['succeeded','failed','cancelled'].includes(a.state)})">`
+      // 不用内联 onclick：agentId 拼进 '单引号 JS 字符串' 又嵌在双引号 HTML 属性里，
+      // esc() 只转义 & < > "，转义不了单引号——今天 agentId 恒为 agt_+8位十六进制，
+      // 碰不到，但这是个脆弱假设。改成 data-* + 渲染后绑定监听器，直接不进入那个嵌套语境。
+      `<div class="sa-head" data-agent-id="${esc(a.agentId)}" data-default-expanded="${terminal ? '0' : '1'}">`
       + `<span class="sa-caret">${expanded ? '▼' : '▶'}</span>`
       + `<span class="sa-state ${esc(a.state)}">${esc(a.state)}</span>`
       + `<span class="sa-name">${esc(a.name)}</span>`
@@ -521,8 +525,11 @@ function renderSubagents(snap) {
         + `<span class="sa-tool-ms">${t.ms == null ? '' : t.ms + 'ms'}</span></div>`)
     }
     // tool.call 是执行完才发的，所以没有"进行中"的工具行。运行中而流水没长出新条目
-    // 时，agent 正在等 LLM —— 用一行"思考中"表达，不伪造一条工具行。
-    if (!['succeeded', 'failed', 'cancelled'].includes(a.state)) {
+    // 时，agent 大多数情况下是在等 LLM —— 用一行"思考中"表达，不伪造一条工具行。
+    // waiting_input 是例外：那不是模型在想，是模型已经问完、卡在等人类回答。
+    if (a.state === 'waiting_input') {
+      parts.push('<div class="sa-tool sa-thinking">⏸ 等你回答…</div>')
+    } else if (!terminal) {
       parts.push('<div class="sa-tool sa-thinking">● 思考中…</div>')
     }
     parts.push('</div>')
@@ -555,6 +562,11 @@ function renderSubagents(snap) {
   }
 
   body.innerHTML = parts.join('')
+  // 内联 onclick 会把 agentId 拼进 HTML 属性里的 JS 字符串字面量，esc() 覆盖不到
+  // 那个语境；渲染完再绑监听器，直接不进入需要转义的嵌套上下文。
+  body.querySelectorAll('.sa-head').forEach(el => {
+    el.onclick = () => saToggle(el.dataset.agentId, el.dataset.defaultExpanded === '1')
+  })
   renderAskBanner(snap.questions || [])
 }
 
@@ -904,6 +916,9 @@ async function resetChat() {
   }
   addMsg('assistant', '会话已重置，请开始新的对话。')
   // reset() 会连带 closeSubagents() —— 面板必须跟着清,否则会留着一批已经不存在的 agent。
+  // saManual 也要清:新会话的 agentId 是全新分配的,留着旧的手动展开/折叠状态没有意义,
+  // 而且理论上（虽然目前不会）可能撞上新会话里复用的 agentId。
+  saManual.clear()
   refreshSubagents()
 }
 
