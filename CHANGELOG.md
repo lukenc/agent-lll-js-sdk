@@ -2,7 +2,7 @@
 
 本文件记录 `lll-web-agent` 的显著变更。格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## 0.9.0（未发布）
+## 0.9.0 - 2026-08-04
 
 ### 新增
 
