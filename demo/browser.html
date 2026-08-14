@@ -199,6 +199,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <input type="checkbox" id="enableAskUser" checked> 注入 ask_user 工具（允许 LLM 向你发问）
   </label>
   <label class="check">
+    <input type="checkbox" id="hostAskUser"> 用「宿主自带的 ask_user」（富 schema：带选项的多选题）
+  </label>
+  <label class="check">
     <input type="checkbox" id="enableSkills" checked> 启用技能系统（从 /skill-source 经 HTTP provider 加载 demo/skills）
   </label>
   <label class="check">
@@ -619,6 +622,44 @@ var timer = defineTool({
   }
 })
 
+// 11. 宿主自带的 ask_user（勾了「用宿主自带的 ask_user」才装进 tools）
+//
+// 这是真实宿主（Electron / 桌面端）最常见的形态：一个富 schema 的询问工具，
+// 走自己的 UI 通道弹一个带选项的询问块。SDK 在配置 subagents 后**也**注入
+// ask_user，必须尊重这个同名工具（包一层保留 schema 与 execute），而不是同名
+// 替换掉它 —— 替换过的那版是个静默回归：宿主弹窗从此不再出现，而 SDK 版在宿主
+// 没接 hooks.onAskUser 时没有任何送达通道，那次工具调用会永久挂起，表象是几分钟
+// 后被宿主看门狗掐断的"网络错误"。勾选框开着时可以在这个页面上直接复现/验证。
+var hostAskUser = defineTool({
+  name: 'ask_user',
+  description: '向用户提问并等待回答。需要澄清、确认或让用户在几个选项中拍板时使用。',
+  parameters: { type: 'object', properties: {
+    questions: {
+      type: 'array',
+      description: '要问的问题列表',
+      items: { type: 'object', properties: {
+        question: { type: 'string', description: '问题正文' },
+        options: { type: 'array', items: { type: 'string' }, description: '备选项（可选）' }
+      }, required: ['question'] }
+    }
+  }, required: ['questions'] },
+  execute: async function(p, ctx) {
+    var list = p.questions || []
+    var answers = []
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i] || {}
+      var who = ctx && ctx.agentName && ctx.agentName !== 'main' ? ctx.agentName : ''
+      addMsg('phase', '❓ [宿主 ask_user]' + (who ? ' from ' + who : '') + ': ' + item.question)
+      var a = await askUserDialog(
+        (who ? '[' + who + '] ' : '') + item.question,
+        item.options
+      )
+      answers.push(list.length > 1 ? item.question + ' → ' + a : a)
+    }
+    return answers.join('\n') || '(用户未提供回答)'
+  }
+})
+
 // 模型联动
 // 主模型与简单模型的默认值分开维护：
 //   - 主任务模型走 DEFAULT_MAIN_MODELS（qwen 默认 qwen3.5-plus）
@@ -932,11 +973,16 @@ function initAgent() {
   var simpleApiKey = document.getElementById('simpleApiKey').value.trim()
   var enableIntent = document.getElementById('enableIntent').checked
   var enableAskUser = document.getElementById('enableAskUser').checked
+  var useHostAskUser = document.getElementById('hostAskUser').checked
   var enableSkills = document.getElementById('enableSkills').checked
   var enableSubagents = document.getElementById('enableSubagents').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
   var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
+  // 勾了「宿主自带的 ask_user」就把它一起交给 Agent。SDK 注入 ask_user 时会认出
+  // 这个同名的宿主工具并**包一层**（保留富 schema 与 execute，外面补 AskRegistry
+  // 登记），而不是替换掉它。
+  if (useHostAskUser) baseTools = baseTools.concat([hostAskUser])
   // MCP 工具追加到末尾,让 LLM 同时看到本地工具与远端 MCP 工具
   var allTools = baseTools.concat(mcpTools)
 
@@ -988,6 +1034,10 @@ function initAgent() {
       },
     }
   }
+  // 勾了宿主版时 hook 让位:宿主工具自己就是送达通道(它会弹自己那个带选项的框),
+  // 两条通道都装等于同一个问题弹两次窗。SDK 侧也按这个语义实现——本次提问带了
+  // 专属通道时就不再触发 hooks.onAskUser,这里只是把宿主的意图表达清楚。
+  if (useHostAskUser && agentOpts.hooks) delete agentOpts.hooks.onAskUser
   if (enableSubagents) {
     // 浏览器里没有 git worktree、没有 shell_exec —— 跨 agent 的护栏只有产物轨,
     // 所以这里显式把它调成 deny:同一个 key 被另一个 agent 覆盖时直接拒绝。
@@ -1390,7 +1440,7 @@ async function renderBrowserSubagents() {
   })
 }
 
-function askUserDialog(question) {
+function askUserDialog(question, options) {
   return new Promise(function(resolve) {
     var overlay = document.createElement('div')
     overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s'
@@ -1418,7 +1468,22 @@ function askUserDialog(question) {
     okBtn.onclick = function() { submit(inp.value.trim() || '(用户未提供回答)') }
     cancelBtn.onclick = function() { submit('(用户跳过了此问题)') }
     inp.addEventListener('keydown', function(e) { if (e.key === 'Enter') okBtn.click() })
-    box.appendChild(title); box.appendChild(q); box.appendChild(inp); row.appendChild(cancelBtn); row.appendChild(okBtn); box.appendChild(row)
+    box.appendChild(title); box.appendChild(q)
+    // 宿主版 ask_user 的富 schema 带 options 时渲染成一排可点的选项 —— 这正是
+    // SDK 那张单串 question 的 schema 表达不出来、因而必须由宿主自己提供的东西。
+    if (options && options.length) {
+      var opts = document.createElement('div')
+      opts.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px'
+      options.forEach(function(opt) {
+        var b = document.createElement('button')
+        b.style.cssText = 'padding:6px 14px;background:#f3eefb;color:#5e35b1;border:1px solid #d1c4e9;border-radius:16px;font-size:13px;cursor:pointer'
+        b.textContent = opt
+        b.onclick = function() { submit(opt) }
+        opts.appendChild(b)
+      })
+      box.appendChild(opts)
+    }
+    box.appendChild(inp); row.appendChild(cancelBtn); row.appendChild(okBtn); box.appendChild(row)
     overlay.appendChild(box); document.body.appendChild(overlay)
     setTimeout(function() { inp.focus() }, 50)
   })

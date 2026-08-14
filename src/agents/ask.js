@@ -49,9 +49,15 @@ export class AskRegistry {
    * @param {string|null} [args.nodeId=null]
    * @param {string} [args.taskDescription='']
    * @param {string} args.question
+   * @param {((meta: object) => unknown)|null} [args.notify=null]
+   *   **本次提问专属**的送达通道，语义与 `onQuestion` 完全一致（返回非 null 算一次
+   *   回答，抛错则取消），但只对这一条提问生效，且**取代** `onQuestion` 而不是叠加。
+   *   宿主自带 `ask_user` 工具时由 `Agent` 传入，把那个工具的 `execute` 接成通道。
+   *   取代而非叠加是必须的：两者都是"把问题送到用户面前"，同时触发就会为同一个问题
+   *   弹两次窗，用户答了一个另一个还悬着。就近的那个通道（模型实际调用的那个工具）赢。
    * @returns {Promise<string>}
    */
-  ask({ agentId, agentName, parentAgentId = 'main', nodeId = null, taskDescription = '', question }) {
+  ask({ agentId, agentName, parentAgentId = 'main', nodeId = null, taskDescription = '', question, notify = null }) {
     SEQ = (SEQ + 1) >>> 0
     const askId = `ask_${SEQ.toString(16).padStart(6, '0')}`
     const askedAt = Date.now()
@@ -94,15 +100,29 @@ export class AskRegistry {
       }
 
       // 通知通道与 `answer()` 竞速；先到先赢由 settle 的 `settled` 闸门保证。
-      if (this.onQuestion) {
+      // `notify`（本次提问专属）存在时取代 `onQuestion`——见 ask() 的参数说明：
+      // 两个都是送达通道，同时触发等于为同一个问题弹两次窗。
+      const channel = notify ?? this.onQuestion
+      if (channel) {
         let notified
         try {
-          notified = Promise.resolve(this.onQuestion(question, { ...meta }))
+          notified = Promise.resolve(channel(question, { ...meta }))
         } catch (err) {
           notified = Promise.reject(err)
         }
         notified.then(
-          (answer) => { if (answer != null) this.answer(askId, answer, { via: 'hook' }) },
+          (answer) => {
+            if (answer == null) return
+            // 宿主工具的返回值**不经 String()**：它可能是对象/数组，而 `answer()`
+            // 会把它压成 "[object Object]"。工具结果的字符串化是 `tool.js` 的
+            // `stringifyToolResult` 的职责（它会走 JSON），这里越俎代庖等于把宿主
+            // 富返回值的信息在半路丢掉。hook 通道维持既有的 String() 语义不变。
+            if (notify) {
+              if (settle(answer)) this.emit('ask.answered', { askId, agentId, agentName, via: 'tool' })
+              return
+            }
+            this.answer(askId, answer, { via: 'hook' })
+          },
           (err) => this.cancel(askId, `ask handler failed: ${err?.message ?? err}`),
         )
       }

@@ -6,6 +6,10 @@
  * 前 3 幕的存在不是凑数：subagent 会往 Agent 的工具集、system 消息、轮边界注入、
  * ask_user 通道上各插一脚，这几处恰好是既有功能的落点，一起跑才看得出有没有被碰坏。
  *
+ * 第 7 幕另外守着一个具体回归：宿主自带的 ask_user（富 schema + 自己的送达通道）
+ * 曾被 subagent 注入逻辑同名替换掉，宿主弹窗从此不再出现、提问永久挂起。那一幕
+ * 断言的是宿主的 execute 真被调到、模型看到的仍是宿主那张 schema。
+ *
  * 运行（需要真实 API Key）:
  *
  *   OPENAI_API_KEY=sk-xxx node examples/subagents.js
@@ -178,6 +182,47 @@ const readNote = defineTool({
   execute: async ({ name }) => NOTES[name] ?? `no note named "${name}"`,
 })
 
+// 宿主自带的 ask_user —— 富 schema（多选题）版本。真实宿主（Electron / Web 服务）
+// 往往在这里走 IPC 弹一个带选项的询问块，不是 SDK 那个单串 question 能表达的。
+//
+// 这一幕的立意：SDK 在配置了 subagents 后**也**会注入 ask_user。它必须尊重宿主
+// 已提供的同名工具（包一层保留富 schema 与 execute），而不是同名替换掉。替换过
+// 的那版是一个静默回归：宿主弹窗从此不再出现，而 SDK 版在宿主没接
+// hooks.onAskUser 时没有任何送达通道，那次工具调用会永久挂起 —— 表象是几分钟后
+// 被宿主看门狗掐断的"网络错误"。
+const hostAskCalls = []
+const hostAskUser = defineTool({
+  name: 'ask_user',
+  description: '向用户提一个或多个带选项的问题，等待用户选择。需要用户拍板时使用。',
+  parameters: {
+    type: 'object',
+    properties: {
+      questions: {
+        type: 'array',
+        description: '要问的问题列表',
+        items: {
+          type: 'object',
+          properties: {
+            question: { type: 'string', description: '问题正文' },
+            options: { type: 'array', items: { type: 'string' }, description: '备选项' },
+          },
+          required: ['question'],
+        },
+      },
+    },
+    required: ['questions'],
+  },
+  // 真实宿主在这里走 IPC；本例直接在进程内应答，但**参数形状与返回路径**和真实
+  // 宿主一致 —— 要验证的正是"模型看到的是这张富 schema，且这个 execute 真被调到"。
+  execute: async (params, ctx = {}) => {
+    hostAskCalls.push({ params, agentName: ctx.agentName ?? 'main' })
+    const q = params.questions?.[0]
+    render.log(`    · [host-ask] ${ctx.agentName ?? 'main'} 问: ${q?.question}`
+      + (q?.options?.length ? ` 选项: ${q.options.join(' / ')}` : ''))
+    return '定在本周四晚上 22:00，走灰度发布。'
+  },
+})
+
 // ---------------------------------------------------------------------------
 // 2. Subagent 类型
 // ---------------------------------------------------------------------------
@@ -269,7 +314,7 @@ const agent = new Agent({
   systemPrompt: '你是一个工程助手。可以查时间、算数、读项目笔记，也可以把成块的活派给 subagent。'
     + '用户明确要求用某个能力时（派 subagent、声明依赖图、列产物、让 agent 来问他）就照做，不要自己改用别的方式。'
     + '请用中文回答。',
-  tools: [getCurrentTime, calculate, readNote, ...mcpTools],
+  tools: [getCurrentTime, calculate, readNote, hostAskUser, ...mcpTools],
   // 既有功能：token 感知记忆 + 知识库 + 意图识别
   //（意图识别开着才验证得到"subagent 元工具没被 ToolFilter 裁掉"）
   memory: new TokenAwareMemory(30000),
@@ -364,9 +409,13 @@ agent.on('run.keep_alive.timeout', (p) => render.log(`    · keep-alive 等了 $
 
 // 提问路由的**命令式通道**（Web 服务端最常用的接法）：不在 hook 里 await，
 // 而是轮询 pendingQuestions() 再 answerQuestion()。
+//
+// 本例里宿主自己的 ask_user（hostAskUser）通常会先答上来，所以这条通道实际是
+// **兜底**：宿主弹窗被关掉 / 宿主通道自己挂住时，命令式通道仍能解围。两条通道
+// 竞速、先到先赢是 AskRegistry 的既定语义，这里正好一并验证它不会互相打断。
 const answerPoller = setInterval(() => {
   for (const q of agent.pendingQuestions()) {
-    render.log(`    · [ask] ${q.agentName} 问: ${q.question}`)
+    render.log(`    · [ask-fallback] ${q.agentName} 问: ${q.question}`)
     agent.answerQuestion(q.askId, '定在本周四晚上 22:00，走灰度发布。')
   }
 }, 200)
@@ -504,11 +553,25 @@ try {
     t6.includes('artifact_list') && t6.includes('history_search'), t6.join(', '))
   check('第 6 幕正常收尾', typeof r6 === 'string' && r6.length > 0)
 
-  const r7 = await act('第 7 幕 · 新功能：提问路由（subagent 反问用户）',
+  const r7 = await act('第 7 幕 · 新功能：提问路由（subagent 反问用户，走宿主自己的 ask_user）',
     '派一个 interviewer 类型的 subagent（run_in_background 设为 false），'
     + '让它替你问我 0.6.0 的发布窗口定在什么时候，然后把我的原话告诉我。')
   check('子 agent 的提问被路由到主机并被应答', seen.asks >= 1, `ask=${seen.asks}`)
   check('用户的回答带回了主 agent', /周四|22:00|灰度/.test(r7), r7.slice(0, 60))
+  // 回归断言：宿主自带的 ask_user 没有被 SDK 版顶替掉。
+  // 这三条是这次修复的落点 —— 顶替版会让 hostAskCalls 恒为空（宿主 execute 根本
+  // 不被调用），而模型看到的 schema 会退化成单个 question 字符串。
+  const askTool = agent.getTools().filter(t => t.name === 'ask_user')
+  check('工具表里只有一个 ask_user（没有叠成同名两项）', askTool.length === 1, `${askTool.length} 个`)
+  check('模型看到的仍是宿主的富 schema（questions 数组，不是单个 question 串）',
+    askTool[0]?.parameters?.properties?.questions?.type === 'array',
+    JSON.stringify(Object.keys(askTool[0]?.parameters?.properties ?? {})))
+  check('宿主自己的 ask_user execute 真被调到（弹窗通道没断）',
+    hostAskCalls.length >= 1,
+    hostAskCalls.map(c => `${c.agentName}:${c.params.questions?.[0]?.question?.slice(0, 20)}`).join(' | ') || '一次都没调到')
+  check('提问登记进了 AskRegistry 且归属是子 agent（不是 main）',
+    hostAskCalls.some(c => c.agentName !== 'main'),
+    hostAskCalls.map(c => c.agentName).join(', '))
 
   // ===================== 汇总 =====================
   section('汇总')

@@ -55,6 +55,41 @@ import { INJECTION_MERGE_THRESHOLD } from './agents/mailbox.js'
 const INJECTABLE_ROLES = new Set(['user', 'system'])
 
 /**
+ * 打在 SDK 自己包出来的 `ask_user` 上的标记。子 Agent 继承的是**父**的 ask_user
+ * 闭包，而子 Agent 的构造会再次走到注入分支 —— 有了这个标记才分得清"继承来的
+ * SDK 包装（留用）"和"宿主自己写的工具（需要包一层）"，否则要么叠出两个同名
+ * 工具，要么把已经包过的再包一次。Symbol 而非普通字段：它是 SDK 的内部约定，
+ * 不该出现在发给模型的工具定义里，也不该和宿主自己的字段撞名。
+ */
+const ASK_USER_WRAPPED = Symbol.for('lll.askUser.wrapped')
+
+/**
+ * 把 `ask_user` 的调用参数压成一句可读的问题摘要，**仅**用于 AskRegistry 的登记
+ * （`pendingQuestions()` 的展示、`ask.user` 遥测）。宿主的 execute 收到的始终是
+ * 原样参数，不经过这里。
+ *
+ * 存在的理由：登记表的 `question` 是一个字符串字段，而宿主版的富 schema 未必有
+ * 单一的"问题"字段（典型形态是 `questions: [{ question, options }]`）。裸取
+ * `params.question` 在那种形状下是 undefined，宿主 UI 上就会显示一个空问题。
+ */
+function describeAskParams(params) {
+  if (typeof params?.question === 'string') return params.question
+  const list = params?.questions
+  if (Array.isArray(list) && list.length > 0) {
+    const texts = list
+      .map(q => (typeof q === 'string' ? q : q?.question))
+      .filter(q => typeof q === 'string' && q.length > 0)
+    if (texts.length > 0) return texts.join(' / ')
+  }
+  // 兜底不返回空串：登记表/宿主 UI 上一个空问题比一句"形状不认识"更难排查。
+  try {
+    return JSON.stringify(params)
+  } catch {
+    return String(params)
+  }
+}
+
+/**
  * Build a zero-valued Session_Metrics object. Counter fields start at 0 so
  * that the per-run aggregation can add to them unconditionally (null-valued
  * provider usage contributes 0 per Requirement 8.6 / 8.7).
@@ -392,14 +427,33 @@ export class Agent {
     if (this.hooks.onAskUser || opts.subagents) {
       // 可能不存在 —— 只配了 subagents 而没给 hook 时走登记表通道。
       const onAskUser = this.hooks.onAskUser ?? null
-      this.tools = [
-        // 同名替换而非追加：子 agent 继承了父的 ask_user（闭包里是**父**的归属），
-        // 再叠一个自己的会让发给模型的工具表出现重名项。留下自己这一个。
-        ...this.tools.filter(t => t.name !== 'ask_user'),
-        {
+
+      // 宿主自带的同名工具。**保留它**：宿主版往往带着这个 SDK 造不出来的东西 ——
+      // 富 schema（多选题、选项列表）和一条真的能到达用户界面的通道（IPC / 弹窗）。
+      // 早先这里无条件 filter 掉同名工具换上 SDK 版，代价是静默的：宿主精心做的
+      // ask_user 消失，模型看到的参数退化成单个 question 字符串，而 SDK 版在宿主
+      // 没接 hooks.onAskUser 时**没有任何送达通道** —— 问题登记进 AskRegistry 后
+      // 既无 hook 可通知、宿主也不知道该调 answerQuestion，timeoutMs 又默认 null，
+      // 于是那次工具调用永久挂起，表象是"流上几分钟无事件后被看门狗掐断"的假网络错误。
+      //
+      // 但也不能简单改成"追加"：子 agent 继承的是**父**的 ask_user 闭包，子 Agent
+      // 构造时会再次进到这个分支，叠加就会让工具表出现两个同名项。区分办法是给
+      // SDK 自己包出来的工具打标记 —— 带标记的是继承来的自己人，直接留用；不带
+      // 标记的才是宿主真正自己写的工具，包一层保留其 schema 与 execute。
+      const existing = this.tools.find(t => t.name === 'ask_user')
+      const inherited = existing?.[ASK_USER_WRAPPED] === true
+
+      if (!inherited) {
+        // 宿主版存在时：**包装**而非替换。对外暴露宿主的 name/description/parameters
+        // （模型看到的还是宿主那张富 schema），execute 外面套一层 AskRegistry 登记，
+        // 补上归属与状态标注，并让 answerQuestion / cancelQuestion / agent_cancel
+        // 这些命令式通道对宿主的提问同样有效。宿主没提供时，退化成 SDK 自己的极简版。
+        const host = existing ?? null
+        const wrapped = {
           name: 'ask_user',
-          description: 'Ask the user a question and wait for their response. Use this when you need clarification, confirmation, or additional information from the user before proceeding.',
-          parameters: {
+          description: host?.description
+            ?? 'Ask the user a question and wait for their response. Use this when you need clarification, confirmation, or additional information from the user before proceeding.',
+          parameters: host?.parameters ?? {
             type: 'object',
             properties: {
               question: { type: 'string', description: 'The question to ask the user' },
@@ -411,6 +465,7 @@ export class Agent {
             if (!registry) {
               // 理论上不可达（注入条件要求二者至少有一个），但别留一个能抛
               // TypeError 的洞 —— 工具执行失败要以可纠正的字符串回给模型。
+              if (host) return await host.execute(params, ctx)
               if (!onAskUser) return 'Error: no user-interaction channel is configured.'
               return await onAskUser(params.question)
             }
@@ -422,11 +477,21 @@ export class Agent {
               parentAgentId: ctx.parentAgentId ?? 'main',
               nodeId: ctx.nodeId ?? null,
               taskDescription: ctx.taskDescription ?? '',
-              question: params.question,
+              // 登记表只存字符串问题。宿主的富参数（questions 数组）没有单一的
+              // "问题"字段，`describeAskParams` 把它压成一句可读的摘要，仅供
+              // pendingQuestions() / 遥测展示；宿主 execute 收到的仍是**原样**参数。
+              question: describeAskParams(params),
+              // 宿主版存在时，它自己就是送达通道：模型调的是宿主那张 schema，
+              // 参数也只有宿主看得懂，所以原样转交而不是把摘要塞给它。这条通道
+              // 取代（而非叠加）hooks.onAskUser，避免同一个问题弹两次窗。
+              notify: host ? () => host.execute(params, ctx) : null,
             })
           },
-        },
-      ]
+        }
+        // 让子 Agent 的构造认出这是 SDK 包出来的，从而留用而不是再包一层。
+        Object.defineProperty(wrapped, ASK_USER_WRAPPED, { value: true, enumerable: false })
+        this.tools = [...this.tools.filter(t => t.name !== 'ask_user'), wrapped]
+      }
     }
 
     // ---- 元工具：load_mcp_server ----
