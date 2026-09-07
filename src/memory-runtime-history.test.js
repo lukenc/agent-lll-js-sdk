@@ -20,6 +20,9 @@ describe('RuntimeHistory-backed Memory compatibility', () => {
   })
 
   it('TokenAwareMemory returns a safe projected suffix while preserving all events', () => {
+    // 预算 4 tokens 现在连一条消息都装不下（含结构开销后单条最低 8+）。
+    // 保底策略保住最近一条，而不是把非 system 历史清空 —— 模型至少要看得到
+    // 最新那句话。原始事件不受投影影响，仍然全部保留。
     const mem = new TokenAwareMemory(4)
     mem.add({ role: 'system', content: 'SP' })
     mem.add({ role: 'user', content: 'x'.repeat(200) })
@@ -27,6 +30,16 @@ describe('RuntimeHistory-backed Memory compatibility', () => {
 
     assert.deepEqual(mem.getMessages().map(m => m.content), ['SP', 'short'])
     assert.equal(mem.runtimeHistory.getEvents('all').length, 3)
+  })
+
+  it('TokenAwareMemory with a realistic budget keeps multiple messages', () => {
+    // 预算给够时正常保留多条 —— 保底只是极小预算下的兜底，不是常态
+    const mem = new TokenAwareMemory(200)
+    mem.add({ role: 'system', content: 'SP' })
+    mem.add({ role: 'user', content: 'one' })
+    mem.add({ role: 'assistant', content: 'two' })
+    mem.add({ role: 'user', content: 'three' })
+    assert.deepEqual(mem.getMessages().map(m => m.content), ['SP', 'one', 'two', 'three'])
   })
 
   it('legacy messages assignment rebuilds RuntimeHistory', () => {

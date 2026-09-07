@@ -94,6 +94,11 @@ describe('memory-policy helpers', () => {
   })
 
   it('estimateMessageTokens uses current chars-per-token heuristic', () => {
-    assert.equal(estimateMessageTokens({ role: 'user', content: '12345' }), 2)
+    // 计价现在含结构开销（对齐 dsh token-meter）：
+    // 5 字符 / 4 = 2，加 BLOCK_OVERHEAD 4 与 ROLE_OVERHEAD 4 = 10。
+    // 旧版本只算 2 —— 漏掉的正是每条消息的 JSON 框架成本，会系统性低估。
+    assert.equal(estimateMessageTokens({ role: 'user', content: '12345' }), 10)
+    // 校准锚点，与 dsh 的 estimateMessage(textMessage('abcd')) === 9 一致
+    assert.equal(estimateMessageTokens({ role: 'user', content: 'abcd' }), 9)
   })
 })

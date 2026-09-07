@@ -212,7 +212,7 @@ const agent = new Agent({ ..., validateStreamCompletion: false })
 | `afterToolCall` | `(name, args, result) => void` | 工具执行后，`result` 是工具返回的字符串 |
 | `onRoundStart` | `(round) => void` | 每轮 ReAct 循环开始 |
 | `onError` | `(error, context) => void` | 错误回调。ReAct 工具执行路径传 `{ round, toolName }`，动态 MCP 替换连接失败时传 `{ serverKey, phase }` |
-| `onAskUser` | `(question, meta) => Promise<string\|void>` | 用户交互回调；提供后自动注入 `ask_user` 工具，见 [提问路由](#提问路由) |
+| `onAskUser` | `(question, meta) => Promise<string\|void>` | 用户交互回调；提供后自动注入 `ask_user` 工具（宿主已自带同名工具时**包住它而不是替换**），见 [提问路由](#提问路由) |
 
 抛异常不会打断 ReAct 循环：`onRoundStart` / `afterToolCall` / `onError` 走 `_safeHook`
 隔离（同步抛出被 catch 并 `console.warn`，返回的 promise 挂一个 no-op rejection handler）；
@@ -241,7 +241,8 @@ const agent = new Agent({
 >
 > 另外两个由 subagent 运行时改写而不是透传：`onAskUser` 被换成经 `AskRegistry` 登记
 > （这样提问才带得上归属、能被 `answerQuestion` 定向应答），`onRoundStart` 被用来在轮
-> 边界投递邮箱消息。
+> 边界投递邮箱消息。宿主若自带 `ask_user` 工具，它同样经登记表但**保留自己的 schema 与
+> execute**，并原样传给子 agent，见[提问路由](#提问路由)的接法 3。
 
 ### IntentRecognizer
 
@@ -1144,6 +1145,9 @@ const agent = new Agent({
     ],
     maxConcurrent: 4,                // 每个 depth 层独立的并发槽数
     maxDepth: 2,                     // 主 agent 是 depth 0；depth 2 的 agent 不能再派
+    retry: {
+      attemptTimeoutMs: 600000,      // 单次 attempt 的截止时间；null = 显式不设截止
+    },
     artifacts: { policy: 'warn' },   // 'warn'（默认）| 'deny'
     retainClosedGraphs: 5,           // 保留多少张已关闭的图（超出按 FIFO 整张淘汰）
   },
@@ -1229,14 +1233,49 @@ registerAgentType({ name: 'reviewer', description: '代码评审', systemPrompt:
 ```js
 agent.on('agent.succeeded', ({ agentName, rounds, usage }) => { /* ... */ })
 agent.on('run.keep_alive.timeout', ({ pendingAgents, pendingNodes, waitedMs }) => { /* ... */ })
+// 等待预算耗尽、但仍有活在飞时发一次，附上被留下的在飞清单
+agent.on('run.keep_alive.gave_up', ({ spent, budget, pendingAgents, pendingNodes, inFlight }) => { /* ... */ })
 
-// 每轮对话最多超时一次；超时后给模型留一条"收尾或 agent_cancel"的提示
-agent.lastKeepAliveTimedOut      // boolean
+agent.lastKeepAliveTimedOut      // boolean，纯告知用，不再闸住任何行为
 agent.lastStopReason             // 取值集合未变：null | 'completed' | 'max_rounds'
 ```
 
-轮次仍受 `maxRounds` 约束，因此不存在无界循环。`keepAlive: false` 时本轮直接结束，
-通知暂存到下一次 `chat()` / `stream()` 的第一个轮边界。
+**等待是有界的：`maxConsecutiveWakes`（默认 `3`）。** 数的是**白等** —— 等满
+`keepAliveTimeoutMs` 却没有任何 subagent 事件的次数；被事件唤醒（真有结果回来）不花预算，
+那一次等待买到了东西。用户亲手输入的新一轮（`chat()` / `stream()`）把预算补回，框架自己
+开的续跑轮（`followup()`）不补 —— 否则通知自己就能把它刚花掉的预算充满，闸门等于不存在。
+该名称和默认值参考 dsh 的 jobs 插件；两者计数对象不同：本 SDK 计等待超时，dsh jobs 计自动唤醒。dsh SubAgent 的完成通知直接使用父 Agent 的 followup/steer。非法取值（`0`、负数、非整数、
+`Infinity`）在**构造期**抛 `TypeError`，不留到调用期把一次成功的等待变成整个 run 报错。
+
+```js
+new Agent({ subagents: { maxConsecutiveWakes: 5 } })   // 1 = 复现旧版"最多等一次"的时间线
+```
+
+**放弃等待 ≠ 放弃工作。** 预算耗尽时本轮收尾、发 `run.keep_alive.gave_up`，在飞的子 agent
+**不被取消**（dsh 同样只在 disposal 时取消）。它的结果仍会送达，靠三条路径之一：下一次
+`chat()` / `stream()` 的 round 0 合并（用户又说话了，自动生效）、宿主订阅 `run.wakeup` 后调
+`agent.followup()`（用户没说话，需要宿主主动开一轮）、或宿主自己再调一次 `chat()`。
+
+```js
+// 后台 agent 在**没有 run 在跑**时 settle —— SDK 喊一声，宿主要不要开一轮由宿主决定
+agent.on('run.wakeup', ({ pendingInjections, inFlightAgents }) => {
+  agent.followup().then(answer => answer && push(answer)).catch(reportError)
+  // 初始化或运行中、以及队列空时返回 null；不会并发消费通知。
+})
+```
+
+**推荐配置：`keepAlive: false` + 订阅 `run.wakeup` + 调 `followup()`。** 这正是 dsh 的方向
+（不在轮内干等，而是结束本轮、稍后叫醒），流式宿主因此不会在等待期间看不到任何 chunk。
+
+每次轮次仍受 `maxRounds` 约束；跨轮自动续跑的总预算由宿主控制，`maxConsecutiveWakes` 只限制轮内等待，不能充当跨轮续跑次数上限。`keepAlive: false` 时本轮直接结束，通知暂存
+到下一次 run 的 round 0 —— 那里会把积压的通知**并进**用户这条新消息（通知在前），而不是追加
+成第二条相邻的 `user` 消息（连续多条 user 会被部分供应商拒绝）。写进 memory 的是合并后的
+文本，而传给意图识别与 `SkillFilter` 的仍是用户原话：一段框架自己写的
+`<agent-notification>` 不该参与"用户想干什么"的判断。
+
+`chat()` / `stream()` 初始化阶段也计为忙碌。流消费者在 `done` 后直接 `break` 时，结束窗口内到达的通知仍会触发 `run.wakeup`。宿主应按会话保留 Agent，并串行提交用户轮次；会话关闭时调用 `closeSubagents()`。
+
+可重复集成用例：`node examples/background-lifecycle.js`（本地脚本化模型）；实模型用例：配置 `LLM_API_KEY`、完整 `LLM_URL`、`MODEL` 后运行 `node examples/background-lifecycle-live.js`。两侧 demo 已接入自动续跑。
 
 等待的判据是"真的还有活在飞"（在跑的 agent、排队中的 agent、running 的图节点），
 **不包括 `blocked` 与 `awaiting_confirm` 的图节点** —— 那些等的是主 agent 自己的下一步
@@ -1247,6 +1286,32 @@ agent.lastStopReason             // 取值集合未变：null | 'completed' | 'm
 判据与告知都是**跨全部图**的（含已关闭的图）：一个在飞的 agent 不因为它所属的图被关掉就
 停止存在。`run.keep_alive.timeout` 的 `pendingNodes` 同样跨图统计 —— 若未完成节点在另一
 张图里而这个数报成 0，模型正好会在它决定要不要收尾的那一刻拿到一个假数。
+
+### 单次 attempt 的截止时间
+
+runner 的一次 attempt（一整段 `child.chat()`）默认带 **10 分钟**的截止时间
+（`subagents.retry.attemptTimeoutMs`，默认 `600000`，也可按类型配
+`Agent_Type.attemptTimeoutMs`）。到点即 abort 与调用方 signal 融合后的那一个 signal，
+异常被分类成 `failureKind: 'timeout'` —— 它本来就在可重试集合里 —— 于是按
+`maxAttempts` 自动重试，每次 attempt 各融一张新表。优先级与 `maxAttempts` 同形：
+`subagents.retry.attemptTimeoutMs` > `Agent_Type.attemptTimeoutMs` > 默认值；非法取值
+（`0`、负数、非整数、`Infinity`）在**构造期**抛 `TypeError`；`null` = 显式不设截止
+（与 `ask.timeoutMs` 同一拼法）。
+
+它补的洞此前被文档追认成"刻意留白"：`maxRounds` 数的是**轮**，一轮永不返回就永远不
+递增，所以一个卡在挂死工具调用（或挂死的非流式 LLM 请求）上的子 agent 根本没有时间
+上界 —— `run_in_background: false` 时父 agent 的那次 `agent` 工具调用跟着无上界地
+await 下去，后台派发时挂死的子 agent 永久占着它那一个 depth 层的并发槽（默认
+`maxConcurrent: 4`，四个就把池坐死）。
+
+**最坏墙钟因此有了数**：`maxAttempts × attemptTimeoutMs` 加退避间隔，默认值下 ≈
+3 × 10min + 3s ≈ **30 分钟**（此前是无穷）。`run_in_background: false` 时父 agent 的
+`agent` 工具调用同步等这么久，宿主自己的看门狗必须比它大，否则会看到"SDK 还在重试、
+宿主已经掐断"的中间态。想回到旧行为，显式配 `attemptTimeoutMs: null`（而不是删掉
+配置——删掉等于用回默认值）。
+
+这个界是**协作式**的，不是抢占式的 —— 宿主工具认不认 abort signal 由宿主决定，详见
+「已知限制」第 13 条。
 
 ### DAG 编排
 
@@ -1406,7 +1471,8 @@ Still to decide — not reactivated: api, e2e. ...
 `askId` 定向送回对应的等待方 —— 主机因此可以乱序回答。主 agent 自己的提问也走同一张表
 （归属 `agentId: 'main'`）。
 
-主机有两条接法，可以只用一条，也可以同时用（两条**竞速，先到先赢**，后到者静默 no-op）：
+主机有三条接法，可以只用一条，也可以混用（都与 `answerQuestion` **竞速，先到先赢**，
+后到者静默 no-op）：
 
 ```js
 // 接法 1：hook。签名扩展为 (question, meta)，旧的单参数写法继续工作。
@@ -1429,6 +1495,62 @@ for (const q of agent.pendingQuestions()) {
 agent.answerQuestion(askId, 'prisma')             // → true 表示被这条通道接走了
 agent.cancelQuestion(askId, 'user closed the tab')
 ```
+
+#### 接法 3：宿主自带 `ask_user` 工具（富 schema）
+
+SDK 内置的 `ask_user` 参数只有一个 `question` 字符串。宿主往往需要更多 —— 带选项的
+多选题、走 IPC 的弹窗、自己的富 UI。**直接在 `tools` 里放一个自己的 `ask_user` 即可，
+SDK 会包住它而不是替换它**：`description` / `parameters` 原样保留（模型看到的是你那张
+schema），`execute` 成为这次提问的送达通道，外面只补一层 `AskRegistry` 登记。
+
+```js
+const agent = new Agent({
+  /* ... */
+  subagents: {},
+  tools: [
+    // …你的其它工具
+    {
+      name: 'ask_user',                       // 同名即可，不需要任何 opt-in
+      description: '向用户提问，需要用户在若干选项中拍板时使用。',
+      parameters: {                           // ← 模型看到的就是这张 schema
+        type: 'object',
+        properties: {
+          questions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                question: { type: 'string' },
+                options: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['question'],
+            },
+          },
+        },
+        required: ['questions'],
+      },
+      // ctx 带归属：{ agentId, agentName, depth, nodeId, attempt, cwd, signal }
+      execute: async (params, ctx) => ipcAskUser(params, ctx.agentName),
+    },
+  ],
+})
+```
+
+三点需要知道的：
+
+- **宿主工具在场时不要再挂 `hooks.onAskUser`。** 两者都是"把问题送到用户面前"，SDK 只会
+  触发前者（就近的那条通道赢），但两条都写会让你自己的代码看起来像有两个弹窗入口。
+- **登记表照常工作。** 提问仍带归属出现在 `pendingQuestions()` 里，`answerQuestion` /
+  `cancelQuestion` / `agent_cancel` / `closeSubagents()` 都答得掉它 —— 宿主 UI 被关掉时
+  这就是解围通道。登记表的 `question` 字段是从你的参数里提取的一句摘要（`question`，
+  或 `questions[].question` 拼接）；你的 `execute` 收到的始终是**原样**参数。
+- **子 agent 自动继承同一个通道**（`ask_user` 在 `FLOOR_TOOLS` 里），提问带子 agent 自己的
+  归属，不需要你做任何事。
+
+> ⚠️ **不要只配 `subagents` 而不给任何应答通道。** 三条接法一条都没有时，提问会登记进
+> `AskRegistry` 后无人送达，而 `ask.timeoutMs` 默认 `null`（永不超时）—— 那次工具调用
+> 会**永久挂起**，表象通常是宿主看门狗几分钟后掐断，看起来像网络故障。至少给一条通道，
+> 或者设一个 `ask.timeoutMs` 兜底。
 
 提问期间该 agent 状态转 `waiting_input`（在 `agent_status` 里可见），仍占并发槽。
 `ask.timeoutMs` 默认 `null`（永不超时）；配置后超时返回"用户未在 N 秒内回答"，由子
@@ -1532,7 +1654,12 @@ agent.cancelQuestion(askId, reason)
 
 // 主动往主 agent 的上下文里塞一条消息 —— 在**下一个 ReAct 轮边界**写进 memory，
 // 不是立刻写。后台完成通知、图节点就绪通知、send_message 投递共用这一条队列。
+// 没有 run 在跑时入队会发 `run.wakeup`（宿主据此决定要不要开一轮）。
 agent.enqueueMessage({ role: 'user', content: '用户补充：优先看 auth 模块' })
+
+// 把积压的待投递通知跑成一轮 —— `run.wakeup` 之后调它。
+// 队列空时返回 null 且不发任何请求；这一轮不补回 keep-alive 等待预算。
+await agent.followup()           // → string | null
 
 // 产物轨
 await agent.getArtifacts()                        // 全部
@@ -1545,7 +1672,7 @@ agent.subagents.newGraph({ label })
 agent.subagents.closeGraph(graphId, { reason, disposition })   // disposition 缺省 'keep_running'
 
 // keep-alive 观测
-agent.lastKeepAliveTimedOut    // boolean，本轮是否在还有活在飞时放弃了等待
+agent.lastKeepAliveTimedOut    // boolean，纯告知用 —— 别拿它做控制流判断（见"后台派发与 keep-alive"）
 agent.lastStopReason           // null | 'completed' | 'max_rounds'（取值集合未扩张）
 
 // 退出前
@@ -1630,6 +1757,18 @@ floor）与 `interviewer`（只有 floor，含 `ask_user`）。面板会实时�
 12. **重跑与产物冲突策略的组合** —— 激活刻意不动产物轨（旧记录留着好做对比），因此在
     `artifacts.policy: 'deny'` 下，重跑写同一个 `key` 时若上一代记录属于另一个 agent，
     写入会被拒。这是既有语义，但"重跑 + deny"这个组合是新出现的。
+13. **attempt 截止时间是协作式的，不是抢占式的** —— `attemptTimeoutMs`（见"单次 attempt
+    的截止时间"）经 abort signal 通知：signal 到得了 `fetch`（挂死的 LLM 请求因此真的
+    有界）和 `tool.execute(args, ctx)` 的 `ctx.signal`，但**宿主工具认不认它由宿主决定**
+    —— 一个忽略 signal 的工具（典型：不接 signal 的 `child_process.exec`、裸 `await`
+    一个永不 settle 的 Promise）仍然无上界，超时只打断 `child.chat()` 的等待，工具自己
+    的异步尾巴还在跑。框架**有意不**改成 race `chat()` 的 Promise：赢了 race 会把
+    handle 标成 failed、释放并发槽，而子 Agent 还活着继续发遥测、写产物轨 —— 一个框架
+    账本上已死、物理上还活着的 agent 比没有超时更坏（与 dsh 同一契约）。宿主侧的对应
+    动作是给自己的工具接上 `ctx.signal`。另外 `send_message` 的续跑路径
+    （`runtime._resume`）复活已终态 agent 后的那一轮 `chat()` 还没装这张表，只受调用方
+    signal 约束 —— `_resume` 不走 attempt 循环，硬套会把"续跑超时"错误地计入
+    `maxAttempts`，留待后续版本单独设计。
 
 ## 示例与 demo
 

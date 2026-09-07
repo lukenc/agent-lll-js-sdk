@@ -287,6 +287,7 @@ var defineTool = LllWebAgent.defineTool
 var registerBaseTool = LllWebAgent.registerBaseTool
 var unregisterBaseTool = LllWebAgent.unregisterBaseTool
 var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
+var defaultTokenBudget = LllWebAgent.defaultTokenBudget
 
 /**
  * 活动账本 —— 与 demo/lib/activity.js **逻辑等价的内联副本**。
@@ -395,6 +396,7 @@ var BROWSER_SUBAGENT_TYPES = [
 
 var agent = null
 var sending = false
+var followupRequested = false
 var chat = document.getElementById('chat')
 var input = document.getElementById('input')
 var sendBtn = document.getElementById('send')
@@ -564,6 +566,27 @@ var modifyPage = defineTool({
       default: return 'Error: 未知操作 ' + p.action
     }
   }
+})
+
+// 10. Spill 演示：会产出超大输出的工具
+// 真实场景里这类输出来自读大文件、抓长网页。造一份「结论在尾部」的假构建日志 ——
+// 这正是 headTail 策略的意义：只留头部的话，模型看得到编译开始，看不到最终失败。
+var BUILD_LOG = (function() {
+  var lines = ['=== BUILD START ===', 'Resolving dependencies...']
+  for (var i = 0; i < 3000; i++) {
+    lines.push(i === 1817
+      ? '[' + i + "] ERROR: cannot find module 'left-pad' (imported from src/util.ts)"
+      : '[' + i + '] compiling module_' + i + '.ts ... ok')
+  }
+  lines.push('=== BUILD FAILED ===', 'EXIT_CODE=1')
+  return lines.join('\n')
+})()
+
+var readBuildLog = defineTool({
+  name: 'read_build_log',
+  description: '读取最近一次构建的完整日志（输出很大，约 100KB）',
+  parameters: { type: 'object', properties: {} },
+  execute: async function() { return BUILD_LOG },
 })
 
 // 9. 本地存储类
@@ -897,11 +920,12 @@ async function refreshBrowserMcpTools() {
   }
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
-    var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
-    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user):它们不在
-    // baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们冲掉,
-    // 导致挂载/卸载 MCP 后技能系统或 ask_user 失效。按名字从现有 tools 里捞回来。
-    var META_TOOL_NAMES = { skill: 1, skill_resource: 1, ask_user: 1 }
+    var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer, readBuildLog]
+    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user / spill_read):
+    // 它们不在 baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们
+    // 冲掉,导致挂载/卸载 MCP 后技能系统、ask_user 或 spill 取回失效 —— 而系统提示
+    // 仍在告诉模型「用 spill_read 取回」,那句话就成了空头支票。按名字从现有 tools 捞回来。
+    var META_TOOL_NAMES = { skill: 1, skill_resource: 1, ask_user: 1, spill_read: 1, spill_search: 1 }
     var preserved = (agent.tools || []).filter(function(t) { return META_TOOL_NAMES[t.name] })
     agent.tools = baseTools.concat(mcpTools).concat(preserved)
   }
@@ -978,7 +1002,7 @@ function initAgent() {
   var enableSubagents = document.getElementById('enableSubagents').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
-  var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer]
+  var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer, readBuildLog]
   // 勾了「宿主自带的 ask_user」就把它一起交给 Agent。SDK 注入 ask_user 时会认出
   // 这个同名的宿主工具并**包一层**（保留富 schema 与 execute，外面补 AskRegistry
   // 登记），而不是替换掉它。
@@ -1007,6 +1031,9 @@ function initAgent() {
     // 12 轮足够覆盖 ask_user → 工具调用 → 合成回复的典型三轮流程外加几次
     // 重试空间；超出上限框架会写入 `[max rounds exceeded]` 体面退出。
     maxRounds: 12,
+    // Token 计量：配了 tokenBudget 才走 ContextManager，也才有 usage 锚定。
+    // 不配的话直接把 memory 里的消息发出去，既不裁剪也不计量。
+    tokenBudget: defaultTokenBudget(),
   }
   // 技能系统 —— 浏览器端用 HTTP provider 从 demo server 的 /skill-source 拉技能。
   // runtime: 'browser' 会改注入 skill_resource 工具(Level 3 走 provider.readResource,
@@ -1017,6 +1044,17 @@ function initAgent() {
       providers: [{ type: 'http', baseUrl: location.origin + '/skill-source' }],
     }
   }
+  // Spill —— 工具输出限长 + 转存。浏览器侧没有文件系统，SDK 会自动选 IndexedDB
+  // 后端（`createDefaultSpillStore` 按环境判断）。上限设小一点方便看效果：
+  // read_build_log 产出约 100KB，模型只会看到头尾摘要 + 一个 spill:// 地址，
+  // 需要中间细节时自己调 spill_read 分段读回。
+  agentOpts.spill = {
+    maxToolResultBytes: 1200,
+    onWarn: function(msg) { addMsg('phase', '⚠️ spill 降级: ' + msg) },
+  }
+  agentOpts.systemPrompt += '。工具输出过大时会被自动转存,你只会看到头尾摘要和一个 spill:// 地址;'
+    + '需要细节时先用 spill_search 搜关键词定位,再用 spill_read 按 offset 精读,不要从头顺序读。'
+
   if (simpleProvider) agentOpts.simpleProvider = simpleProvider
   if (simpleModel) agentOpts.simpleModel = simpleModel
   if (simpleApiKey) agentOpts.simpleApiKey = simpleApiKey
@@ -1046,8 +1084,7 @@ function initAgent() {
       maxConcurrent: 2,
       maxDepth: 2,
       artifacts: { policy: 'deny' },
-      keepAlive: true,
-      keepAliveTimeoutMs: 60000,
+      keepAlive: false,
       // 必须设。`ask.timeoutMs` 默认 null = 永不超时,而这个页面**只有** hook 一条
       // 应答通道:上面那个"注入 ask_user 工具"没勾时 hook 不装,一个 interviewer
       // 子 agent 的提问就永远没人答 —— 它会一直占着并发槽挂到页面关掉。
@@ -1058,6 +1095,13 @@ function initAgent() {
   }
 
   agent = new Agent(agentOpts)
+  followupRequested = false
+  var connectedAgent = agent
+  agent.on('run.wakeup', function() {
+    if (agent !== connectedAgent) return
+    followupRequested = true
+    queueMicrotask(function() { if (!sending) send(true) })
+  })
 
   // 重连即新会话，账本跟着清；手动展开/折叠的记忆也一并清空（新会话的
   // agentId 全新分配，留着旧的没有意义）。
@@ -1069,7 +1113,9 @@ function initAgent() {
   // 订阅遥测事件，实时渲染到右侧面板。
   // 说明：监听器为空时 Agent 也会维护 getLastRunMetrics / getSessionMetrics，
   // 这里显式订阅以做 UI 可视化。失败时通过 console.warn 暴露。
-  var telemetryTypes = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call']
+  var telemetryTypes = ['session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call',
+    // 上下文组装：带 tokenConfidence（usage=实测锚定 / estimated=纯估算）
+    'context.assembled']
   if (enableSubagents) {
     telemetryTypes = telemetryTypes.concat([
       'agent.spawn', 'agent.state', 'agent.succeeded', 'agent.failed', 'agent.cancelled',
@@ -1109,20 +1155,24 @@ function initAgent() {
   input.focus()
 }
 
-async function send() {
-  if (!agent || sending) return
-  var msg = input.value.trim()
-  if (!msg) return
-  input.value = ''
+async function send(followup = false) {
+  if (!agent || sending || (followup && !followupRequested)) return
+  var msg = followup ? '' : input.value.trim()
+  if (!followup && !msg) return
+  if (!followup) input.value = ''
+  followupRequested = false
   sending = true
   sendBtn.disabled = true
 
-  addMsg('user', msg)
+  if (!followup) addMsg('user', msg)
   var el = null
   var reasoningEl = null
 
   try {
-    var iter = agent.stream(msg)
+    var iter = followup ? (async function*() {
+      var answer = await agent.followup()
+      if (answer != null) yield { type: 'done', content: answer }
+    })() : agent.stream(msg)
     while (true) {
       var r = await iter.next()
       if (r.done) break
@@ -1201,6 +1251,7 @@ async function send() {
   sending = false
   sendBtn.disabled = false
   input.focus()
+  if (followupRequested) queueMicrotask(function() { send(true) })
 }
 
 function addMsg(role, text) {

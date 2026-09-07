@@ -69,6 +69,7 @@ import {
   createSkillRegistry,
   listAgentTypes,
   SUBAGENT_TOOL_NAMES,
+  defaultTokenBudget,
 } from '../src/index.js'
 import { createActivityLedger } from './lib/activity.js'
 
@@ -295,6 +296,33 @@ const readNote = defineTool({
   execute: async ({ name }) => NOTES[name] ?? `no note named "${name}"`,
 })
 
+// ---- Spill 演示：一个会产出超大输出的工具 ----
+// 真实场景里这类输出来自 shell_exec 跑构建、read_file 读大日志。
+// 这里造一份「结论在尾部」的假构建日志 —— 这正是 headTail 策略的意义：
+// 只留头部的话，模型能看到编译开始，却看不到最终失败和退出码。
+const BUILD_LOG = (() => {
+  const lines = ['=== BUILD START ===', 'Resolving dependencies...']
+  for (let i = 0; i < 3000; i++) {
+    lines.push(i === 1817
+      ? `[${i}] ERROR: cannot find module 'left-pad' (imported from src/util.ts)`
+      : `[${i}] compiling module_${i}.ts ... ok`)
+  }
+  lines.push('=== BUILD FAILED ===', 'EXIT_CODE=1')
+  return lines.join('\n')
+})()
+
+const readBuildLog = defineTool({
+  name: 'read_build_log',
+  description: '读取最近一次构建的完整日志（输出可能非常大，约 100KB）',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => BUILD_LOG,
+})
+
+// 默认开启。SPILL=0 关闭后行为与引入 spill 之前逐字节一致。
+const ENABLE_SPILL = process.env.SPILL !== '0' && process.env.SPILL !== 'false'
+// 单条工具结果的模型可见上限（字节）。demo 里设小一点，方便观察效果。
+const SPILL_MAX_BYTES = Number(process.env.SPILL_MAX_BYTES || 1200)
+
 /**
  * 演示用的 Agent_Type。`tools` 只列任务工具就够 —— artifact_write / artifact_list /
  * history_search / history_get / send_message / ask_user 是框架保证带上的基础设施 floor。
@@ -358,7 +386,7 @@ function getMcpPromptNote() {
  * ask_user 冲掉,是最难发现的那种回归:system 消息里的 agent type 清单还在,模型照着
  * 它去调 `agent`,却被告知没有这个工具。
  */
-const META_TOOL_NAMES = new Set([...SUBAGENT_TOOL_NAMES, 'ask_user', 'skill'])
+const META_TOOL_NAMES = new Set([...SUBAGENT_TOOL_NAMES, 'ask_user', 'skill', 'spill_read', 'spill_search'])
 
 /** 重建 agent 的 tools(不重建 agent 本身,保留对话历史) */
 function refreshAgentTools() {
@@ -378,7 +406,7 @@ function refreshAgentTools() {
     (t) => t.name === 'load_mcp_server' || t.name === 'skill' || t.name === 'skill_resource'
       || dynamicNames.has(t.name) || META_TOOL_NAMES.has(t.name)
   )
-  agent.tools = [...getLocalBaseTools(), readNote, ...getAllMcpTools(), ...preserved]
+  agent.tools = [...getLocalBaseTools(), readNote, readBuildLog, ...getAllMcpTools(), ...preserved]
 }
 
 /**
@@ -495,10 +523,14 @@ function createAgent(strategy) {
       + (ENABLE_SUBAGENTS
         ? '。成块的、边界清晰的活可以用 `agent` 工具派给 subagent 去做;多件事之间有依赖时用 `agent_graph` 声明依赖图'
         : '')
+      + (ENABLE_SPILL
+        ? '。工具输出过大时会被自动转存,你只会看到头尾摘要和一个 spill:// 地址;'
+          + '需要细节时先用 spill_search 搜关键词定位,再用 spill_read 按 offset 精读,不要从头顺序读'
+        : '')
       + '。请用中文回答。',
     // getLocalBaseTools() 已含 get_current_time / calculate / (skills 启用时) read_file；
     // readNote 是 subagent 演示素材，两边合并后一起给。
-    tools: [...getLocalBaseTools(), readNote, ...getAllMcpTools()],
+    tools: [...getLocalBaseTools(), readNote, readBuildLog, ...getAllMcpTools()],
     strategy: currentStrategy,
     // 启用后,Agent 工具集会多一个 load_mcp_server 元工具,LLM 可自主加载 MCP 服务器;
     // 连接/关闭超时沿用默认 30s/5s。运行时加载的客户端由 Agent 持有,reset()/
@@ -519,10 +551,25 @@ function createAgent(strategy) {
           maxConcurrent: 2,
           maxDepth: 2,
           artifacts: { policy: 'warn' },
-          keepAlive: true,
-          // demo 场景等 10 分钟没意义,超时后模型会拿到一条"收尾或 agent_cancel"的提示。
-          keepAliveTimeoutMs: 60_000,
+          // 父轮次先结束，页面收到后台通知后发起 followup。
+          keepAlive: false,
+          retry: { attemptTimeoutMs: Number(process.env.SUBAGENT_ATTEMPT_TIMEOUT_MS || 600000) },
           ask: { timeoutMs: 180_000 },
+        },
+      }
+      : {}),
+    // Token 计量：配了 tokenBudget 才会走 ContextManager，也才有 usage 锚定。
+    // 不配的话 _runPipeline 走「简单模式」，直接把 memory 里的消息发出去，
+    // 既不裁剪也不计量。demo 里开着，好让遥测面板能看到置信度变化。
+    tokenBudget: defaultTokenBudget(),
+    // Spill：单条工具结果超过上限时转存，模型侧只留头尾摘要 + 取回地址。
+    // 未配置（SPILL=0）时 agent._spill 恒为 null，工具结果逐字节与从前一致。
+    // Node 侧默认落临时文件目录；spill_read 工具自动注入并注册为基础工具。
+    ...(ENABLE_SPILL
+      ? {
+        spill: {
+          maxToolResultBytes: SPILL_MAX_BYTES,
+          onWarn: msg => console.warn('[spill]', msg),
         },
       }
       : {}),
@@ -574,13 +621,16 @@ async function buildContextSnapshot(agent) {
 function pipeTelemetry(agent, res) {
   const types = [
     'session.start', 'session.end', 'round.start', 'round.end', 'llm.call', 'tool.call',
+    // 上下文组装：带 tokenConfidence（usage / estimated）与各区段计价。
+    // 面板上能直接看到「这一轮的 token 数是实测锚定的还是纯估的」。
+    'context.assembled',
     // subagent 系统的事件。列在这里而不是订阅 '*' —— 事件流面板是给人看的,
     // 图的每一次 tick 都推过去会把真正重要的几条淹掉。
     'agent.spawn', 'agent.state', 'agent.succeeded', 'agent.failed', 'agent.cancelled',
     'graph.declared', 'graph.node.ready', 'graph.node.started', 'graph.node.settled', 'graph.closed',
     'artifact.write', 'artifact.conflict',
     'ask.user', 'ask.answered', 'ask.cancelled',
-    'run.keep_alive.timeout',
+    'run.keep_alive.timeout', 'run.keep_alive.gave_up', 'run.wakeup', 'agent.retry',
   ]
   const listeners = []
   for (const t of types) {
@@ -626,6 +676,7 @@ async function buildSubagentSnapshot(agent) {
   }))
   return {
     enabled: true,
+    pendingMessages: agent._pendingInjections.length,
     types: listAgentTypes().map(t => ({ name: t.name, description: t.description })),
     // toStatus() 是一份不含函数、不含 apiKey 的快照 —— 直接下发给浏览器是安全的。
     agents: rt.registry.list({ includeFinished: true }).map((h) => {
@@ -639,6 +690,7 @@ async function buildSubagentSnapshot(agent) {
   }
 }
 
+let chatting = false
 const server = createServer(async (req, res) => {
   // 静态页面
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
@@ -675,9 +727,12 @@ const server = createServer(async (req, res) => {
 
   // SSE 聊天接口
   if (req.method === 'POST' && req.url === '/chat') {
+    if (chatting) { res.writeHead(409); res.end('A conversation is already running'); return }
     let body = ''
     for await (const chunk of req) body += chunk
-    const { message } = JSON.parse(body)
+    const { message, followup } = JSON.parse(body)
+    if (chatting) { res.writeHead(409); res.end('A conversation is already running'); return }
+    chatting = true
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -690,8 +745,13 @@ const server = createServer(async (req, res) => {
     const unsubscribe = pipeTelemetry(agent, res)
 
     try {
-      for await (const event of agent.stream(message)) {
-        res.write(`data: ${JSON.stringify(event)}\n\n`)
+      if (followup) {
+        const answer = await agent.followup()
+        if (answer != null) res.write(`data: ${JSON.stringify({ type: 'done', content: answer, stopReason: agent.lastStopReason })}\n\n`)
+      } else {
+        for await (const event of agent.stream(message)) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`)
+        }
       }
       // 把本次运行的聚合指标一起下发，前端可以直接渲染。
       const lastRun = agent.getLastRunMetrics()
@@ -707,6 +767,7 @@ const server = createServer(async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`)
     } finally {
       unsubscribe()
+      chatting = false
     }
     res.write('data: [DONE]\n\n')
     res.end()

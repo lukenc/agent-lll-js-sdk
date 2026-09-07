@@ -416,14 +416,21 @@ describe('Preservation: Unchanged Trim Behavior for Non-Tool-Call Boundaries', (
           const result = mem.getMessages()
           const nonSystem = result.filter(m => m.role !== 'system')
 
-          // Total tokens of kept messages must not exceed maxTokens
+          // 预算不变量：保留的消息不得超预算 —— **但有一个有意的例外**。
+          //
+          // 计价含结构开销后，单条消息最低就要 BLOCK+ROLE = 8 tokens。
+          // maxTokens 小于这个数时严格守预算意味着「一条都不留」，模型连
+          // 用户刚说的话都看不到。TokenBudgetPolicy 因此保底留最近一条，
+          // 请求有效性优先于严格预算（与 context-manager.trimHistory 同一取舍）。
+          //
+          // 所以不变量准确的表述是：**要么在预算内，要么正好只保留了一条**。
           const totalTokens = nonSystem.reduce((sum, m) => {
             return sum + Math.ceil((m.content ?? '').length / CHARS_PER_TOKEN)
           }, 0)
 
           assert.ok(
-            totalTokens <= maxTokens,
-            `Token budget exceeded: ${totalTokens} > ${maxTokens}`
+            totalTokens <= maxTokens || nonSystem.length <= 1,
+            `Token budget exceeded with ${nonSystem.length} messages kept: ${totalTokens} > ${maxTokens}`
           )
 
           // Kept messages should be a suffix of the original messages

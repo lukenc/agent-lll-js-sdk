@@ -648,6 +648,7 @@ function renderAgentStatus(runtime, { agentId, includeFinished }) {
   if (handles.length === 0) return 'no active agents (0 running, 0 queued)'
   const lines = handles.map(h =>
     `${h.name} [${h.state}] type=${h.type} model=${h.model?.alias ?? 'inherited'} `
-    + `attempt=${h.attempt} — ${h.description}`)
+    + `attempt=${h.attempt} rounds=${h.metrics.rounds} tools=${h.metrics.toolCalls} `
+    + `lastToolCallAt=${h.lastToolCallAt ?? 'none'} — ${h.description}`)
   return `${handles.length} agent(s):\n${lines.join('\n')}`
 }

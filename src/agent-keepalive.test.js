@@ -209,15 +209,25 @@ test('lastStopReason 的取值集合没有扩张', () => {
   assert.ok([null, 'completed', 'max_rounds'].includes(agent.lastStopReason))
 })
 
-// ---- 超时之后：不再二次等待，但迟到的投递照旧 ----
+// ---- 超时之后：等待有界，但迟到的投递照旧 ----
 
-test('超时后不再等第二次，但迟到的通知仍会被投递', async () => {
-  // `maxRounds` 默认 300：不设这道闸，一个卡死的 subagent 能把一轮对话拖成
+test('预算耗尽后不再等待，但迟到的通知仍会被投递', async () => {
+  // `maxRounds` 默认 300：不设界，一个卡死的 subagent 能把一轮对话拖成
   // 300 × keepAliveTimeoutMs（默认 10 分钟）≈ 50 小时，并发 300 次超时事件。
-  // 抑制的是第二次**等待**，不是第二次**投递** —— 所以待注入判断仍在最前面。
-  const agent = new Agent({ ...baseOpts, subagents: { keepAliveTimeoutMs: 50 } })
+  // 抑制的是**等待**，不是**投递** —— 所以待注入判断仍在最前面。
+  //
+  // 这个界原先是硬编码的"每 run 一次"（粘性布尔 `lastKeepAliveTimedOut`），
+  // 现在是一个可配置的计数 `maxConsecutiveWakes`（默认 3，对齐 dsh）。取 1 时
+  // 行为与旧版逐条相同 —— 本用例正是用 1 保住旧版那条反自激保证。计数语义、
+  // refill 规则与"放弃时不取消在飞工作"见 `agent-keepalive-budget.test.js`。
+  const agent = new Agent({
+    ...baseOpts,
+    subagents: { keepAliveTimeoutMs: 50, maxConsecutiveWakes: 1 },
+  })
   const events = []
   agent.on('run.keep_alive.timeout', p => events.push(p))
+  const gaveUp = []
+  agent.on('run.keep_alive.gave_up', p => gaveUp.push(p))
   const handle = stuckAgent(agent)
 
   assert.strictEqual(await agent._keepAliveOnce(), 'timeout')
@@ -225,14 +235,17 @@ test('超时后不再等第二次，但迟到的通知仍会被投递', async ()
   assert.strictEqual(await agent._keepAliveOnce(), 'injected')
   agent._drainPendingInjections()
 
-  // 队列空了、agent 仍在飞 —— 这一次必须立刻收尾，不能再等一个完整超时。
+  // 队列空了、agent 仍在飞、预算已尽 —— 这一次必须立刻收尾，不能再等一个完整超时。
   assert.strictEqual(agent.subagents.hasInFlight(), true)
   const startedAt = performance.now()
   assert.strictEqual(await agent._keepAliveOnce(), 'idle')
   assert.ok(performance.now() - startedAt < 25, '不该再等一个完整超时')
-  assert.strictEqual(events.length, 1, '超时事件每轮对话只发一次')
+  assert.strictEqual(events.length, 1, '预算为 1 时超时事件只发一次')
+  assert.strictEqual(gaveUp.length, 1, '放弃等待必须说一声，不是静默走人')
+  assert.strictEqual(gaveUp[0].inFlight.length, 1, '并附上被留下的在飞清单')
+  assert.strictEqual(agent.subagents.hasInFlight(), true, '放弃等待 ≠ 取消工作')
 
-  // 但迟到的完成通知照样投递。
+  // 但迟到的完成通知照样投递 —— 预算耗尽闸的是等待，不是投递。
   agent.subagents._onBackgroundSettled(handle, 'late but real')
   assert.strictEqual(await agent._keepAliveOnce(), 'injected')
 })

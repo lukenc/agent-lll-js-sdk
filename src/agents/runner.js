@@ -14,11 +14,17 @@
  * 让位给 `_finishCancelled`——不管重试循环里兜到的异常长什么样，都不会把一次
  * 主动取消误渲染成 `status: 'failed'`。
  */
-import { getAgentType } from './types.js'
+import { getAgentType, normalizeAttemptTimeoutMs } from './types.js'
 import { renderContract } from './contract.js'
 import { finalizeWorktree } from './isolation.js'
 import { wrapMemoryForMirror } from './mirror.js'
 import { SlidingWindowMemory } from '../memory.js'
+
+// `normalizeAttemptTimeoutMs` 的**定义**在 types.js（Agent_Type 那一侧也要用它，而
+// types.js 若反向 import 本模块就构成引用环 —— 见下面那条"不要静态 import Agent"的
+// 注释）。这里 re-export，所以机制的公开面仍然长在 runner 这一侧，调用方按
+// `import { normalizeAttemptTimeoutMs } from './runner.js'` 取用即可。
+export { normalizeAttemptTimeoutMs }
 
 // 注意：**不要**在这里静态 import `Agent` —— agent.js → runtime.js → runner.js
 // 已经构成引用环，静态 import 会让求值顺序变得脆弱。默认工厂改用动态 import，
@@ -74,6 +80,131 @@ export const GRAPH_TOOLS = new Set([
 export const FLOOR_TOOLS = new Set([
   'artifact_write', 'artifact_list', 'history_search', 'history_get', 'send_message', 'ask_user',
 ])
+
+/**
+ * 单次 attempt 截止时间的默认值（毫秒）—— 10 分钟。
+ *
+ * 这个数不是新拍的：`docs/superpowers/plans/2026-07-30-subagent-system.md` 当初写的
+ * 就是 `retry = { maxAttempts = 3, attemptTimeoutMs = 600000 }`，设计里有、实现里漏了，
+ * 而 0.9.0 的 CHANGELOG 把这次漏掉追认成了"刻意留白"。它还与 `keepAliveTimeoutMs`
+ * 默认同值 —— 编排者愿意为一次等待花的上限，正好是它愿意为一个子任务花的上限。
+ */
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 600000
+
+/** `AttemptTimeoutError.code`，也是 dsh `deadline(upstream, ms, code)` 里那个 code 的对应物。 */
+export const ATTEMPT_TIMEOUT_CODE = 'SUBAGENT_ATTEMPT_TIMEOUT'
+
+/**
+ * `setTimeout` 的上限（2^31-1，约 24.8 天）。超过它 Node 会**立即**触发表 —— 一个
+ * 想表达"几乎不设界"的大数于是变成"当场超时"。dsh 用 `clampTimeout` 把上限钳到同一个
+ * 数（`packages/util/timeout/src/index.ts`），这里照做。
+ */
+export const MAX_TIMER_DELAY_MS = 2147483647
+
+/**
+ * 单次 attempt 到点时 abort 的那个 reason。
+ *
+ * 带 `_failureKind = 'timeout'` 走的是 `MaxRoundsError` 那套既有惯例 —— `classifyFailure`
+ * 优先采信它，比读消息正则可靠；消息里仍然写着 "timed out"，所以两条路指向同一个结论，
+ * 改文案不会让分类静默退化成不可重试的 `tool_error`。
+ *
+ * 对应 dsh 的 `TimeoutReason`（`name` / `code` / `timeoutMs` 三个可观测字段同款）。
+ */
+export class AttemptTimeoutError extends Error {
+  constructor(timeoutMs, code = ATTEMPT_TIMEOUT_CODE) {
+    super(`subagent attempt timed out after ${timeoutMs}ms`)
+    this.name = 'AttemptTimeoutError'
+    this.code = code
+    this.timeoutMs = timeoutMs
+    this._failureKind = 'timeout'
+  }
+}
+
+/**
+ * 给一次 attempt 装一张截止表，与调用方的 signal 融合。
+ *
+ * 移植 dsh `packages/util/timeout` 的 `deadline()` 语义，但**不用 `AbortSignal.any` 也不用
+ * `using`/`Symbol.dispose`** —— 本包的支持下限是 Node 18（`package.json` 的
+ * `engines.node: ">=18.0.0"`，且不做任何转译），而 `AbortSignal.any` 是 Node 20.3.0+。
+ * 仓内已有同一个取舍的先例：`src/mcp/transports/sse.js` 的 `combineSignals`，它的注释写着
+ * "Node 18+ 有 `AbortSignal.any(...)`，但为兼容更老的语义与测试环境我们手动实现"。
+ * `[Symbol.dispose]` 同理换成显式 `clear()` + `try/finally`。
+ *
+ * 语义逐条对齐 dsh 的 `timeout.spec.ts`：
+ *   - **先到者胜**：上游（调用方取消 / `agent_cancel` / `closeSubagents()`）先 abort 就把
+ *     它的 reason 原样转发，`timedOut()` 是 `undefined` —— 一次刻意的取消不该被读成
+ *     "这个子 agent 出故障了"；我们的表先到则 `timedOut()` 返回那个错误，之后上游再
+ *     abort 是 no-op。
+ *   - 上游**预先已 aborted** → 当场转发且不装表（一个已经取消的 attempt 没有再等十分钟的
+ *     余地）。
+ *   - `timeoutMs` 为 `null` / `<= 0` / 非数 → **不装表**，`signal` 就是上游本身（没有上游
+ *     则是 `undefined`），`clear()` 是空操作。
+ *
+ * `timedOut()` 用**闭包身份**判定而不是 dsh 的 `timeoutOf(signal, code)` 按 code 扫 reason：
+ * 这里更强一层。一个**父** attempt 的截止表 abort 了子 agent 的融合 signal 时，子这一侧的
+ * `fired` 仍是 `null`，于是它被分类成 `aborted` 而不是 `timeout` —— 父超时会连带停掉子，
+ * 但那是父的账，不该让子背上"我自己超时了"并去重试。dsh 需要 code 作用域是因为它的
+ * `timeoutOf` 在远处读一个裸 signal，没有闭包可用。
+ *
+ * `clear()` 两件事都做，少一件都是一个真实缺陷：
+ *   - `clearTimeout` —— 漏掉的话每次 attempt 都给宿主进程留下一个最长 10 分钟的活表，
+ *     Node 的事件循环要等它触发才退出，README「后台 agent 跨 `chat()` 存活，全部 settle
+ *     之后进程自然退出」那条承诺就变成"跑完了也不退出"。
+ *   - `removeEventListener` —— `{ once: true }` 只在**真的 abort** 时自摘。每次 attempt
+ *     都往同一个调用方 signal 上融一张新表，三次重试就是三个常驻监听器，`maxAttempts`
+ *     再大一点就是 `MaxListenersExceededWarning`（`agent-keepalive.test.js` 已经为
+ *     `nextEvent` 钉过同一个回归形状）。
+ *
+ * @param {AbortSignal|undefined|null} upstream 调用方的 signal（`run()` 收到的那个）
+ * @param {number|null|undefined} timeoutMs
+ * @returns {{ signal: AbortSignal|undefined, timedOut: () => AttemptTimeoutError|undefined, clear: () => void }}
+ */
+export function attemptDeadline(upstream, timeoutMs) {
+  const live = upstream && typeof upstream.addEventListener === 'function' ? upstream : null
+  const armed = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+
+  if (!armed) {
+    // 不装表：逐字节等同没有这个特性时的行为。
+    return { signal: live ?? undefined, timedOut: () => undefined, clear: () => {} }
+  }
+
+  const controller = new AbortController()
+  /** 只有**我们的表**赢了才非 null —— 分类的唯一依据。 */
+  let fired = null
+  let forward = null
+  let timer = null
+  let cleared = false
+
+  const clear = () => {
+    if (cleared) return
+    cleared = true
+    if (timer != null) { clearTimeout(timer); timer = null }
+    if (live && forward) {
+      try { live.removeEventListener('abort', forward) } catch { /* 非标准 signal 实现 */ }
+      forward = null
+    }
+  }
+
+  if (live?.aborted) {
+    try { controller.abort(live.reason) } catch { controller.abort() }
+    return { signal: controller.signal, timedOut: () => undefined, clear }
+  }
+
+  if (live) {
+    forward = () => {
+      try { controller.abort(live.reason) } catch { controller.abort() }
+    }
+    live.addEventListener('abort', forward, { once: true })
+  }
+
+  timer = setTimeout(() => {
+    timer = null
+    fired = new AttemptTimeoutError(timeoutMs)
+    controller.abort(fired)
+  }, Math.min(timeoutMs, MAX_TIMER_DELAY_MS))
+
+  return { signal: controller.signal, timedOut: () => fired ?? undefined, clear }
+}
 
 export function classifyFailure(err) {
   if (!err) return 'tool_error'
@@ -267,6 +398,25 @@ export class SubagentRunner {
   }
 
   /**
+   * 单次 attempt 的截止时间。优先级 `subagents.retry.attemptTimeoutMs` >
+   * `Agent_Type.attemptTimeoutMs` > `DEFAULT_ATTEMPT_TIMEOUT_MS`，与 `maxAttempts` 同形。
+   *
+   * **必须用显式判 `undefined` 而不是 `??` 收尾**：`null` 是"显式不设截止"，
+   * `null ?? DEFAULT` 会把它吞成 600000 —— 一个写了 `attemptTimeoutMs: null` 的宿主
+   * 会拿到它刚刚明确关掉的那张表，而且没有任何迹象。
+   *
+   * 默认值只在这里解析一次。`runtime.js` **不得** eager 填 `retry.attemptTimeoutMs`
+   * （它把 `retry` 原样展开传给本类，`runtime.test.js` 钉住了那次展开）—— 谁在那里填了
+   * 默认值，类型级配置就永远不可达，`maxAttempts` 已经踩过一次这个坑。
+   */
+  _attemptTimeoutMs(type) {
+    const configured = this.opts.retry?.attemptTimeoutMs
+    if (configured !== undefined) return configured
+    if (type && type.attemptTimeoutMs !== undefined) return type.attemptTimeoutMs
+    return DEFAULT_ATTEMPT_TIMEOUT_MS
+  }
+
+  /**
    * @returns {Promise<string>} Agent_Result 字符串。永不 reject。
    */
   async run(handle, { prompt, inputs = [], signal } = {}) {
@@ -380,6 +530,7 @@ export class SubagentRunner {
       memory: this._makeChildMemory(handle),
     })
     handle._child = child
+    handle.metrics = { rounds: 0, llmCalls: 0, toolCalls: 0, usage: null, wallClockMs: 0 }
     // `nodeId` / `attempt` 必须在这里给全：`artifact_write` 读的就是它们。少给的
     // 后果是静默的 —— 每条产物记录都记成 `{ nodeId: null, attempt: 1 }`，图节点的
     // 归属丢了，而一个重试过的 agent 会为同一个 key 留下两条无法区分的记录（
@@ -393,7 +544,28 @@ export class SubagentRunner {
     }
     this._forwardTelemetry(handle, child)
 
-    const text = await child.chat(options._contract, { signal })
+    // 单次 attempt 的截止时间。融合后的 signal **只在这一次 `child.chat` 上使用，绝不
+    // 写回**`signal`（也不去 abort `handle._abort`）：`run()` 收到的 `signal` 就是
+    // `handle._abort.signal`（`runtime.js` 的 `spawn`），而它的重试闸门读的是
+    // `!signal?.aborted`。写回去的话第一次超时就等于宣告"调用方取消了"，重试当场失效
+    // —— 这个字段也就只剩"把挂死变成失败"，而没有"再试一次"。
+    // 孙辈照样会被停掉：融合 signal 顺着 `child.chat` → `tool.execute(ctx.signal)` →
+    // 孙 `spawn` 的转发链一路传下去。
+    const deadline = attemptDeadline(signal, this._attemptTimeoutMs(getAgentType(handle.type)))
+    let text
+    try {
+      text = await child.chat(options._contract, { signal: deadline.signal })
+    } catch (err) {
+      // 只在**错误路径**上看表。一次跑完的 attempt 手里是完整报告，与截止时刻擦肩也照收
+      // —— 丢掉它去重跑是纯烧 token，还会把已经干完的活再干一遍。这与 dsh 的
+      // `timeout-policy` 有意分歧：它即使工具成功返回也照样换成超时结果，但它的结果可能
+      // 是被掐断的半截输出，而这里不会。
+      throw deadline.timedOut() ?? err
+    } finally {
+      // 表与上游监听器都必须摘干净：漏 `clearTimeout` 会让宿主进程在每个跑完的子 agent
+      // 之后多挂最长 attemptTimeoutMs；漏 `removeEventListener` 会在重试路径上堆积监听器。
+      deadline.clear()
+    }
     if (child.lastStopReason === 'max_rounds') {
       const err = new Error('subagent exhausted its round budget')
       err.name = 'MaxRoundsError'
@@ -427,6 +599,16 @@ export class SubagentRunner {
     if (typeof child.on !== 'function') return
     for (const eventType of ['llm.call', 'tool.call', 'round.start', 'round.end']) {
       child.on(eventType, (payload) => {
+        // Capture progress before publishing the event, so a host querying
+        // agent_status from its listener sees the same completed work.
+        if (!handle.isTerminal() && handle._child === child && !payload.agentId) {
+          if (eventType === 'round.start') handle.metrics.rounds = payload.round + 1
+          if (eventType === 'llm.call' && payload.ok) handle.metrics.llmCalls += 1
+          if (eventType === 'tool.call') {
+            if (payload.ok) handle.metrics.toolCalls += 1
+            handle.lastToolCallAt = Date.now()
+          }
+        }
         this.emit(eventType, {
           ...payload,
           agentId: handle.agentId,

@@ -23,7 +23,12 @@ export {
   getBaseTools,
 } from './tool-filter.js'
 export { KnowledgeBase, createKnowledgeEntry } from './knowledge-base.js'
-export { ContextManager, defaultTokenBudget, estimateTokens } from './context-manager.js'
+export {
+  ContextManager, defaultTokenBudget, estimateTokens,
+  // token 计量：结构开销计价 + 信封指纹（第 03 份差距，移植自 dsh token-meter）。
+  // estimateMessageTokens 由 memory-policy 侧统一导出，此处不重复。
+  estimateToolsTokens, headerFingerprint, ROLE_OVERHEAD, BLOCK_OVERHEAD,
+} from './context-manager.js'
 export { streamChat, syncChat, streamChatIter, LlmApiError, LlmStreamIncompleteError, withRetry, isRetryableError, computeRetryDelayMs } from './llm-client.js'
 export { PlanAndExecuteStrategy, PlanStep, StepStatus, parsePlan } from './plan-and-execute.js'
 export { TelemetryBus, newTraceId, newSpanId, childContext, extractUsage, utf8ByteLength } from './telemetry.js'
@@ -72,3 +77,22 @@ export {
   A2AError,
   WorktreeIsolationError,
 } from './agents/index.js'
+
+// ---- Spill：工具输出限长 + 转存取回 ----
+// 移植自 deepseek-harness 的 output-retention / spill 系列（MIT）。
+export {
+  TextRetainer,
+  ItemRetainer,
+  describeOmitted,
+  formatRetentionNotice,
+} from './output-retention.js'
+export {
+  MemorySpillStore,
+  createNodeSpillStore,
+  createIndexedDBSpillStore,
+  createDefaultSpillStore,
+  encodeSegment,
+  utf8Bytes,
+  SpillError,
+} from './spill/index.js'
+export { createSpillPolicy, SPILL_READ_TOOL_NAME, SPILL_SEARCH_TOOL_NAME } from './spill/policy.js'

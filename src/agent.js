@@ -38,6 +38,8 @@ import { TelemetryBus, newTraceId, newSpanId, utf8ByteLength, childContext } fro
 import { createMCPClient } from './mcp/index.js'
 import { formatMcpToolSummary } from './mcp/metadata.js'
 import { createSkillRegistry } from './skills/registry.js'
+import { createSpillPolicy, SPILL_READ_TOOL_NAME, SPILL_SEARCH_TOOL_NAME } from './spill/policy.js'
+import { createDefaultSpillStore } from './spill/index.js'
 import { SkillFilter } from './skills/filter.js'
 import { applySkillArgs } from './skills/model.js'
 import { createSubagentRuntime } from './agents/runtime.js'
@@ -259,6 +261,18 @@ export class Agent {
    * @param {Record<string, { model?: string, apiKey?: string, url?: string }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）
    * @param {object} [opts.subagents.retry] - 重试配置。`maxAttempts` 优先级：本字段 >
    *   `Agent_Type.maxAttempts` > 3；`backoffMs` 为退避基数（默认 `min(2^attempt·1000, 8000)`）
+   * @param {number|null} [opts.subagents.retry.attemptTimeoutMs=600000] - **单次 attempt
+   *   的截止时间**。到点即 abort 融合 signal，分类成 `failureKind: 'timeout'`（属
+   *   `RETRYABLE_KINDS`，因此会按 `maxAttempts` 重试）。优先级同 `maxAttempts`：本字段 >
+   *   `Agent_Type.attemptTimeoutMs` > 默认 600000。`null` = 显式不设截止；非法取值
+   *   （`0` / 负数 / 非整数 / `Infinity` / 非 number）在**构造期**抛 `TypeError`。
+   *
+   *   补的洞：`maxRounds` 数的是**轮**，一轮永不返回就永远不递增 —— 一个卡在挂死工具
+   *   调用（或挂死的非流式 LLM 请求）上的子 agent 因此没有上界，而它占着的那一个
+   *   depth 层并发槽也就永久不释放；`run_in_background: false` 时父 agent 的那次工具
+   *   调用跟着无上界地 await 下去（keep-alive 管不着它 —— 它压根没走到"最终回答"那个
+   *   分支）。**这个界是协作式的**：框架只经 abort signal 通知，宿主工具认不认它由宿主
+   *   决定（与 dsh 同一契约），见 README「已知限制」。
    * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
    * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
    * @param {number} [opts.subagents.retainClosedGraphs=5] - 保留多少张已关闭的图（FIFO 淘汰，在飞节点的图不淘汰）
@@ -273,7 +287,18 @@ export class Agent {
    *   false = 关掉这个等待，最终回答一律立刻收尾（旧行为）
    * @param {number} [opts.subagents.keepAliveTimeoutMs=600000] - 单次 keep-alive 等待的上限。
    *   到点后置 `lastKeepAliveTimedOut`、发 `run.keep_alive.timeout`，并给模型留一条
-   *   "收尾或 agent_cancel"的提示；**每轮对话最多超时一次**，此后最终回答直接收尾
+   *   "收尾或 agent_cancel"的提示
+   * @param {number} [opts.subagents.maxConsecutiveWakes=3] - 等待预算：连续多少次
+   *   **白等**（等满 `keepAliveTimeoutMs` 却没有任何 subagent 事件）之后，不再替模型
+   *   把本轮撑住，转而发 `run.keep_alive.gave_up` 并收尾。被事件唤醒（真有结果回来）
+   *   不花预算；用户亲手输入的新一轮把预算补回，而框架自己开的续跑轮（`followup()`）
+   *   不补。与 dsh 的 `maxConsecutiveWakes` 同名同值同 refill 规则
+   *   （`packages/jobs/tool-jobs/src/index.ts:38-51, 224-228`）。
+   *
+   *   它取代的是原先那道"每轮对话最多超时一次"的粘性闸门。闸门的问题是它抑制的是
+   *   **等待**而不是**再叫醒**：超时一次之后 run 就地结束，在飞的子 agent 既不被取消
+   *   也不被等待，而模型刚说完"我继续等通知"。放弃等待 ≠ 放弃工作 —— 结果仍会在
+   *   下一次 user 轮的 round 0、或宿主收到 `run.wakeup` 后调 `followup()` 时送达。
    */
   constructor(opts) {
     if (!opts.apiKey) throw new Error('apiKey is required')
@@ -297,8 +322,24 @@ export class Agent {
      * 工作没完"。**它是独立于 `lastStopReason` 的一面旗子**：那个取值集合是
      * 跨包契约（CHANGELOG 里写了 null | 'completed' | 'max_rounds'），不能为
      * 超时新增一个值。
+     *
+     * **它如今只是一面告知用的旗子，不再闸住任何行为。** 早先 `_keepAliveOnce`
+     * 拿它当"本 run 不再等第二次"的闸门，那个粘性布尔正是客户端报告 §3 的缺陷
+     * 本体；换成 `_spentKeepAliveWakes` 计数之后，这里保留是为了不打断已经订阅
+     * 它的宿主。别再拿它做控制流判断。
      */
     this.lastKeepAliveTimedOut = false
+    /**
+     * 本会话已经花掉的 keep-alive 等待预算 —— 距上一次**用户亲手输入**以来，
+     * 等满 `keepAliveTimeoutMs` 却没有任何 subagent 事件的次数。达到
+     * `subagents.maxConsecutiveWakes` 后 `_keepAliveOnce()` 不再替模型撑住本轮。
+     *
+     * 计数器在 Agent 上而不是 runtime 上：补回预算的条件是"用户又说话了"，只有
+     * Agent 知道这件事 —— runtime 看到的只是 `enqueueMessage`，而那条同样可能是
+     * agent 之间 `send_message` 发来的，dsh 不会把它算作用户输入
+     * （`message.source.kind === 'user'` 才 refill）。
+     */
+    this._spentKeepAliveWakes = 0
 
     // ---- Tool_Registry generation 与动态 MCP 状态 ----
     // `this.tools` 保持为数组（元素顺序 = 加入顺序），既有 `tools` 选项语义不变。
@@ -383,6 +424,14 @@ export class Agent {
     this.enableIntentRecognition = opts.enableIntentRecognition ?? false
     this.knowledgeBase = opts.knowledgeBase ?? null
     this.tokenBudget = opts.tokenBudget ?? null
+    /**
+     * 上一次成功调用的真实用量锚点。信封（系统提示 + 工具集）没变时，
+     * 下一轮的请求压力从它出发算增量，而不是全量估算。
+     * `null` = 还没有可用锚点（第一轮，或供应商没返回 usage）。
+     */
+    this._tokenAnchor = null
+    /** 本轮组装的快照，拿到真实用量后据此算出新锚点（含守恒校验的基准） */
+    this._lastAssembly = null
 
     // IntentRecognizer（sidecar LLM 调用）使用简单任务模型配置
     this.intentRecognizer = this.enableIntentRecognition
@@ -418,6 +467,7 @@ export class Agent {
     this._lastRunMetrics = null
     this._sessionMetrics = _zeroSessionMetrics()
     this._currentRun = null
+    this._activeTurns = 0
 
     // ---- 内置工具：ask_user ----
     // 提供 hooks.onAskUser **或**配置了 subagents 时注入 ask_user 工具。
@@ -606,6 +656,43 @@ export class Agent {
       }
     }
 
+    // ---- Spill：工具输出限长 + 转存取回 ----
+    // `opts.spill.maxToolResultBytes` 配置后启用。**未配置时 `this._spill` 恒为
+    // null，工具结果逐字节与旧版本一致** —— 这是不破坏现有使用方的前提。
+    //
+    // 非法配置在这里（构造时）就抛：若留到调用时，策略层的参数断言会在工具
+    // 执行之后抛出，把一次本来成功的工具调用变成报错。配置错误应该让初始化
+    // 失败，而不是让运行中的业务失败。
+    this._spill = null
+    /**
+     * Spill 的会话标识。**必须在实例上稳定**，不能用 `_currentRun.traceId` ——
+     * 那个每轮 run 结束就置 null，`reset()` 时算出来的 id 会和保存时不一致，
+     * 导致清理静默失效（转存内容一直留着，直到进程退出）。
+     * `reset()` 时换一个新的，语义上就是「开始新会话」。
+     */
+    this._spillSessionId = `sess-${Math.floor(Math.random() * 0xffffffff).toString(16)}`
+    if (opts.spill?.maxToolResultBytes != null) {
+      this._spill = createSpillPolicy({
+        maxInlineBytes: opts.spill.maxToolResultBytes,
+        // 未显式给 store 时按环境自动选：Node 落文件、浏览器落 IndexedDB。
+        store: opts.spill.store ?? createDefaultSpillStore(opts.spill.storeOptions),
+        ...(opts.spill.skipTools ? { skipTools: opts.spill.skipTools } : {}),
+        ...(opts.spill.readDefaultLimit != null ? { readDefaultLimit: opts.spill.readDefaultLimit } : {}),
+        ...(opts.spill.readMaxLimit != null ? { readMaxLimit: opts.spill.readMaxLimit } : {}),
+        onWarn: opts.spill.onWarn ?? (msg => {
+          // 默认把降级告警转给 onError 钩子 —— 宿主至少能看见「spill 没生效」，
+          // 而不是以为限长在工作。
+          this._safeHook('onError', new Error(msg), { phase: 'spill' })
+        }),
+      })
+      // spill_read / spill_search 与 skill / ask_user 同一先例：注册为 base tool。
+      // 提示语已经告诉模型「先搜后读」，若 ToolFilter 在 enableIntentRecognition
+      // 下把它们裁掉，那句提示就成了空头支票。
+      this.tools = [...this.tools, this._spill.createReadTool(), this._spill.createSearchTool()]
+      registerBaseTool(SPILL_READ_TOOL_NAME)
+      registerBaseTool(SPILL_SEARCH_TOOL_NAME)
+    }
+
     // ---- Subagent 系统 ----
     // `opts.subagents` 配置后创建 SubagentRuntime 并注入元工具。未配置时
     // `this.subagents` 恒为 null，全部相关行为与旧版本逐字节一致。
@@ -632,18 +719,29 @@ export class Agent {
    * @param {string} message
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
+   * @param {boolean} [opts._frameworkAuthored] **内部字段**：本轮不是用户亲手发起的
+   *   （`followup()` 用它），因此不补回 keep-alive 等待预算
    * @returns {Promise<string>}
    */
   async chat(message, opts = {}) {
-    this._filteredSkills = null
-    await this.loadSkills()
-    return this._runWithSession(async (_rootCtx) => {
-      if (this.strategy === 'plan_and_execute') {
-        return this._planAndExecuteChat(message, opts)
-      }
-      this.memory.add({ role: 'user', content: message })
-      return this._reactLoop(message, opts)
-    })
+    // Reserve the turn before loadSkills yields, so a background notice cannot
+    // start a followup against a user turn that is still initializing.
+    this._activeTurns += 1
+    let ok = false
+    try {
+      this._refillKeepAliveBudget(opts)
+      this._filteredSkills = null
+      await this.loadSkills()
+      const answer = await this._runWithSession(async (_rootCtx) => {
+        if (this.strategy === 'plan_and_execute') {
+          return this._planAndExecuteChat(message, opts)
+        }
+        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(message) })
+        return this._reactLoop(message, opts)
+      })
+      ok = true
+      return answer
+    } finally { this._releaseTurn(ok) }
   }
 
   /**
@@ -654,16 +752,35 @@ export class Agent {
    * @yields {{ type: 'delta'|'reasoning'|'tool_start'|'tool_end'|'intent'|'done', content?, stopReason?: 'completed'|'max_rounds', rounds?: number, ... }}
    */
   async *stream(message, opts = {}) {
-    this._filteredSkills = null
-    await this.loadSkills()
-    yield* this._runWithSessionStream(async function* (_rootCtx) {
-      if (this.strategy === 'plan_and_execute') {
-        yield* this._planAndExecuteStream(message, opts)
-        return
+    this._activeTurns += 1
+    let ok = false
+    try {
+      this._refillKeepAliveBudget(opts)
+      this._filteredSkills = null
+      await this.loadSkills()
+      const events = this._runWithSessionStream(async function* (_rootCtx) {
+        if (this.strategy === 'plan_and_execute') {
+          yield* this._planAndExecuteStream(message, opts)
+          return
+        }
+        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(message) })
+        yield* this._reactLoopStream(message, opts)
+      }.bind(this))
+      for await (const event of events) {
+        // Consumers commonly break on done rather than requesting one more
+        // item. That return still completed the turn and must deliver notices.
+        if (event.type === 'done') ok = true
+        yield event
       }
-      this.memory.add({ role: 'user', content: message })
-      yield* this._reactLoopStream(message, opts)
-    }.bind(this))
+      ok = true
+    } finally { this._releaseTurn(ok) }
+  }
+
+  _releaseTurn(ok) {
+    this._activeTurns -= 1
+    // Includes notices arriving between the final done yield and generator
+    // completion. Error/cancellation does not automatically restart a run.
+    if (ok && this._activeTurns === 0 && this._pendingInjections.length > 0) this._emitWakeup()
   }
 
   /** 清空对话历史，开始新会话 */
@@ -673,6 +790,10 @@ export class Agent {
     // 上一个会话的通知不该漏进新会话 —— memory 与 history 都清了，队列还留着的话，
     // 新会话跑到 round 1 就会把陈旧通知注入进去。
     this._pendingInjections = []
+    // 等待预算同样归零：新会话不该继承上一会话花掉的花费，否则它的第一轮可能一次
+    // 都不能等。紧随其后的那次 `chat()` 也会 refill，但两处都要做 —— `reset()` 之后
+    // 可能先跑 `followup()`（它**不** refill），宿主也可能直接读这个字段。
+    this._spentKeepAliveWakes = 0
     // 动态 MCP 生命周期拆除：仅当 `_managedClients` 非空时以 fire-and-forget 方式
     // 触发 `_teardownManagedClients()`（关闭客户端、移除动态工具并取消 Base_Tool
     // 注册、清空集合）。`reset()` 保持同步返回 undefined（Req 7.2），故不 await；
@@ -685,6 +806,19 @@ export class Agent {
         })
     }
     this._lastIntent = null
+    // 新会话不该带着上一轮的计量基准：历史已清空，旧锚点的 historyTokens
+    // 对不上，算出来的增量会是个大负数。
+    this._tokenAnchor = null
+    this._lastAssembly = null
+    // Spill 清理：与上面的 MCP 拆除同一手法 —— `reset()` 必须同步返回 undefined，
+    // 所以只触发不 await。清理失败无害（策略层内部已吞异常），最坏是上一会话的
+    // 转存内容多留一会儿，等 close() 或进程退出再收。
+    if (this._spill) {
+      const previous = this._spillSessionId
+      // 先换 id 再清理旧的：新会话立刻用新命名空间，清理慢一点也不会误删新内容。
+      this._spillSessionId = `sess-${Math.floor(Math.random() * 0xffffffff).toString(16)}`
+      Promise.resolve().then(() => this._spill.clear(previous)).catch(() => {})
+    }
     // Subagent 生命周期拆除：与上面的 MCP 拆除同一手法 —— `reset()` 必须保持
     // 同步返回 undefined，所以只触发取消而不 await。`closeSubagents()` 内部先
     // abort 各自的 AbortController 再 drain，因此在跑的 subagent 会真的停下来。
@@ -977,6 +1111,71 @@ export class Agent {
     }
   }
 
+  /**
+   * 对一条工具结果应用 spill 策略。两条 ReAct 循环共用，避免同一逻辑写两遍走偏。
+   *
+   * **永不抛**：spill 是辅助设施，它坏了应退化成「没有这个设施」，
+   * 而不是把一次成功的工具调用变成报错。策略层内部已做降级，
+   * 这里再兜一层，防止未来某个后端在 `apply` 之外的路径上抛。
+   *
+   * @param {{id?:string, name:string}} call
+   * @param {*} result 工具原始返回
+   * @returns {Promise<*>} 限长后的结果（未启用或降级时原样返回）
+   */
+  async _applySpill(call, result) {
+    if (!this._spill) return result
+    try {
+      return await this._spill.apply({
+        sessionId: this._spillSessionId,
+        toolName: call.name,
+        callId: call.id ?? null,
+        text: result,
+      })
+    } catch (err) {
+      this._safeHook('onError', err, { phase: 'spill', toolName: call.name })
+      return result
+    }
+  }
+
+  /**
+   * 从一次 `llm.call` 事件里接住真实用量，存为下一轮的锚点。
+   *
+   * **口径**：`input_tokens + output_tokens`。不能照抄 dsh 的
+   * `input + cacheRead + cacheWrite + output` —— 它的三项是互斥的
+   * （适配器把缓存命中从 prompt_tokens 里减掉了），而我们的 `extractUsage`
+   * 是原样透传 OpenAI 语义，`prompt_tokens` **已含**缓存命中。
+   * 加上 cached 会重复计数，让锚点系统性偏高。见 CONTRACT-NOTES 的 H1。
+   *
+   * 只在拿得到真实用量、且本轮确实走过 ContextManager 时才记锚点 ——
+   * 没有 `_lastAssembly` 就没有守恒校验的基准，宁可不锚。
+   *
+   * @param {object} ev `llm.call` 遥测事件
+   */
+  _recordTokenAnchor(ev) {
+    const input = ev?.['gen_ai.usage.input_tokens']
+    const output = ev?.['gen_ai.usage.output_tokens']
+    if (!Number.isFinite(input) || !Number.isFinite(output)) return
+    const snap = this._lastAssembly
+    if (!snap) return
+    this._tokenAnchor = {
+      fingerprint: snap.fingerprint,
+      totalTokens: input + output,
+      // 同期的纯估算值，供下一轮做守恒校验（dsh 的 G2）
+      estimatedAtAnchor: snap.estimatedTokens,
+      historyTokens: snap.historyTokens,
+    }
+  }
+
+  /**
+   * 当前的 token 锚点快照（没有则为 null）。
+   *
+   * 返回副本 —— 宿主拿去展示或上报时改动它，不该影响内部计量。
+   * @returns {{fingerprint:string, totalTokens:number, estimatedAtAnchor:number, historyTokens:number}|null}
+   */
+  getTokenAnchor() {
+    return this._tokenAnchor ? { ...this._tokenAnchor } : null
+  }
+
   // ---- Session lifecycle wrapper ----
 
   /**
@@ -1011,8 +1210,13 @@ export class Agent {
     // (Finding M-5). plan_and_execute itself doesn't set `lastStopReason`,
     // so it correctly reads back as `null` after such a run.
     this.lastStopReason = null
-    // keep-alive 的"已放弃过一次"闸门必须**按 run 重置**：它在本 run 内抑制第
-    // 二次等待（见 `_keepAliveOnce`），粘到下一轮对话就成了永久关闭 keep-alive。
+    // keep-alive 的"本轮已超时过"旗子必须**按 run 重置**：它描述的是最近一次 run
+    // 的状态，粘到下一轮对话就成了错的告知。
+    //
+    // **等待预算 `_spentKeepAliveWakes` 不在这里重置** —— 它跨 run 累计，只在用户
+    // 亲手输入的 run 入口（`chat` / `stream` → `_refillKeepAliveBudget`）补回。
+    // `followup()` 同样走到这里，而它是框架自己开的轮次；在这儿清零就等于让通知
+    // 自己 refill 它刚花掉的预算，闸门形同不存在。
     this.lastKeepAliveTimedOut = false
 
     const rootCtx = {
@@ -1041,7 +1245,7 @@ export class Agent {
     // emitted `llm.call` / `tool.call` event into `_currentRun`, and are
     // torn down in `finally` so they don't leak across runs.
     const run = this._currentRun
-    const _onLlmCall = (ev) => { run.llmCalls.push(ev) }
+    const _onLlmCall = (ev) => { run.llmCalls.push(ev); this._recordTokenAnchor(ev) }
     const _onToolCall = (ev) => { run.toolCalls.push(ev) }
     this._bus.on('llm.call', _onLlmCall)
     this._bus.on('tool.call', _onToolCall)
@@ -1083,7 +1287,7 @@ export class Agent {
     const startedPerfNow = performance.now()
 
     // See `_runWithSession` — same staleness-reset rationale (Finding M-5)，
-    // keep-alive 的闸门同理按 run 重置。
+    // keep-alive 的超时旗子同理按 run 重置；等待预算同理**不**在这里重置。
     this.lastStopReason = null
     this.lastKeepAliveTimedOut = false
 
@@ -1109,7 +1313,7 @@ export class Agent {
     // See `_runWithSession` for rationale — Requirement 9.5 requires that
     // aggregate bookkeeping runs unconditional of external listener count.
     const run = this._currentRun
-    const _onLlmCall = (ev) => { run.llmCalls.push(ev) }
+    const _onLlmCall = (ev) => { run.llmCalls.push(ev); this._recordTokenAnchor(ev) }
     const _onToolCall = (ev) => { run.toolCalls.push(ev) }
     this._bus.on('llm.call', _onLlmCall)
     this._bus.on('tool.call', _onToolCall)
@@ -1235,6 +1439,31 @@ export class Agent {
         knowledgeBase: this.knowledgeBase,
         filteredTools,
         tokenBudget: this.tokenBudget,
+        // 上一次成功调用的真实用量当基准。信封没变时只对增量估算，
+        // 误差从「整体估算」缩小到「只有新增内容是估算的」。
+        anchor: this._tokenAnchor,
+      })
+
+      // 记下本轮的组装快照 —— 拿到真实用量后要用它算出下一次的锚点
+      // （estimatedAtAnchor 用于守恒校验，historyTokens 用于算增量）。
+      this._lastAssembly = {
+        fingerprint: assembled.headerFingerprint,
+        estimatedTokens: assembled.estimatedTokens,
+        historyTokens: assembled.historyTokens,
+      }
+
+      this._safeEmit('context.assembled', {
+        traceId: this._currentRun?.traceId,
+        totalTokens: assembled.totalTokens,
+        estimatedTokens: assembled.estimatedTokens,
+        // 'usage' = 基于真实用量的锚点；'estimated' = 纯启发式。
+        // 暴露它是为了让宿主知道这个数可不可信（dsh 的 G5）。
+        tokenConfidence: assembled.tokenConfidence,
+        systemPromptTokens: assembled.systemPromptTokens,
+        knowledgeTokens: assembled.knowledgeTokens,
+        historyTokens: assembled.historyTokens,
+        toolsTokens: assembled.toolsTokens,
+        trimmed: assembled.trimmed,
       })
 
       return {
@@ -1246,6 +1475,8 @@ export class Agent {
         },
         intent,
         filteredTools,
+        totalTokens: assembled.totalTokens,
+        tokenConfidence: assembled.tokenConfidence,
       }
     }
 
@@ -1459,7 +1690,53 @@ export class Agent {
       return this
     }
     this._pendingInjections.push({ role, content: message.content })
+    // 空闲期的入队要主动喊一声。`_signalEvent()` 只叫醒已经阻塞在 `nextEvent()`
+    // 上的等待方，而此刻没有 run 在跑、`waiters` 是空的，那次信号是彻底的空操作 ——
+    // 宿主无从得知"该再跑一轮了"，除非 SDK 说。还要检查 `_activeTurns`，
+    // 因为异步初始化及最终 done 的退出窗口也属于当前轮次。
+    // 忙碌时由轮边界接走；成功退出时仍有积压则由 `_releaseTurn` 补发唤醒。
+    if (!this._currentRun && this._activeTurns === 0) this._emitWakeup()
     return this
+  }
+
+  _emitWakeup() {
+    this._safeEmit('run.wakeup', {
+      pendingInjections: this._pendingInjections.length,
+      inFlightAgents: this.subagents ? this.subagents.registry.list().length : 0,
+    })
+  }
+
+  /**
+   * 把积压的待投递通知跑成一轮 —— 后台 agent 在空闲期 settle 之后的续跑入口。
+   *
+   * 对应 dsh 的 `followup(message)`（`continuation.ts:1670`：空闲的父 agent 得到
+   * 一次普通轮次）。宿主的用法是订阅 `run.wakeup`，收到后调它；SDK 不自行开轮，
+   * 因为一次新轮要不要惊动用户、要不要走宿主的流式渲染，是宿主的决定。
+   *
+   * **队列为空时返回 `null` 且不发任何请求。** 空转一次 LLM 调用是纯烧 token，
+   * 而"没有待投递内容"是常态而非异常。
+   *
+   * **这一轮不补回 keep-alive 等待预算。** 它是框架自己开的轮次，消息也是框架
+   * 自己排进队列的通知 —— dsh 的 refill 条件因此写死为 `source.kind === 'user'`，
+   * 并注明"a notice this plugin itself queued must not refill the budget it just
+   * spent"。少了这条，`followup → chat` 会把刚花掉的预算立刻充满，闸门等于不存在。
+   *
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<string|null>} 本轮的最终回答，或 `null`（无事可做）
+   */
+  async followup(opts = {}) {
+    // A running turn owns memory and its notification queue. Do not consume
+    // messages or replace its telemetry context with a concurrent run.
+    if (this._currentRun || this._activeTurns > 0) return null
+    const pending = this._pendingInjections
+    if (pending.length === 0) return null
+    // 先清空再交给 chat()：通知本身**就是**这一轮的 user 消息，清空可避免
+    // round 0 的合并路径把它再拼一次。
+    this._pendingInjections = []
+    const text = pending.map(m => m.content).join('\n\n')
+    // 覆盖宿主可能显式传进来的 `_frameworkAuthored`：这条路径**恒**是框架发起的。
+    return this.chat(text, { ...opts, _frameworkAuthored: true })
   }
 
   /**
@@ -1481,15 +1758,75 @@ export class Agent {
   }
 
   /**
+   * run 入口（round 0）的排空：把空闲期积压的通知并进用户这条新消息。
+   *
+   * 为什么必须有这一步 —— `_drainPendingInjections()` 只在 `round > 0` 跑，而
+   * `_signalEvent()` 只叫醒已经阻塞在 `nextEvent()` 上的等待方。于是一条在**没有
+   * run 在跑**时到达的后台完成通知没有任何投递路径：它入队成功，下一次 run 的
+   * round 0 不看它，而那次 run 若只有一轮（模型直接给最终回答，这是最常见的
+   * 情况），就再也不会有 round 1 —— 通知永久搁浅。这正是"派一个慢任务、下轮
+   * 再收结果"之所以不成立的原因，与 sticky 闸门和 runtime 是否 per-instance 都
+   * 无关（`keepAlive: false` 且复用同一个 Agent 实例照样复现）。
+   *
+   * dsh 的对应做法是把方向反过来：不在轮内干等，而是结束本轮、稍后叫醒
+   * （`continuation.ts:1664-1673`：空闲父 agent `followup(message)`，正忙父 agent
+   * `steer(message)`）。本方法是 `followup` 那一支的最小实现 —— 宿主自己开下一轮
+   * 时，通知同样能落地。
+   *
+   * **合并成一条**而不是追加一条：通知与用户新消息同为 `role: 'user'`，两条相邻
+   * 的 user 会被部分供应商拒绝（与 `INJECTION_MERGE_THRESHOLD` 同一理由）。
+   *
+   * **返回的是写进 memory 的文本，不是传给 `_reactLoop` 的 message。** 意图识别与
+   * SkillFilter 看的是用户真实意图，一段框架自己写的 `<agent-notification>` 不该
+   * 参与那个判断。
+   *
+   * @param {string} message 用户本轮的消息
+   * @returns {string} 合并后的消息文本（队列为空时逐字节等于入参）
+   */
+  _mergePendingIntoUserMessage(message) {
+    const pending = this._pendingInjections
+    if (pending.length === 0) return message
+    this._pendingInjections = []
+    const notice = pending.map(m => m.content).join('\n\n')
+    // 通知在前：它到达的时刻早于用户这条消息，时序上就该排在前面，读起来也是
+    // "你等的东西回来了" → "用户接着说了什么"。
+    return `${notice}\n\n${message}`
+  }
+
+  /**
+   * run 入口补回 keep-alive 等待预算 —— **仅当这一轮是用户亲手发起的**。
+   *
+   * dsh 的对应条件是 `agent/inbox/claimed` 上的 `message.source.kind === 'user'`
+   * （`tool-jobs/src/index.ts:224-228`），注释写得很直白："a notice this plugin
+   * itself queued must not refill the budget it just spent"。我们这里的同一条线是
+   * `followup()`：它把 `enqueueMessage` 排进来的通知跑成一轮，那条消息是框架自己
+   * 写的，不是用户说的。若它也补预算，`followup → chat → 预算清零` 会让闸门等于
+   * 不存在，而它要防的自激链（被叫醒的一轮又派一个后台任务、那个任务的完成又叫醒
+   * 同一轮）重新无界。
+   *
+   * 反过来，**不能**只在 `enqueueMessage` 里判来源：那个方法也是 agent 之间
+   * `send_message` 的投递口，而 dsh 同样不把 agent 间消息算作用户输入。
+   *
+   * @param {object} opts `chat` / `stream` 的入参
+   * @returns {void}
+   */
+  _refillKeepAliveBudget(opts) {
+    if (opts?._frameworkAuthored === true) return
+    this._spentKeepAliveWakes = 0
+  }
+
+  /**
    * keep-alive 的一次等待 —— ReAct 循环在"模型给了最终回答、没有工具调用"时调它，
    * 决定这一轮到底能不能收尾。
    *
    * 五种去向：
    *   - `'injected'` —— 有待注入消息，直接进下一轮把它读了；
    *   - `'event'` —— 被 subagent 事件唤醒（通常伴随一条刚入队的通知）；
-   *   - `'timeout'` —— 等到上限还没动静，已置旗子 + 发事件 + 给模型留话；
+   *   - `'timeout'` —— 等到上限还没动静，已置旗子 + 花一次预算 + 发事件 + 给模型留话；
    *   - `'aborted'` —— 调用方的 signal abort 了（下一轮开头 throwIfAborted）；
-   *   - `'idle'` —— 没有该等的东西，收尾。
+   *   - `'idle'` —— 收尾。两种来由：**没有东西在飞**（干净收尾，不发任何事件），
+   *     或**等待预算耗尽**（仍有工作在飞，发 `run.keep_alive.gave_up` 附在飞清单）。
+   *     宿主区分这两者靠事件，不靠返回值 —— 返回值的取值集合不变。
    *
    * 三道判断的**顺序是本方法的全部要害**，逐条说明见内联注释。
    *
@@ -1499,23 +1836,49 @@ export class Agent {
   async _keepAliveOnce({ signal } = {}) {
     if (!this.subagents || !this.subagents.keepAlive) return 'idle'
 
-    // (1) 待注入消息**先于**任何在飞判断。后台 agent 已经跑完时没有任何东西在
-    // 飞，但它的完成通知还在队列里没被读 —— 先判在飞就会 return 'idle'、本轮
-    // 收尾，通知一直躺到未来某轮跑到 round 1 才被排空（drain 只在 round > 0
-    // 发生）。而"跑完就通知你"正是这套机制存在的唯一理由。
+    // (1) 待注入消息**先于**任何在飞判断，也**先于**预算判断。后台 agent 已经跑完
+    // 时没有任何东西在飞，但它的完成通知还在队列里没被读 —— 先判在飞就会 return
+    // 'idle'、本轮收尾，通知一直躺到未来某轮跑到 round 1 才被排空（drain 只在
+    // round > 0 发生）。而"跑完就通知你"正是这套机制存在的唯一理由。
+    // 预算约束的是**等待**，不是**投递**：预算耗尽也照样接住迟到的通知。
     if (this._pendingInjections.length > 0) return 'injected'
 
-    // (2) 本 run 已经等超时过一次就不再等第二次。超时那次已经给模型留了"收尾
-    // 或 agent_cancel"的话；它若不接手，再等一个完整超时只是把同一次干等重放
-    // 一遍 —— `maxRounds` 默认 300，那是 300 × 10 分钟 ≈ 50 小时的挂起和 300
-    // 次超时事件。注意这道闸在 (1) 之后：抑制的是第二次**等待**，不是第二次
-    // **投递**，迟到的完成通知照样会被 (1) 接住。
-    if (this.lastKeepAliveTimedOut) return 'idle'
-
-    // (3) 用 `hasInFlight()` 而不是 `hasPending()`。blocked / awaiting_confirm
+    // (2) 用 `hasInFlight()` 而不是 `hasPending()`。blocked / awaiting_confirm
     // 的图节点等的是主 agent 自己的下一步动作，不是后台任务：它们不产生任何
     // 事件、也不会自行推进，按它们来等就是每轮干等到超时。
+    //
+    // 这一步必须在预算判断**之前**：没有东西在飞时的 'idle' 是干净收尾，
+    // 发 `run.keep_alive.gave_up` 就是在谎报"我们丢下了工作"。
     if (!this.subagents.hasInFlight()) return 'idle'
+
+    // (3) 等待预算。原先这里是一道粘性布尔闸门（`lastKeepAliveTimedOut`），超时
+    // 一次就永久不再等 —— 后果是 run 在仍有子 agent 在飞时结束、对外报
+    // `stopReason:'completed'`，而模型刚说完"我继续等通知"（那是它的合理推断：
+    // 工具描述承诺过 "you will be notified when one completes"）。客户端报告 §3
+    // 抓的就是这个。
+    //
+    // dsh 里没有这道闸门，它的同类机制约束的是**再叫醒一次**而不是**要不要等**
+    // （`tool-jobs/src/index.ts:292-298`：`spent < wakeBudget` 才 followup，
+    // 否则降级为 inject）。这个方向的差别正是缺陷所在。
+    //
+    // 换成计数之后，反自激的保护还在（`maxRounds` 之外多了一道有界的花费），
+    // 而"静默弃置"没有了：耗尽时发事件、附在飞清单，子 agent **不被取消**
+    // （dsh 同样只在 disposal 时取消），它的结果仍会经 round 0 排空、`run.wakeup`
+    // 或宿主调 `followup()` 送达。
+    const budget = this.subagents.maxConsecutiveWakes
+    if (this._spentKeepAliveWakes >= budget) {
+      const inFlight = this.subagents.registry.list().map(h => h.toStatus())
+      this._safeEmit('run.keep_alive.gave_up', {
+        spent: this._spentKeepAliveWakes,
+        budget,
+        pendingAgents: inFlight.length,
+        // **跨全部图**，与超时提示同一口径：这个数字是宿主决定"要不要关、要不要
+        // 告诉用户"的依据，只算活跃图会在多任务场景下少报。
+        pendingNodes: this.subagents.pendingNodeCount(),
+        inFlight,
+      })
+      return 'idle'
+    }
 
     const startedAt = performance.now()
     const outcome = await this.subagents.nextEvent({
@@ -1523,6 +1886,9 @@ export class Agent {
     })
     if (outcome === 'timeout') {
       this.lastKeepAliveTimedOut = true
+      // 花预算的是**白等**。被事件唤醒（真有结果回来）不计入 —— 那一次等待买到了
+      // 东西，把它算进"该放弃了"的证据里，等于惩罚一个正在正常推进的 run。
+      this._spentKeepAliveWakes += 1
       const pendingAgents = this.subagents.registry.list().length
       // **跨全部图**，不是活跃图那一张：这个数字进的是"请收尾"那句提示，而模型是
       // 照告知行事的 —— 未完成节点落在非活跃图里时告诉它"0 个图节点未完成"，正好
@@ -1887,6 +2253,9 @@ export class Agent {
             }
           }
           this._safeHook('afterToolCall', call.name, call.arguments, result)
+          // Spill 在 afterToolCall 之后、写入 memory 之前：钩子看到的仍是
+          // 工具的原始输出（宿主可能要落自己的日志），模型看到的是限长版本。
+          result = await this._applySpill(call, result)
           this.memory.add(formatToolResult(call.id, call.name, result))
 
           // Emit tool.call after the exact-same memory string is appended
@@ -2100,6 +2469,8 @@ export class Agent {
           }
 
           this._safeHook('afterToolCall', call.name, call.arguments, result)
+          // 同 `_reactLoop`：钩子拿原始输出，模型拿限长版本。
+          result = await this._applySpill(call, result)
           this.memory.add(formatToolResult(call.id, call.name, result))
 
           const ok = errorKind === undefined

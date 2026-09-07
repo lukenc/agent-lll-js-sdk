@@ -8,7 +8,7 @@ import { SubagentRunner, cancelHandle, classifyFailure } from './runner.js'
 import { AgentGraph, GRAPH_TERMINAL_STATES, GRAPH_IN_FLIGHT_STATES } from './graph.js'
 import { createWorktree } from './isolation.js'
 import { resolveModelAliases, resolveModel } from './models.js'
-import { getAgentType, listAgentTypes, registerAgentType } from './types.js'
+import { getAgentType, listAgentTypes, registerAgentType, normalizeAttemptTimeoutMs } from './types.js'
 import { createSubagentTools } from './tools.js'
 import { Mailbox } from './mailbox.js'
 import { AskRegistry } from './ask.js'
@@ -57,8 +57,48 @@ export function createSubagentRuntime({
   ask: askOpts = {},
   keepAlive = true,
   keepAliveTimeoutMs = 600000,
+  /**
+   * keep-alive 的**等待预算**：连续多少次"白等"（等满 `keepAliveTimeoutMs` 却
+   * 没有任何 subagent 事件）之后，不再替模型把本轮撑住。默认 3，与 dsh 同值
+   * （`packages/jobs/tool-jobs/src/index.ts:51`）。
+   *
+   * 它取代的是原先那道 `lastKeepAliveTimedOut` 粘性闸门 —— 超时一次就永久放弃，
+   * 后果是 run 在仍有子 agent 在飞时结束、对外报 `stopReason:'completed'`，而
+   * 模型的下一句"我继续等通知"落到了空气里。dsh 里没有那道闸门；它的同类机制
+   * 是 `maxConsecutiveWakes`，约束的是"再叫醒一次"，不是"要不要等"。
+   *
+   * **花预算的是超时，不是等待本身**：被事件唤醒（真有结果回来）不计入。
+   * 补回预算的只有用户亲手输入的新一轮（见 `Agent.chat` / `Agent.stream`）；
+   * 框架自己开的续跑轮（`Agent.followup`）不补 —— dsh 的原话是 "a notice this
+   * plugin itself queued must not refill the budget it just spent"。少了这条，
+   * 自激链（被叫醒的一轮又派一个后台任务、它的完成又叫醒同一轮）重新无界。
+   */
+  maxConsecutiveWakes = 3,
   createAgent,
 } = {}) {
+  // 与 dsh 同款校验，且在**构造期**抛（`tool-jobs/src/index.ts:219-221`）：留到
+  // 调用期抛的话，一次本来成功的 keep-alive 等待会变成整个 run 报错。配置错误
+  // 应该让初始化失败，而不是让运行中的业务失败 —— 与 `spill/policy.js` 对
+  // `maxInlineBytes` 的处理同一先例。
+  // `Infinity` 是"不设界"的直觉写法，但它正是这个字段存在的理由所要防的。
+  if (!Number.isSafeInteger(maxConsecutiveWakes) || maxConsecutiveWakes < 1) {
+    throw new TypeError(
+      `subagents.maxConsecutiveWakes (${String(maxConsecutiveWakes)}) must be a whole number of waits (>= 1)`,
+    )
+  }
+
+  // `retry.attemptTimeoutMs` 同一待遇：**构造期**校验，不留到调用期。留到调用期抛的
+  // 话，一次本来成功的 attempt 会变成整个 run 报错（`_runOnce` 抛出的异常被 `run()` 的
+  // catch 归类成 `tool_error` —— 不可重试，于是一个配置笔误直接杀掉这个子任务）。
+  // 规则与三个哨兵的语义见 `types.js` 的 `normalizeAttemptTimeoutMs`。
+  //
+  // **只校验，不回填。** 这里必须保持 `retry.attemptTimeoutMs === undefined` 原样透传
+  // （下面 `retry: { ...retry }`）—— 默认值唯一该解析的地方是 runner 的回退链
+  // `_attemptTimeoutMs()`，谁在这里 eager 填了 `DEFAULT_ATTEMPT_TIMEOUT_MS`，
+  // `Agent_Type.attemptTimeoutMs` 就永远不可达，而 `maxAttempts` 已经踩过一次这个坑
+  // （见下面 `{ ...retry }` 那条注释）。
+  normalizeAttemptTimeoutMs(retry?.attemptTimeoutMs, 'subagents.retry.attemptTimeoutMs')
+
   for (const type of types) registerAgentType(type)
 
   const sharedHistory = parent?.memory?.runtimeHistory ?? null
@@ -957,9 +997,10 @@ export function createSubagentRuntime({
       return renderGraphEntry(active, runtime.activeGraphId)
     },
 
-    /** keep-alive 总开关与单次等待上限（`Agent._keepAliveOnce` 读它们）。 */
+    /** keep-alive 总开关、单次等待上限与等待预算（`Agent._keepAliveOnce` 读它们）。 */
     keepAlive,
     keepAliveTimeoutMs,
+    maxConsecutiveWakes,
 
     /**
      * 唤醒全部 keep-alive 等待方。没人在等时是个无副作用的空操作。

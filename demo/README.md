@@ -432,3 +432,19 @@ server 会自动尝试 3001、3002……最多试 10 次。也可以用 `PORT=80
 
 **MCP server 是用 npx 的预设，第一次很慢**
 `npx -y` 首次会下载包，可能 10–30 秒，属正常现象。
+
+
+## 后台任务跨轮通知
+
+Node 和浏览器 demo 使用 `keepAlive: false`。父轮次先返回，后台完成通知到达后自动调用同一个 Agent 的 `followup()`：Node 页面从 `/agents.pendingMessages` 发现通知，经 `/chat` 的 `followup` 请求续跑；浏览器页面订阅 `run.wakeup`。发送中不会并发开启续跑。Node 页面的新会话会取消旧子任务；浏览器重新“连接”会替换 Agent，不会把旧任务迁移到新实例，因此后台任务未结束时应保留当前连接。
+
+Node 侧可用 `SUBAGENT_ATTEMPT_TIMEOUT_MS` 配置单次子任务截止时间，默认 600000ms。超时与失败通知沿相同通道到达页面，不把后台任务伪装成已取消。
+
+本地复现（两个终端，不需要真实密钥）：
+
+```sh
+node examples/support/background-fixture.js
+PORT=4320 PROVIDER=openai LLM_API_KEY=fixture MODEL=fixture LLM_URL=http://127.0.0.1:4319/v1/chat/completions SUBAGENT_ATTEMPT_TIMEOUT_MS=1000 node demo/server.js
+```
+
+在 `http://127.0.0.1:4320/` 发送“后台回归”，观察先确认派发、稍后自动回复 42；再发“上一轮结果是多少”验证记忆。发送“超时回归”验证失败通知。`/browser` 使用相同 URL、模型 fixture、占位密钥 fixture，保持意图识别与 Subagent 开启，可验证工具调用、产物和自动续跑。此服务只脚本化模型响应，不替代实模型验收。

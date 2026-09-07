@@ -54,6 +54,7 @@ export class AgentHandle {
     this.createdAt = now()
     this.startedAt = null
     this.endedAt = null
+    this.lastToolCallAt = null
   }
 
   isTerminal() {
@@ -118,6 +119,7 @@ export class AgentHandle {
       createdAt: this.createdAt,
       startedAt: this.startedAt,
       endedAt: this.endedAt,
+      lastToolCallAt: this.lastToolCallAt,
     }
   }
 }

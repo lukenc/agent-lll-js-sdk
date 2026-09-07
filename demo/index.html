@@ -333,25 +333,26 @@ let sending = false
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } })
 
-async function send() {
-  const msg = input.value.trim()
-  if (!msg || sending) return
-  input.value = ''
+async function send(followup = false) {
+  const msg = followup ? '' : input.value.trim()
+  if ((!followup && !msg) || sending) return
+  if (!followup) input.value = ''
   sending = true
   sendBtn.disabled = true
   // 一轮对话里后台 agent 的进展不走 delta 通道 —— 不轮询的话面板要等整轮结束才动。
   startSubagentPolling()
 
-  addMsg('user', msg)
+  if (!followup) addMsg('user', msg)
   let assistantEl = null
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg }),
+      body: JSON.stringify({ message: msg, followup }),
     })
 
+    if (!res.ok) throw new Error(await res.text())
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buf = ''
@@ -471,7 +472,9 @@ function stopSubagentPolling() {
 async function refreshSubagents() {
   try {
     const res = await fetch('/agents')
-    renderSubagents(await res.json())
+    const snapshot = await res.json()
+    renderSubagents(snapshot)
+    if (!sending && snapshot.pendingMessages > 0) await send(true)
   } catch { /* 请求期间服务端可能正忙,下一次轮询会补上 */ }
 }
 
