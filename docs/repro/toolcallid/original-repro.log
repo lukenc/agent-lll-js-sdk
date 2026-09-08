@@ -1,0 +1,10 @@
+{"type":"tool_start","name":"read_file","arguments":{"path":"a.txt"}}
+{"type":"tool_end","name":"read_file","result":"contents of a.txt"}
+{"type":"tool_start","name":"read_file","arguments":{"path":"a.txt"}}
+{"type":"tool_end","name":"read_file","result":"contents of a.txt"}
+execute context: agentId, agentName, depth, cwd, signal
+execute context: agentId, agentName, depth, cwd, signal
+hook: ["beforeToolCall",2,["read_file",{"path":"a.txt"}]]
+hook: ["afterToolCall",3,["read_file",{"path":"a.txt"}]]
+hook: ["beforeToolCall",2,["read_file",{"path":"a.txt"}]]
+hook: ["afterToolCall",3,["read_file",{"path":"a.txt"}]]

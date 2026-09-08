@@ -1,0 +1,8 @@
+
+> lll-web-agent@0.9.0 build
+> esbuild src/index.js --bundle --format=iife --global-name=LllWebAgent --platform=browser --external:node:* --outfile=dist/lll-web-agent.js
+
+
+  dist/lll-web-agent.js  515.1kb
+
+⚡ Done in 22ms

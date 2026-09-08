@@ -1,0 +1,102 @@
+[
+  {
+    "mode": "node",
+    "lifecycle": [
+      {
+        "type": "tool_start",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        }
+      },
+      {
+        "type": "tool_end",
+        "name": "calculate",
+        "result": "42"
+      },
+      {
+        "type": "tool_start",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        }
+      },
+      {
+        "type": "tool_end",
+        "name": "calculate",
+        "result": "42"
+      }
+    ],
+    "reply": {
+      "type": "done",
+      "content": "done: call_AAA=42; call_BBB=42",
+      "stopReason": "completed"
+    },
+    "memory": "passed",
+    "errors": [],
+    "text": "会话已重置，请开始新的对话。\n连续调用两次 calculate，参数都是 6*7。\n✓ Round 0 完成 (2ms)\n🔧 调用工具: calculate\n✅ calculate → 42\n🔧 调用工具: calculate\n✅ calculate → 42\n✓ Round 1 完成 (1ms)\ndone: call_AAA=42; call_BBB=42\n🧠 RuntimeHistory 轨道快照\nall: 6 events\nvisible: 2 messages\nmodel: 6 messages\nartifacts: 0 items\n\nvisible 最近内容:\nuser: 连续调用两次 calculate，参数都是 6*7。\nassistant: done: call_AAA=42; call_BBB=42\n上一轮的调用 ID 是什么？\n✓ Round 0 完成 (3ms)\nmemory ids: call_AAA,call_BBB\n🧠 RuntimeHistory 轨道快照\nall: 8 events\nvisible: 4 messages\nmodel: 8 messages\nartifacts: 0 items\n\nvisible 最近内容:\nuser: 上一轮的调用 ID 是什么？\nassistant: memory ids: call_AAA,call_BBB"
+  },
+  {
+    "mode": "browser",
+    "lifecycle": [
+      {
+        "type": "tool_start",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        }
+      },
+      {
+        "type": "tool_end",
+        "name": "calculate",
+        "result": "42"
+      },
+      {
+        "type": "tool_start",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        }
+      },
+      {
+        "type": "tool_end",
+        "name": "calculate",
+        "result": "42"
+      }
+    ],
+    "telemetry": [
+      {
+        "traceId": "2cc071e1538ad6516016a8e51582491c",
+        "spanId": "1a435f43a9e84596",
+        "parentSpanId": "83742c8d8fa54633",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        },
+        "durationMs": 0.19999980926513672,
+        "bytes": 2,
+        "ok": true
+      },
+      {
+        "traceId": "2cc071e1538ad6516016a8e51582491c",
+        "spanId": "01e86ff63f514271",
+        "parentSpanId": "83742c8d8fa54633",
+        "name": "calculate",
+        "arguments": {
+          "expression": "6*7"
+        },
+        "durationMs": 0,
+        "bytes": 2,
+        "ok": true
+      }
+    ],
+    "reply": {
+      "type": "done",
+      "content": "done: call_AAA=42; call_BBB=42",
+      "stopReason": "completed"
+    },
+    "memory": "passed",
+    "errors": [],
+    "text": "已连接 openai (fixture)。当前使用 ReAct 策略，边思考边行动。\n\n我拥有 10 种工具能力，试试：\n  • \"现在几点了\" — 时间查询\n  • \"算一下 2^10\" — 数学计算\n  • \"北京天气怎么样\" — 天气查询\n  • \"把 100 公里换算成英里\" — 单位换算\n  • \"帮我生成一个强密码\" — 随机生成\n  • \"统计一下这段话的字数：Hello World\" — 文本处理\n  • \"把页面切换成暗色模式\" — 页面操作\n  • \"帮我记一条笔记：明天开会\" — 记事本\n  • \"用弹窗告诉我一个笑话\" — 弹窗提示\n  • \"30秒后提醒我喝水\" — 倒计时提醒\n\n🧭 试试模糊请求触发意图识别：\n  • \"帮我做点啥\" — AMBIGUOUS 意图\n  • \"查天气\" — 不说城市，会触发 ask_user 追问\n  • \"先算一下 100×50 的面积，再用这个值生成一个等长密码，最后把结果存为笔记\" — COMPLEX 意图\n\n📡 右侧遥测面板会实时展示：\n  • 每次 LLM 调用的 tokens / 耗时 / operation.name（agent.intent / agent.chat / plan.* 等）\n  • 每次工具执行的结果字节数 / 错误分类\n  • 本次运行与会话累计的聚合指标\n\n💡 切换策略或模型配置后点击\"连接\"即可生效。\n🧩 技能系统已启用(HTTP provider ← /skill-source)。说出匹配请求即可触发:\n  • \"写一首关于秋天的七言绝句\" — ancient-poet(会用 skill_resource 读格律参考)\n  • \"帮我算一下 12*8 和 (5+3)^2，生成一份计算报告\" — math-report\n连续调用两次 calculate，参数都是 6*7。\n✓ Round 0 完成 (34ms)\n🧭 意图识别  \nSIMPLE\nCLEAR\n→ react\n理由：tool id report fixture\n🛠 建议工具：calculate （+ 基础工具集）\n🔧 calculate {\"expression\":\"6*7\"}\n✅ calculate → 42\n🔧 calculate {\"expression\":\"6*7\"}\n✅ calculate → 42\n✓ Round 1 完成 (2ms)\ndone: call_AAA=42; call_BBB=42\n🧠 RuntimeHistory 轨道快照\nall: 6 events\nvisible: 2 messages\nmodel: 6 messages\nartifacts: 0 items\n\nvisible 最近内容:\nuser: 连续调用两次 calculate，参数都是 6*7。\nassistant: done: call_AAA=42; call_BBB=42\n上一轮的调用 ID 是什么？\n✓ Round 0 完成 (21ms)\n🧭 意图识别  \nSIMPLE\nCLEAR\n→ react\n理由：tool id report fixture\n🛠 建议工具：calculate （+ 基础工具集）\nmemory ids: call_AAA,call_BBB\n🧠 RuntimeHistory 轨道快照\nall: 8 events\nvisible: 4 messages\nmodel: 8 messages\nartifacts: 0 items\n\nvisible 最近内容:\nuser: 上一轮的调用 ID 是什么？\nassistant: memory ids: call_AAA,call_BBB"
+  }
+]

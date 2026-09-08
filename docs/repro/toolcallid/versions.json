@@ -1,0 +1,31 @@
+{
+  "installedVersion": "0.10.0",
+  "workspaceVersion": "0.9.0",
+  "files": {
+    "src/agent.js": {
+      "equal": true,
+      "sha256": "1f6385da8c0f9e0d021e25c3f3c3850dda1ae27be379364e9131709a76711e0f"
+    },
+    "src/tool.js": {
+      "equal": true,
+      "sha256": "c938a5042bc1b57f4c4ee517beee2d838d2f00087b0753cfe53f67b20054c447"
+    },
+    "src/llm-client.js": {
+      "equal": true,
+      "sha256": "caeec530f846f1d44bd8785da1e20e5c6fd8d1827fdf5a90391aac3200bf407b"
+    },
+    "src/plan-and-execute.js": {
+      "equal": true,
+      "sha256": "d22c7413d42b373cc225c86cfd4491f8c8bb7893875d538935075bcfcf77ea2b"
+    },
+    "src/telemetry.js": {
+      "equal": true,
+      "sha256": "80ec061a51073f2d2f431da19091d8d196c584a6e78ccd0b703541bead1c5fba"
+    },
+    "README.md": {
+      "equal": true,
+      "sha256": "c57ed152c479f4b78485311606f8c04a50462bb94f5dc752352bb45214b0dfa7"
+    }
+  },
+  "reproExit": 0
+}
