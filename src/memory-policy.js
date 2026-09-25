@@ -1,3 +1,5 @@
+import { DEFAULT_IMAGE_PRICING } from './content/image-tokens.js'
+
 const CHARS_PER_TOKEN = 4
 
 /**
@@ -21,13 +23,19 @@ export const BLOCK_OVERHEAD = 4
 /**
  * 给一条 OpenAI 格式的消息计价，含结构开销。
  *
- * @param {{role?:string, content?:string, tool_calls?:object[]}} msg
+ * `content` 为字符串时算法与改动前逐字节相同（校准锚点 9 不变）。为数组时逐部件
+ * 计价：文本按 chars/4，图片按 `pricing.imageTokens`，每个部件一层块框架 ——
+ * **base64 永不按文本计价**（1 MB 图按字符数算会得出 ~33 万 token）。
+ *
+ * @param {{role?:string, content?:string|object[], tool_calls?:object[]}} msg
+ * @param {{ imageTokens(part: object): number }} [pricing]
  * @returns {number}
  */
-export function estimateMessageTokens(msg) {
+export function estimateMessageTokens(msg, pricing = DEFAULT_IMAGE_PRICING) {
   if (!msg || typeof msg !== 'object') return ROLE_OVERHEAD
-  const text = msg.content ?? ''
-  let tokens = Math.ceil(String(text).length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD + ROLE_OVERHEAD
+  let tokens = Array.isArray(msg.content)
+    ? contentPartsTokens(msg.content, pricing) + BLOCK_OVERHEAD + ROLE_OVERHEAD
+    : Math.ceil(String(msg.content ?? '').length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD + ROLE_OVERHEAD
   // 工具调用：函数名与参数是独立计费的字符串，外加一层 JSON 框架
   if (Array.isArray(msg.tool_calls)) {
     for (const call of msg.tool_calls) {
@@ -39,6 +47,16 @@ export function estimateMessageTokens(msg) {
   }
   // tool 结果比同长度的普通消息多一层块框架（tool_call_id + 嵌套 content）
   if (msg.role === 'tool') tokens += BLOCK_OVERHEAD
+  return tokens
+}
+
+function contentPartsTokens(parts, pricing) {
+  let tokens = 0
+  for (const part of parts) {
+    tokens += part?.type === 'image_url'
+      ? pricing.imageTokens(part) + BLOCK_OVERHEAD
+      : Math.ceil(String(part?.text ?? '').length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD
+  }
   return tokens
 }
 

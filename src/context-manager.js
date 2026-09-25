@@ -47,6 +47,7 @@ export function defaultTokenBudget() {
  * @property {import('./knowledge-base.js').KnowledgeBase} [knowledgeBase]
  * @property {import('./tool.js').ToolDef[]} [filteredTools]
  * @property {TokenBudget} [tokenBudget]
+ * @property {{ imageTokens(part: object): number }} [imagePricing] - 图片计价；缺省用 mimo 公式
  */
 
 /**
@@ -94,7 +95,8 @@ export class ContextManager {
     //    大字符串再估，漏掉了每条消息的 JSON 框架成本。
     let sysTokens = estimateTokens(systemPrompt) + estimateTokens(summaryContent) + ROLE_OVERHEAD
     let knowledgeTokens = estimateTokens(knowledgeContent)
-    let historyTokens = sumMessageTokens(historyMessages)
+    const imagePricing = request.imagePricing
+    let historyTokens = sumMessageTokens(historyMessages, imagePricing)
     let toolsTokens = estimateToolsTokens(filteredTools)
     let trimmed = false
 
@@ -114,13 +116,13 @@ export class ContextManager {
       // 3b. 裁剪对话历史
       const remaining = budget.totalTokens - sysTokens - knowledgeTokens - toolsTokens
       if (historyTokens > remaining && remaining > 0) {
-        historyMessages = trimHistory(historyMessages, remaining)
-        historyTokens = sumMessageTokens(historyMessages)
+        historyMessages = trimHistory(historyMessages, remaining, imagePricing)
+        historyTokens = sumMessageTokens(historyMessages, imagePricing)
       } else if (remaining <= 0) {
         // 连一点余量都没有：仍然走 trimHistory 的保底路径保住最后一条，
         // 而不是清空。空历史意味着模型看不到用户刚说的话。
-        historyMessages = trimHistory(historyMessages, 0)
-        historyTokens = sumMessageTokens(historyMessages)
+        historyMessages = trimHistory(historyMessages, 0, imagePricing)
+        historyTokens = sumMessageTokens(historyMessages, imagePricing)
       }
 
       // 3c. 裁剪知识注入
@@ -212,9 +214,9 @@ function isUsableAnchor(a) {
 }
 
 /** 逐条累加消息计价 —— 预算判断与裁剪判断必须共用它，否则两者会打架 */
-function sumMessageTokens(messages) {
+function sumMessageTokens(messages, imagePricing) {
   let sum = 0
-  for (const m of messages) sum += estimateMessageTokens(m)
+  for (const m of messages) sum += estimateMessageTokens(m, imagePricing)
   return sum
 }
 
@@ -322,13 +324,13 @@ function trimTools(tools, budgetTokens) {
  * 注意：当成功纳入父 assistant 时，结果可能超出 `budgetTokens`——这是
  * 为了保 OpenAI 协议有效性而做的折中，优先级高于严格预算。
  */
-function trimHistory(messages, budgetTokens) {
+function trimHistory(messages, budgetTokens, imagePricing) {
   let cutIndex = messages.length
   let tokens = 0
   for (let i = messages.length - 1; i >= 0; i--) {
     // 与预算判断共用 estimateMessageTokens —— 两处若用不同算法，会出现
     // 「预算说超了、裁剪却认为没超」的死角，裁完仍然超预算。
-    const msgTokens = estimateMessageTokens(messages[i])
+    const msgTokens = estimateMessageTokens(messages[i], imagePricing)
     if (tokens + msgTokens > budgetTokens) break
     tokens += msgTokens
     cutIndex = i
