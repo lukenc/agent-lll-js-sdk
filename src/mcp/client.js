@@ -766,7 +766,7 @@ export class MCP_Client {
    *   1. state !== 'ready' → reject MCPClosedError(不发任何流量)。
    *   2. ctx.signal 已 aborted → reject AbortError(不发)(Req 6.12)。
    *   3. 否则 `_sendRequest('tools/call', { name: rawName, arguments: args }, ...)`:
-   *      - 响应正常 → `normalizeCallToolResult(result, rawName)` 始终返回字符串;
+   *      - 响应正常 → `normalizeCallToolResult(result, rawName)` 返回字符串,含图片时返回 contentResult;
    *        包含 `isError === true` 分支 —— 归一化函数负责前置 `"Error from MCP tool "<rawName>": "`
    *        前缀(Req 6.9),外层不抛异常,调用方拿到的是带前缀的字符串。
    *      - 响应 JSON-RPC error → _sendRequest 已包装成 MCPRequestError(code / data /
@@ -779,7 +779,7 @@ export class MCP_Client {
    * @param {string} rawName  server 原始工具名(descriptor.name,未经 sanitize)
    * @param {unknown} args    工具参数;透传给 JSON-RPC 的 `params.arguments`
    * @param {{ signal?: AbortSignal } | undefined} [ctx]
-   * @returns {Promise<string>}
+   * @returns {Promise<string|object>}
    */
   async _executeTool(rawName, args, ctx = {}) {
     if (this._state !== 'ready') {
@@ -799,7 +799,7 @@ export class MCP_Client {
       }
     )
 
-    // normalizeCallToolResult 内部处理 isError 前缀;始终返回 string(Req 6.9)
+    // normalizeCallToolResult 内部处理 isError 前缀(Req 6.9);含白名单图片时返回 contentResult
     return normalizeCallToolResult(result, rawName)
   }
 

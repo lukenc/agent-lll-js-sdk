@@ -1,3 +1,5 @@
+import { contentResult } from '../content/parts.js'
+
 /**
  * CallToolResult 归一化 — 将 MCP `tools/call` 响应的 `result` 结构归一化为
  * 供 LLM 消费的单一字符串。
@@ -21,7 +23,9 @@
  *      返回 `JSON.stringify(result.structuredContent)`(Requirement 6.8);
  *   C. 都空 → 返回空字符串。
  *
- * 返回值 **始终** 是 `string`。
+ * 返回值:`string`;**例外**——非 isError 且含白名单 `image` 部件(png/jpeg/webp/gif)时
+ * 返回 `contentResult`(文本部件原文、image → image_url data URL、其余类型仍是占位),
+ * 由 Agent 按 `vision` 决定发给模型或以 unsupported_content 工具级失败。
  *
  * @see Requirements 6.6, 6.7, 6.8, 6.9
  */
@@ -90,18 +94,32 @@ function normalizeContent(result) {
   return ''
 }
 
+const WIRE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+
+function isWireImage(part) {
+  return part?.type === 'image'
+    && typeof part.data === 'string' && part.data.length > 0
+    && WIRE_IMAGE_TYPES.has(String(part.mimeType ?? '').toLowerCase())
+}
+
 /**
- * 归一化 MCP_Call_Result 为 LLM 消费的字符串。
+ * 归一化 MCP_Call_Result 为 LLM 消费的内容。
  *
  * @param {object} result        MCP `tools/call` 响应的 `result` 字段
  * @param {string} rawToolName   server 原始工具名 (rawName),用于 isError 前缀
- * @returns {string}             始终为字符串
+ * @returns {string|object}      字符串;含白名单图片时为 contentResult
  */
 export function normalizeCallToolResult(result, rawToolName) {
   const body = normalizeContent(result ?? {})
   if (result?.isError === true) {
     // Req 6.9:错误响应以固定前缀拼接归一化 body,不抛异常
     return `Error from MCP tool "${String(rawToolName ?? '')}": ${body}`
+  }
+  const content = result?.content
+  if (Array.isArray(content) && content.some(isWireImage)) {
+    return contentResult(content.map(part => isWireImage(part)
+      ? { type: 'image_url', image_url: { url: `data:${part.mimeType.toLowerCase()};base64,${part.data}` } }
+      : { type: 'text', text: renderContentPart(part) }))
   }
   return body
 }
