@@ -13,6 +13,7 @@
 import { syncChat, streamChat } from './llm-client.js'
 import { formatToolsForOpenAI, parseToolCalls, formatToolResult } from './tool.js'
 import { childContext, extractUsage, utf8ByteLength } from './telemetry.js'
+import { isContentResult, hasImage, contentText } from './content/parts.js'
 
 /** 计划步骤状态 */
 export const StepStatus = {
@@ -530,7 +531,7 @@ export class PlanAndExecuteStrategy {
         const tool = toolMap[call.name]
         const toolStartPerf = _perfNow()
         let result
-        /** @type {undefined | 'not_found' | 'truncated_args' | 'aborted' | 'exception'} */
+        /** @type {undefined | 'not_found' | 'truncated_args' | 'aborted' | 'exception' | 'unsupported_content'} */
         let errorKind
         if (call._truncated && call._parseError) {
           errorKind = 'truncated_args'
@@ -548,6 +549,16 @@ export class PlanAndExecuteStrategy {
               : 'exception'
             // 防 `throw null` / 原始值打穿 catch 块（与 agent.js 同一约定）。
             result = `Error executing ${call.name}: ${err?.message ?? String(err)}`
+          }
+        }
+        // 本版 plan_and_execute 不支持图：步骤执行只拿到步骤描述，看不到用户原图；
+        // 带图的工具结果按工具级失败处理（与 Agent 的 vision:false 同一约定）。
+        if (errorKind === undefined && isContentResult(result)) {
+          if (hasImage(result.parts)) {
+            errorKind = 'unsupported_content'
+            result = `Error: Tool "${call.name}" returned image content, but the plan_and_execute strategy does not accept image input.`
+          } else {
+            result = contentText(result.parts)
           }
         }
         messages.push(formatToolResult(call.id, call.name, result))

@@ -6,7 +6,12 @@ import assert from 'node:assert/strict'
 import { Agent } from './agent.js'
 import { SlidingWindowMemory } from './memory.js'
 import { defaultTokenBudget } from './context-manager.js'
-import { imagePart, UnsupportedContentError, InvalidContentError } from './content/index.js'
+import { defineTool } from './tool.js'
+import { MemorySpillStore } from './spill/index.js'
+import { PlanAndExecuteStrategy, PlanStep } from './plan-and-execute.js'
+import {
+  imagePart, contentResult, isContentResult, UnsupportedContentError, InvalidContentError,
+} from './content/index.js'
 
 const ORIGINAL_FETCH = globalThis.fetch
 let requests = []
@@ -208,5 +213,145 @@ describe('Agent multimodal: stream() parity [Review Focus 3]', () => {
     const agent = makeAgent({ vision: true })
     for await (const _ of agent.stream(withImage('x'))) { /* drain */ }
     assert.deepEqual(requests[0].messages.at(-1).content[1], PNG)
+  })
+})
+
+const toolRound = name => queue.push({ choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name, arguments: '{}' } }] }, finish_reason: 'tool_calls' }] })
+const chartTool = (result = contentResult([{ type: 'text', text: 'chart ready' }, PNG])) => defineTool({
+  name: 'render', description: 'render a chart', parameters: { type: 'object', properties: {} },
+  execute: async () => result,
+})
+
+describe('Agent multimodal: tool results', () => {
+  beforeEach(installJsonFetch)
+  afterEach(() => { globalThis.fetch = ORIGINAL_FETCH })
+
+  it('vision:true — tool text stays in the tool message, the image follows as a user message', async () => {
+    const agent = makeAgent({ vision: true, tools: [chartTool()] })
+    toolRound('render'); reply('done')
+    assert.equal(await agent.chat('draw'), 'done')
+    const msgs = requests[1].messages
+    const t = msgs.findIndex(m => m.role === 'tool')
+    assert.equal(msgs[t].content, 'chart ready')
+    assert.deepEqual(msgs[t + 1], { role: 'user', content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, PNG] })
+    const stored = (await nonSystem(agent)).find(m => m.role === 'tool')
+    assert.deepEqual(stored.content, [{ type: 'text', text: 'chart ready' }, PNG])
+  })
+
+  it('vision:false — tool-level failure, onError fires, run completes, no image is sent', async () => {
+    const errors = []
+    const calls = []
+    const agent = makeAgent({ tools: [chartTool()], hooks: { onError: e => errors.push(e) } })
+    agent.on('tool.call', p => calls.push(p))
+    toolRound('render'); reply('sorry')
+    assert.equal(await agent.chat('draw'), 'sorry')
+    assert.equal(calls[0].ok, false)
+    assert.equal(calls[0].errorKind, 'unsupported_content')
+    assert.ok(errors.some(e => e instanceof UnsupportedContentError))
+    const tool = requests[1].messages.find(m => m.role === 'tool')
+    assert.match(tool.content, /^Error: Tool "render" returned image content/)
+    assert.ok(!JSON.stringify(requests[1]).includes('image_url'))
+  })
+
+  it('invalid contentResult parts → invalid_content', async () => {
+    const calls = []
+    const bad = contentResult([{ type: 'image_url', image_url: { url: 'data:image/svg+xml;base64,AAAA' } }])
+    const agent = makeAgent({ vision: true, tools: [chartTool(bad)] })
+    agent.on('tool.call', p => calls.push(p))
+    toolRound('render'); reply('ok')
+    await agent.chat('draw')
+    assert.equal(calls[0].errorKind, 'invalid_content')
+  })
+
+  it('[Review Focus 4] a plain JSON array result is still JSON-stringified', async () => {
+    const agent = makeAgent({ vision: true, tools: [chartTool([1, 2, 3])] })
+    toolRound('render'); reply('ok')
+    await agent.chat('go')
+    assert.equal(requests[1].messages.find(m => m.role === 'tool').content, '[1,2,3]')
+  })
+
+  it('a text-only contentResult becomes a plain string tool result', async () => {
+    const agent = makeAgent({ tools: [chartTool(contentResult([{ type: 'text', text: 'just text' }]))] })
+    toolRound('render'); reply('ok')
+    await agent.chat('go')
+    assert.equal(requests[1].messages.find(m => m.role === 'tool').content, 'just text')
+  })
+
+  it('tool.call bytes count only text; imageCount reports images', async () => {
+    const calls = []
+    const agent = makeAgent({ vision: true, tools: [chartTool()] })
+    agent.on('tool.call', p => calls.push(p))
+    toolRound('render'); reply('ok')
+    await agent.chat('go')
+    assert.equal(calls[0].bytes, Buffer.byteLength('chart ready'))
+    assert.equal(calls[0].imageCount, 1)
+  })
+
+  it('spill bounds only the text part and keeps the image', async () => {
+    const long = 'x'.repeat(5000)
+    const agent = makeAgent({
+      vision: true,
+      tools: [chartTool(contentResult([{ type: 'text', text: long }, PNG]))],
+      spill: { maxToolResultBytes: 1200, store: new MemorySpillStore(), onWarn: () => {} },
+    })
+    toolRound('render'); reply('ok')
+    await agent.chat('go')
+    const stored = (await nonSystem(agent)).find(m => m.role === 'tool')
+    assert.ok(Array.isArray(stored.content))
+    assert.ok(stored.content[0].text.length < long.length)
+    assert.deepEqual(stored.content.at(-1), PNG)
+  })
+})
+
+describe('Agent multimodal: tool results via stream() [Review Focus 3]', () => {
+  afterEach(() => { globalThis.fetch = ORIGINAL_FETCH })
+
+  it('stream splits tool images identically and tool_end carries the contentResult', async () => {
+    installSseFetch([
+      [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"render","arguments":"{}"}}]}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+      ],
+      SSE_TEXT,
+    ])
+    const agent = makeAgent({ vision: true, tools: [chartTool()] })
+    const ends = []
+    for await (const ev of agent.stream('draw')) if (ev.type === 'tool_end') ends.push(ev)
+    assert.ok(isContentResult(ends[0].result))
+    const msgs = requests[1].messages
+    const t = msgs.findIndex(m => m.role === 'tool')
+    assert.equal(msgs[t].content, 'chart ready')
+    assert.equal(msgs[t + 1].content[0].text, 'Attached image(s) from tool result:')
+  })
+
+  it('stream with vision:false fails the tool call the same way', async () => {
+    installSseFetch([
+      [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"render","arguments":"{}"}}]}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+      ],
+      SSE_TEXT,
+    ])
+    const calls = []
+    const agent = makeAgent({ tools: [chartTool()] })
+    agent.on('tool.call', p => calls.push(p))
+    for await (const _ of agent.stream('draw')) { /* drain */ }
+    assert.equal(calls[0].errorKind, 'unsupported_content')
+  })
+})
+
+describe('PlanAndExecute: tool images are unsupported in this version', () => {
+  beforeEach(installJsonFetch)
+  afterEach(() => { globalThis.fetch = ORIGINAL_FETCH })
+
+  it('a step whose tool returns an image records unsupported_content and sends no image', async () => {
+    const strategy = new PlanAndExecuteStrategy({ url: 'https://api.openai.com/v1/chat/completions', apiKey: 'sk-fake', model: 'gpt-4o-mini', tools: [chartTool()] })
+    const step = new PlanStep(0, 'draw')
+    toolRound('render'); reply('done')
+    await strategy._reactLoop('draw', null, 3, undefined, [], step)
+    assert.equal(step.toolCalls[0].errorKind, 'unsupported_content')
+    assert.ok(!JSON.stringify(requests[1]).includes('image_url'))
   })
 })

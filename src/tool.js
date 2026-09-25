@@ -17,12 +17,14 @@
  *   })
  */
 
+import { isContentResult, normalizeContent, contentText } from './content/parts.js'
+
 /**
  * @typedef {object} ToolDef
  * @property {string} name - 工具唯一名称
  * @property {string} description - 工具描述（供 LLM 理解）
  * @property {object} parameters - JSON Schema 格式的参数定义
- * @property {(params: object, context?: object) => Promise<string>} execute - 执行函数
+ * @property {(params: object, context?: object) => Promise<string|object>} execute - 执行函数；返回图片时用 `contentResult([...])`
  */
 
 /**
@@ -71,13 +73,25 @@ export function parseToolCalls(response) {
   })
 }
 
-/** 将工具执行结果格式化为对话消息 */
+/**
+ * 将工具执行结果格式化为对话消息。
+ * `contentResult`（带图的工具结果）→ 规范化后的 content parts（无图折叠为字符串）；
+ * 部件非法时降级为文本投影 —— 本函数在工具调用的 try/catch 之外被调用，永不抛。
+ */
 export function formatToolResult(callId, toolName, result) {
   return {
     role: 'tool',
     tool_call_id: callId,
     name: toolName,
-    content: stringifyToolResult(result),
+    content: isContentResult(result) ? contentResultContent(result) : stringifyToolResult(result),
+  }
+}
+
+function contentResultContent(result) {
+  try {
+    return normalizeContent(Array.isArray(result.parts) ? result.parts : [])
+  } catch {
+    return contentText(result.parts)
   }
 }
 

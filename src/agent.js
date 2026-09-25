@@ -47,6 +47,7 @@ import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
 import {
   normalizeContent, hasImage, contentText, UnsupportedContentError, projectHistoryImages,
   toWireMessages, normalizeImageLimits, normalizeMaxImageBytes, createImagePricing, estimatorForUrl,
+  contentResult, isContentResult, partsText, imageParts, toolResultText,
 } from './content/index.js'
 // 一次轮边界排空时，超过这个条数的待注入消息会被合并为一条 —— 连续多条 user
 // 消息会被部分供应商拒绝。常量的家在 `agents/mailbox.js`：它是注入契约的一部分，
@@ -242,7 +243,7 @@ export class Agent {
    * @param {object} [opts.planAndExecuteOpts] - PlanAndExecute 策略配置
    * @param {object} [opts.hooks] - 生命周期钩子
    * @param {(name: string, args: object) => Promise<boolean|void>} [opts.hooks.beforeToolCall] - 工具执行前（返回 false 阻止执行）
-   * @param {(name: string, args: object, result: string) => void} [opts.hooks.afterToolCall] - 工具执行后
+   * @param {(name: string, args: object, result: string|object) => void} [opts.hooks.afterToolCall] - 工具执行后（带图的结果是 contentResult）
    * @param {(round: number) => void} [opts.hooks.onRoundStart] - 每轮 ReAct 循环开始
    * @param {(error: Error, context: object) => void} [opts.hooks.onError] - 错误回调
    * @param {(question: string, meta?: { askId: string, agentId: string, agentName: string, parentAgentId: string, nodeId: string|null, taskDescription: string }) => Promise<string|void>|string|void} [opts.hooks.onAskUser]
@@ -1152,6 +1153,11 @@ export class Agent {
    */
   async _applySpill(call, result) {
     if (!this._spill) return result
+    // 带图结果：只对文本部件限界，图片原样保留（由 imageLimits 在出站时约束）。
+    if (isContentResult(result)) {
+      const text = await this._applySpill(call, partsText(result.parts))
+      return contentResult([...(text ? [{ type: 'text', text }] : []), ...imageParts(result.parts)])
+    }
     try {
       return await this._spill.apply({
         sessionId: this._spillSessionId,
@@ -1849,6 +1855,35 @@ export class Agent {
   }
 
   /**
+   * 工具返回值的多模态闸门。只处理 `contentResult`；其余返回值原样放行（普通 JSON
+   * 数组仍按旧规则 stringify）。不支持视觉 → **工具级**失败：此刻 assistant(tool_calls)
+   * 已入 memory，整轮抛出会留下悬空的 tool_calls，下一轮被供应商以 400 拒绝。
+   *
+   * @param {any} result tool.execute 的返回值
+   * @param {string|undefined} errorKind 已有的失败分类（有则不再处理）
+   * @param {{ round: number, toolName: string }} ctx
+   * @returns {{ result: any, errorKind: string|undefined }}
+   */
+  _admitToolResult(result, errorKind, ctx) {
+    if (errorKind !== undefined || !isContentResult(result)) return { result, errorKind }
+    let content
+    try {
+      content = normalizeContent(Array.isArray(result.parts) ? result.parts : [], { maxImageBytes: this.maxImageBytes })
+    } catch (err) {
+      this._safeHook('onError', err, ctx)
+      return { result: `Error: Tool "${ctx.toolName}" returned invalid content: ${err.message}`, errorKind: 'invalid_content' }
+    }
+    if (hasImage(content) && !this.vision) {
+      this._safeHook('onError', new UnsupportedContentError({ code: 'vision_disabled' }), ctx)
+      return {
+        result: `Error: Tool "${ctx.toolName}" returned image content, but the model does not accept image input (vision is disabled).`,
+        errorKind: 'unsupported_content',
+      }
+    }
+    return { result: hasImage(content) ? contentResult(content) : content, errorKind }
+  }
+
+  /**
    * run 入口补回 keep-alive 等待预算 —— **仅当这一轮是用户亲手发起的**。
    *
    * dsh 的对应条件是 `agent/inbox/claimed` 上的 `message.source.kind === 'user'`
@@ -2270,7 +2305,7 @@ export class Agent {
           const toolStartPerf = performance.now()
           const tool = toolMap[call.name]
           let result
-          /** @type {undefined | 'not_found' | 'rejected' | 'truncated_args' | 'aborted' | 'exception'} */
+          /** @type {undefined | 'not_found' | 'rejected' | 'truncated_args' | 'aborted' | 'exception' | 'unsupported_content' | 'invalid_content'} */
           let errorKind
 
           // 工具调用参数被截断（finish_reason=length + JSON 解析失败）：
@@ -2307,6 +2342,7 @@ export class Agent {
               this._safeHook('onError', err, { round, toolName: call.name })
             }
           }
+          ;({ result, errorKind } = this._admitToolResult(result, errorKind, { round, toolName: call.name }))
           this._safeHook('afterToolCall', call.name, call.arguments, result)
           // Spill 在 afterToolCall 之后、写入 memory 之前：钩子看到的仍是
           // 工具的原始输出（宿主可能要落自己的日志），模型看到的是限长版本。
@@ -2328,10 +2364,11 @@ export class Agent {
             name: call.name,
             arguments: call.arguments,
             durationMs: performance.now() - toolStartPerf,
-            bytes: utf8ByteLength(String(result)),
+            bytes: utf8ByteLength(toolResultText(result)),
             ok,
           }
           if (!ok) toolCallPayload.errorKind = errorKind
+          if (isContentResult(result)) toolCallPayload.imageCount = imageParts(result.parts).length
           this._safeEmit('tool.call', toolCallPayload)
         }
       } finally {
@@ -2493,7 +2530,7 @@ export class Agent {
           const toolStartPerf = performance.now()
           const tool = toolMap[call.name]
           let result
-          /** @type {undefined | 'not_found' | 'rejected' | 'truncated_args' | 'aborted' | 'exception'} */
+          /** @type {undefined | 'not_found' | 'rejected' | 'truncated_args' | 'aborted' | 'exception' | 'unsupported_content' | 'invalid_content'} */
           let errorKind
 
           if (call._truncated && call._parseError) {
@@ -2523,6 +2560,7 @@ export class Agent {
             }
           }
 
+          ;({ result, errorKind } = this._admitToolResult(result, errorKind, { round, toolName: call.name }))
           this._safeHook('afterToolCall', call.name, call.arguments, result)
           // 同 `_reactLoop`：钩子拿原始输出，模型拿限长版本。
           result = await this._applySpill(call, result)
@@ -2537,10 +2575,11 @@ export class Agent {
             name: call.name,
             arguments: call.arguments,
             durationMs: performance.now() - toolStartPerf,
-            bytes: utf8ByteLength(String(result)),
+            bytes: utf8ByteLength(toolResultText(result)),
             ok,
           }
           if (!ok) toolCallPayload.errorKind = errorKind
+          if (isContentResult(result)) toolCallPayload.imageCount = imageParts(result.parts).length
           this._safeEmit('tool.call', toolCallPayload)
 
           yield { type: 'tool_end', name: call.name, result }
