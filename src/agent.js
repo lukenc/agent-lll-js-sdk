@@ -44,6 +44,11 @@ import { SkillFilter } from './skills/filter.js'
 import { applySkillArgs } from './skills/model.js'
 import { createSubagentRuntime } from './agents/runtime.js'
 import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
+import {
+  normalizeContent, hasImage, contentText, contentResult, isContentResult, partsText, imageParts,
+  toolResultText, UnsupportedContentError, projectHistoryImages, toWireMessages,
+  normalizeImageLimits, normalizeMaxImageBytes, createImagePricing, estimatorForUrl,
+} from './content/index.js'
 // 一次轮边界排空时，超过这个条数的待注入消息会被合并为一条 —— 连续多条 user
 // 消息会被部分供应商拒绝。常量的家在 `agents/mailbox.js`：它是注入契约的一部分，
 // 发信方（邮箱）与收信方（这里）必须用同一个数，各存一份必然分叉。
@@ -245,6 +250,16 @@ export class Agent {
    *   用户交互回调（提供后自动注入 ask_user 工具）。第二参 `meta` 说明这个问题是谁问的
    *   —— 并发提问因此可区分；只读第一参的旧式单参 hook 不受影响。返回值即回答；返回
    *   null/undefined 表示"稍后经 `answerQuestion(askId, ...)` 回答"（配置了 subagents 时可用）。
+   * @param {boolean} [opts.vision=false] - 主模型是否接受图片。false 时带图的用户消息在写入
+   *   memory **之前**抛 `UnsupportedContentError`；工具返回的图以 `unsupported_content` 工具级失败
+   * @param {boolean} [opts.simpleVision] - 简单模型是否接受图片，只影响子 Agent 的 `fast` 别名
+   *   （sidecar 一律只收文本投影）。默认：未配置简单模型时同 `vision`，否则 false
+   * @param {{ maxImages?: number, maxBytes?: number, countQuantum?: number, byteQuantum?: number }} [opts.imageLimits]
+   *   单次请求的图片上限；超限时按量子卸载最老的图（默认 20 张 / 20 MiB，量子 5 张 / 10 MiB）
+   * @param {number} [opts.maxImageBytes=20971520] - 入口单张图片字节上限
+   * @param {'openai'|'mimo'|((width:number,height:number,detail?:string)=>number)} [opts.imageTokenEstimator]
+   *   图片 token 估算器；默认按 url 推断（api.openai.com → 'openai'，其余 → 'mimo'）
+   * @param {number} [opts.unknownImageTokens=1024] - 宽高未知时（公网 URL 等）的兜底计价
    * @param {boolean} [opts.validateStreamCompletion=true] - 校验流完整性（finish_reason 缺失时抛 LlmStreamIncompleteError）
    * @param {object} [opts.skills] - Skill 系统配置。提供后创建 SkillRegistry 并注入 `skill` 元工具
    * @param {import('./skills/provider.js').SkillProvider[]} opts.skills.providers - skill 来源列表（本地目录 / HTTP 等）
@@ -379,6 +394,17 @@ export class Agent {
       this.simpleModel = this.model
       this.simpleUrl = this.url
     }
+
+    // ---- 多模态（图片输入）----
+    // 必须早于 `opts.subagents`：子 Agent 的模型别名在 runtime 构造时就读 vision / simpleVision。
+    this.vision = opts.vision === true
+    this.simpleVision = opts.simpleVision ?? (hasSimpleConfig ? false : this.vision)
+    this.imageLimits = normalizeImageLimits(opts.imageLimits)
+    this.maxImageBytes = normalizeMaxImageBytes(opts.maxImageBytes)
+    this._imagePricing = createImagePricing({
+      estimator: opts.imageTokenEstimator ?? estimatorForUrl(this.url),
+      ...(opts.unknownImageTokens !== undefined ? { unknownTokens: opts.unknownImageTokens } : {}),
+    })
 
     // 记忆：默认使用 SummarizingMemory 自动压缩上下文，
     // 通过简单任务模型（未配置则回退主模型）生成摘要。
@@ -716,7 +742,7 @@ export class Agent {
 
   /**
    * 同步对话 — 发送消息，返回最终回复文本
-   * @param {string} message
+   * @param {string|object[]} message - 字符串，或 OpenAI content parts（文本 + image_url）
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
    * @param {boolean} [opts._frameworkAuthored] **内部字段**：本轮不是用户亲手发起的
@@ -729,15 +755,17 @@ export class Agent {
     this._activeTurns += 1
     let ok = false
     try {
+      // 入口校验先于一切：先写后抛会让带图消息留在历史里，此后每一轮都再撞上它。
+      const content = this._admitUserMessage(message)
       this._refillKeepAliveBudget(opts)
       this._filteredSkills = null
       await this.loadSkills()
       const answer = await this._runWithSession(async (_rootCtx) => {
         if (this.strategy === 'plan_and_execute') {
-          return this._planAndExecuteChat(message, opts)
+          return this._planAndExecuteChat(content, opts)
         }
-        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(message) })
-        return this._reactLoop(message, opts)
+        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(content) })
+        return this._reactLoop(content, opts)
       })
       ok = true
       return answer
@@ -746,7 +774,7 @@ export class Agent {
 
   /**
    * 流式对话 — 通过 async generator 实时推送内容
-   * @param {string} message
+   * @param {string|object[]} message - 字符串，或 OpenAI content parts（文本 + image_url）
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
    * @yields {{ type: 'delta'|'reasoning'|'tool_start'|'tool_end'|'intent'|'done', content?, stopReason?: 'completed'|'max_rounds', rounds?: number, ... }}
@@ -755,16 +783,17 @@ export class Agent {
     this._activeTurns += 1
     let ok = false
     try {
+      const content = this._admitUserMessage(message)
       this._refillKeepAliveBudget(opts)
       this._filteredSkills = null
       await this.loadSkills()
       const events = this._runWithSessionStream(async function* (_rootCtx) {
         if (this.strategy === 'plan_and_execute') {
-          yield* this._planAndExecuteStream(message, opts)
+          yield* this._planAndExecuteStream(content, opts)
           return
         }
-        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(message) })
-        yield* this._reactLoopStream(message, opts)
+        this.memory.add({ role: 'user', content: this._mergePendingIntoUserMessage(content) })
+        yield* this._reactLoopStream(content, opts)
       }.bind(this))
       for await (const event of events) {
         // Consumers commonly break on done rather than requesting one more
@@ -1407,7 +1436,7 @@ export class Agent {
     if (this.intentRecognizer) {
       const toolNames = this.tools.map(t => t.name)
       const history = await this._getHistory()
-      intent = await this.intentRecognizer.analyze(userMessage, toolNames, {
+      intent = await this.intentRecognizer.analyze(contentText(userMessage), toolNames, {
         history,
         signal,
         telemetry: this._currentRun?.rootCtx ?? null,
@@ -1418,7 +1447,7 @@ export class Agent {
     if (this.skills) {
       const allSkills = this.skills.list().filter(s => !s.disableModelInvocation)
       if (allSkills.length > this._skillFilterOpts.threshold) {
-        this._filteredSkills = await this._skillFilter.filter(userMessage, allSkills, {
+        this._filteredSkills = await this._skillFilter.filter(contentText(userMessage), allSkills, {
           topK: this._skillFilterOpts.topK,
           signal,
           telemetry: this._currentRun?.rootCtx ?? null,
@@ -1431,7 +1460,8 @@ export class Agent {
 
     // 3. 上下文组装（如果配置了 tokenBudget 或 knowledgeBase）
     if (this.tokenBudget || this.knowledgeBase) {
-      const history = await this._getHistory()
+      // 投影 A 必须先于计价：被卸载的图若仍按图计价，预算会误判超限、裁掉不该裁的文本历史。
+      const history = this._projectImages(await this._getHistory())
 
       const assembled = this.contextManager.assemblePrompt({
         systemPrompt: this.systemPrompt,
@@ -1439,6 +1469,7 @@ export class Agent {
         knowledgeBase: this.knowledgeBase,
         filteredTools,
         tokenBudget: this.tokenBudget,
+        imagePricing: this._imagePricing,
         // 上一次成功调用的真实用量当基准。信封没变时只对增量估算，
         // 误差从「整体估算」缩小到「只有新增内容是估算的」。
         anchor: this._tokenAnchor,
@@ -1469,7 +1500,7 @@ export class Agent {
       return {
         body: {
           model: this.model,
-          messages: this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages))),
+          messages: toWireMessages(this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(assembled.messages)))),
           temperature: this.temperature,
           ...(assembled.tools ? { tools: assembled.tools } : {}),
         },
@@ -1481,7 +1512,7 @@ export class Agent {
     }
 
     // 简单模式：直接使用 memory 中的消息
-    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
+    const messages = toWireMessages(this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(this._projectImages(await this._getMessages())))))
 
     const openaiTools = filteredTools.length > 0 ? formatToolsForOpenAI(filteredTools) : undefined
     return {
@@ -1780,8 +1811,8 @@ export class Agent {
    * SkillFilter 看的是用户真实意图，一段框架自己写的 `<agent-notification>` 不该
    * 参与那个判断。
    *
-   * @param {string} message 用户本轮的消息
-   * @returns {string} 合并后的消息文本（队列为空时逐字节等于入参）
+   * @param {string|object[]} message 用户本轮的消息（已过入口校验）
+   * @returns {string|object[]} 合并后的消息文本（队列为空时逐字节等于入参）
    */
   _mergePendingIntoUserMessage(message) {
     const pending = this._pendingInjections
@@ -1790,7 +1821,32 @@ export class Agent {
     const notice = pending.map(m => m.content).join('\n\n')
     // 通知在前：它到达的时刻早于用户这条消息，时序上就该排在前面，读起来也是
     // "你等的东西回来了" → "用户接着说了什么"。
+    // 带图消息：通知作为首个 text 部件并入同一条 user 消息（不变量 18：不追加第二条 user）。
+    if (Array.isArray(message)) return [{ type: 'text', text: notice }, ...message]
     return `${notice}\n\n${message}`
+  }
+
+  /**
+   * 用户消息的入口校验 —— 必须在 `memory.add` 之前：先写后抛会让带图消息留在历史里，
+   * 此后每一轮组装都再撞上它，会话被永久毒化。入口是唯一能"拒绝而不留痕"的位置。
+   *
+   * @param {string|object[]} message
+   * @returns {string|object[]} 规范化后的内容（纯文本数组折叠为字符串；字符串原样）
+   * @throws {import('./content/errors.js').InvalidContentError}
+   * @throws {UnsupportedContentError}
+   */
+  _admitUserMessage(message) {
+    const content = normalizeContent(message, { maxImageBytes: this.maxImageBytes })
+    if (hasImage(content)) {
+      if (!this.vision) throw new UnsupportedContentError({ code: 'vision_disabled' })
+      if (this.strategy === 'plan_and_execute') throw new UnsupportedContentError({ code: 'plan_and_execute' })
+    }
+    return content
+  }
+
+  /** 出站投影 A：计价/裁剪之前。只作用于本次请求的副本。 */
+  _projectImages(messages) {
+    return projectHistoryImages(messages, { vision: this.vision, imageLimits: this.imageLimits })
   }
 
   /**
@@ -2799,7 +2855,7 @@ export class Agent {
   }
 
   async _buildSimpleBody(tools = this.tools) {
-    const messages = this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(await this._getMessages())))
+    const messages = toWireMessages(this._withSubagentTypesNote(this._withSkillListingNote(this._withUnavailableToolsNote(this._projectImages(await this._getMessages())))))
     const openaiTools = tools.length > 0 ? formatToolsForOpenAI(tools) : undefined
     return {
       body: {
