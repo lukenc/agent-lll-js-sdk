@@ -13,24 +13,27 @@ import { AgentTypeError } from './errors.js'
 
 /**
  * @param {{ model: string, apiKey: string, url: string,
- *           simpleModel: string, simpleApiKey: string, simpleUrl: string }} parent
- * @param {Record<string, { model?: string, apiKey?: string, url?: string }>|undefined} configured
- * @returns {Record<string, { model: string, apiKey: string, url: string }>}
+ *           simpleModel: string, simpleApiKey: string, simpleUrl: string,
+ *           vision?: boolean, simpleVision?: boolean }} parent
+ * @param {Record<string, { model?: string, apiKey?: string, url?: string, vision?: boolean }>|undefined} configured
+ * @returns {Record<string, { model: string, apiKey: string, url: string, vision: boolean }>}
  */
 export function resolveModelAliases(parent, configured) {
   if (!configured || Object.keys(configured).length === 0) {
     return {
-      fast: { model: parent.simpleModel, apiKey: parent.simpleApiKey, url: parent.simpleUrl },
-      main: { model: parent.model, apiKey: parent.apiKey, url: parent.url },
+      fast: { model: parent.simpleModel, apiKey: parent.simpleApiKey, url: parent.simpleUrl, vision: parent.simpleVision === true },
+      main: { model: parent.model, apiKey: parent.apiKey, url: parent.url, vision: parent.vision === true },
     }
   }
-  /** @type {Record<string, { model: string, apiKey: string, url: string }>} */
+  /** @type {Record<string, { model: string, apiKey: string, url: string, vision: boolean }>} */
   const out = {}
   for (const [alias, spec] of Object.entries(configured)) {
     out[alias] = {
       model: spec?.model ?? parent.model,
       apiKey: spec?.apiKey ?? parent.apiKey,
       url: spec?.url ?? parent.url,
+      // 视觉能力跟着模型走：没换模型就继承；换了模型却没声明，按不收图处理（与 Agent 默认一致）。
+      vision: typeof spec?.vision === 'boolean' ? spec.vision : (spec?.model == null ? parent.vision === true : false),
     }
   }
   return out
@@ -43,12 +46,12 @@ export function modelEnum(aliases) {
 
 /**
  * 优先级：调用入参 `model` > `Agent_Type.model` > 继承父模型。
- * @returns {{ alias: string|null, model: string, apiKey: string, url: string }}
+ * @returns {{ alias: string|null, model: string, apiKey: string, url: string, vision: boolean }}
  */
 export function resolveModel({ requested, type, aliases, parent }) {
   const alias = requested ?? type?.model ?? null
   if (alias == null) {
-    return { alias: null, model: parent.model, apiKey: parent.apiKey, url: parent.url }
+    return { alias: null, model: parent.model, apiKey: parent.apiKey, url: parent.url, vision: parent.vision === true }
   }
   const spec = aliases[alias]
   if (!spec) {
@@ -56,5 +59,5 @@ export function resolveModel({ requested, type, aliases, parent }) {
       `unknown model alias "${alias}". Available: ${modelEnum(aliases).join(', ')}`,
     )
   }
-  return { alias, model: spec.model, apiKey: spec.apiKey, url: spec.url }
+  return { alias, model: spec.model, apiKey: spec.apiKey, url: spec.url, vision: spec.vision === true }
 }

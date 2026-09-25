@@ -489,3 +489,22 @@ test('重试写同一个 key 的产物：两条记录靠 attempt 区分，并渲
   assert.deepStrictEqual(rows.map(r => r.nodeId), ['n1', 'n1'])
   assert.match(out, /attempt=2/, 'formatResult 里 attempt>1 的标注不该是死代码')
 })
+
+test('子 agent 的 vision 跟着解析出的模型走，imageLimits / maxImageBytes 沿用父级', async () => {
+  const imageLimits = Object.freeze({ maxImages: 3, maxBytes: 1000, countQuantum: 1, byteQuantum: 1000 })
+  const visionParent = { ...parent, vision: true, simpleVision: false, imageLimits, maxImageBytes: 123 }
+
+  const main = makeRunner(['ok'], {}, visionParent)
+  await main.runner.run(makeHandle(main.registry, {
+    model: { alias: 'main', model: 'gpt-4o', apiKey: 'sk-main', url: 'https://main/v1', vision: true },
+  }), { prompt: 'p' })
+  const [mainOpts] = main.createAgent.calls
+  assert.strictEqual(mainOpts.vision, true)
+  assert.strictEqual(mainOpts.imageLimits, imageLimits)
+  assert.strictEqual(mainOpts.maxImageBytes, 123)
+
+  // makeHandle 默认的 fast 别名不带 vision → 子 Agent 不收图
+  const fast = makeRunner(['ok'], {}, visionParent)
+  await fast.runner.run(makeHandle(fast.registry), { prompt: 'p' })
+  assert.strictEqual(fast.createAgent.calls[0].vision, false)
+})

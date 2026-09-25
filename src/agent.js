@@ -273,7 +273,7 @@ export class Agent {
    * @param {string} [opts.subagents.defaultType='general-purpose'] - 未指定 subagent_type 时用的类型
    * @param {number} [opts.subagents.maxConcurrent=4] - 每个 depth 层的并发上限
    * @param {number} [opts.subagents.maxDepth=2] - 允许的最大派生深度
-   * @param {Record<string, { model?: string, apiKey?: string, url?: string }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）
+   * @param {Record<string, { model?: string, apiKey?: string, url?: string, vision?: boolean }>} [opts.subagents.modelAliases] - 模型别名表（默认 fast / main）。`vision` 缺省：未换模型则继承父级，换了模型则 false
    * @param {object} [opts.subagents.retry] - 重试配置。`maxAttempts` 优先级：本字段 >
    *   `Agent_Type.maxAttempts` > 3；`backoffMs` 为退避基数（默认 `min(2^attempt·1000, 8000)`）
    * @param {number|null} [opts.subagents.retry.attemptTimeoutMs=600000] - **单次 attempt

@@ -12,9 +12,9 @@ test('未配置时默认给出 fast / main 两个别名', () => {
   const aliases = resolveModelAliases(parent, undefined)
   assert.deepStrictEqual(Object.keys(aliases), ['fast', 'main'])
   assert.deepStrictEqual(aliases.fast,
-    { model: 'gpt-4o-mini', apiKey: 'sk-simple', url: 'https://simple.example/v1/chat/completions' })
+    { model: 'gpt-4o-mini', apiKey: 'sk-simple', url: 'https://simple.example/v1/chat/completions', vision: false })
   assert.deepStrictEqual(aliases.main,
-    { model: 'gpt-4o', apiKey: 'sk-main', url: 'https://main.example/v1/chat/completions' })
+    { model: 'gpt-4o', apiKey: 'sk-main', url: 'https://main.example/v1/chat/completions', vision: false })
   assert.deepStrictEqual(modelEnum(aliases), ['fast', 'main'])
 })
 
@@ -58,4 +58,21 @@ test('未知别名抛 AgentTypeError 且消息列出可用别名', () => {
 test('解析结果不把 apiKey 暴露在 alias 枚举里', () => {
   const aliases = resolveModelAliases(parent, undefined)
   assert.ok(!JSON.stringify(modelEnum(aliases)).includes('sk-'))
+})
+
+test('别名携带 vision：main 继承 vision，fast 取 simpleVision，宿主别名可显式声明', () => {
+  const p = { ...parent, vision: true, simpleVision: false }
+  const d = resolveModelAliases(p, undefined)
+  assert.strictEqual(d.main.vision, true)
+  assert.strictEqual(d.fast.vision, false)
+
+  const c = resolveModelAliases(p, {
+    inherit: {},                          // 不指定 model → 继承父模型 → 继承 vision
+    other: { model: 'text-only-model' },  // 换了模型又没声明 → false
+    eyes: { model: 'vl-model', vision: true },
+  })
+  assert.deepStrictEqual([c.inherit.vision, c.other.vision, c.eyes.vision], [true, false, true])
+
+  assert.strictEqual(resolveModel({ requested: undefined, type: null, aliases: d, parent: p }).vision, true)
+  assert.strictEqual(resolveModel({ requested: 'fast', type: null, aliases: d, parent: p }).vision, false)
 })

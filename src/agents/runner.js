@@ -337,6 +337,10 @@ export class SubagentRunner {
       knowledgeBase: parent.knowledgeBase,
       tokenBudget: parent.tokenBudget,
       validateStreamCompletion: parent.validateStreamCompletion,
+      // 视觉能力跟着解析出的模型走（别名表里的 vision）；图片上限沿用父级。
+      vision: handle.model.vision === true,
+      imageLimits: parent.imageLimits,
+      maxImageBytes: parent.maxImageBytes,
       hooks: this._childHooks(handle),
       // 给假实例/调试用的归属信息（Agent 会忽略未知选项）
       _agentId: handle.agentId,
