@@ -107,7 +107,7 @@ const screenshot = defineTool({
 ```
 
 - `vision` 默认 `false`：带图的用户消息在写入 memory 之前抛 `UnsupportedContentError`；工具返回的图以 `unsupported_content` 工具级失败，run 继续。
-- 历史里的图全部保留；单次请求超过 `imageLimits`（默认 20 张 / 20 MiB）时按批卸载最老的图，替换成文字占位。
+- 历史里的图全部保留；单次请求超过 `imageLimits`（默认 20 张 / 20 MiB）时按批卸载最老的图，替换成文字占位；本轮刚发的图不会被卸载。一条消息（或一个工具结果）自己的图就超出 `imageLimits` 时在入口被拒（`InvalidContentError`，`code: 'exceeds_image_limits'`）。
 - 摘要、意图识别等只收文本，看到的是 `[image png 1024×768 #a1b2c3d4]` 这样的占位。
 - `plan_and_execute` 策略本版不支持图片。
 - 完整示例：`examples/multimodal.js`；机制说明：[docs/design/multimodal.md](docs/design/multimodal.md)。

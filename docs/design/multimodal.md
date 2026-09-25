@@ -60,7 +60,7 @@
 
 | 项 | 方法 |
 |---|---|
-| 媒体类型 | data URL 头；与魔数不符时以魔数为准 |
+| 媒体类型 | data URL 头；与魔数不符时以魔数为准（入口据此重写规范头，§2.3） |
 | 宽高 | PNG：IHDR；GIF：逻辑屏幕描述符；WebP：`VP8 ` / `VP8L` / `VP8X`；只需解码前几十字节。JPEG：扫描到 SOFn 标记为止，**扫描上限 256 KB**，超出记为尺寸未知 |
 | 字节数 | base64 长度反推（公网 URL：未知） |
 | 短摘要 | FNV-1a(`长度 + 头 4 KB + 尾 4 KB`) 的 8 位十六进制 |
@@ -91,21 +91,32 @@ SDK 不提供异步 Blob 读取。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `vision` | `false` | 主模型是否接受图片。对齐 dsh `inputModalities ?? ['text']` —— 默认拒绝 |
-| `simpleVision` | 未配置简单模型时同 `vision`，否则 `false` | 只影响子 Agent 的 `fast` 别名（没配简单模型时 `fast` 就是主模型，所以继承 `vision`）；sidecar 一律走文本投影（§4.2） |
+| `vision` | `false` | 主模型是否接受图片。对齐 dsh `inputModalities ?? ['text']` —— 默认拒绝。给了就必须是布尔值，否则**构造时抛** `TypeError`（`'true'` 不会被当成真） |
+| `simpleVision` | 未配置简单模型时同 `vision`，否则 `false` | 只影响子 Agent 的 `fast` 别名（没配简单模型时 `fast` 就是主模型，所以继承 `vision`）；sidecar 一律走文本投影（§4.2）。类型校验同 `vision` |
 | `imageLimits` | `{ maxImages: 20, maxBytes: 20 MiB, countQuantum: 5, byteQuantum: 10 MiB }` | 出站卸载的上限与量子（§3.A）。非法值**构造时抛** |
 | `maxImageBytes` | `20 MiB` | 入口单张上限 |
 | `imageTokenEstimator` | 按 url 推断：OpenAI → `'openai'`，其余 → `'mimo'` | `'openai' \| 'mimo' \| (w, h, detail) => number` |
 | `unknownImageTokens` | `1024` | 宽高未知时的兜底计价 |
 
+两个字节上限口径不同：`maxImageBytes` 按**解码后**字节计，`imageLimits.maxBytes` 按 **data URL 字符数**
+（≈ 解码字节 × 4/3）计。入口两道都要过（§2.3 第 1、4 步），所以默认配置下单张图的实际上限约为
+**15 MiB**（data URL 要装进 20 MiB），而不是 `maxImageBytes` 字面上的 20 MiB。
+
 ### 2.3 入口校验 —— 在 `memory.add` **之前**
 
 校验失败时本轮**什么都不写**。顺序：
 
-1. 部件合法性（类型、URL 协议、媒体类型白名单、base64 可解、单张 ≤ `maxImageBytes`）
-   → 否则 `InvalidContentError`。
+1. 部件合法性（类型、URL 协议、声明的媒体类型在白名单、base64 可解、**魔数**是白名单图片格式、
+   单张 ≤ `maxImageBytes`）→ 否则 `InvalidContentError`。魔数嗅探只解码前 64 字节：非图字节挂在
+   `image/png` 头下 → `unsupported_media_type`；头与魔数不符（JPEG 字节声明成 PNG）→ 收下，
+   规范头**按魔数**重写（§1.1）。
 2. 带图且 `vision !== true` → `UnsupportedContentError { code: 'vision_disabled' }`。
 3. 带图且 `strategy === 'plan_and_execute'` → `UnsupportedContentError { code: 'plan_and_execute' }`。
+4. 带图且这条消息**自己**的图就超出 `imageLimits`（张数 > `maxImages`，或 data URL 字符数之和
+   > `maxBytes`；公网 URL 计 0 字节）→ `InvalidContentError { code: 'exceeds_image_limits' }`。
+   收下它毫无意义：出站投影只会在携带它的那次请求里就把它换成卸载占位。
+
+公网 http(s) URL 无法在入口校验（SDK 不替供应商抓图），风险见 §10。
 
 **为什么必须先于 `memory.add`：** 若先写后抛，这条带图消息留在历史里，此后每一轮组装都会再撞上它，
 会话被永久毒化。入口是唯一能"拒绝而不留痕"的位置。
@@ -127,22 +138,24 @@ execute: async () => contentResult([
 ```
 
 `contentResult` 用 `Symbol.for('lll.contentResult')` 打标，识别只看标记。
-其 parts 与用户消息走**同一套**部件校验（§2.3 第 1 步，含单张 `maxImageBytes`）。
+其 parts 与用户消息走**同一套**部件校验（§2.3 第 1 步，含魔数与单张 `maxImageBytes`；
+视觉开启时还有第 4 步的 `imageLimits` 检查）。
 `formatToolResult(callId, name, result)` 签名不变（`tool.js` 是稳定契约）：
 遇到 `contentResult` 时 `content` 取规范化后的 parts（无图则折叠为字符串）。
 
 **不支持视觉时：工具级报错。** 在 ReAct 的同步与流式两条工具循环里（`agent.js` 的
 `tool.execute` 之后、`afterToolCall` 之前），若结果是含图的 `contentResult` 且 `vision !== true`：
 
-- `result` 替换为错误文本：`Tool "<name>" returned image content, but the model does not accept image input (vision is disabled).`
+- `result` 替换为错误文本：`Error: Tool "<name>" returned image content, but the model does not accept image input (vision is disabled).`
 - `errorKind = 'unsupported_content'`，`tool.call` 事件 `ok: false`；
 - `onError(new UnsupportedContentError({ code: 'vision_disabled' }), { round, toolName })`；
 - run **继续**，模型看到错误结果并自行应对。
 
 与仓库既有约定一致：工具失败永不打断 run（`tool-error-resilience.test.js`）。
 **不能**整轮抛出 —— 此时 `assistant(tool_calls)` 已写入 memory，直接抛会留下悬空的
-`tool_calls`，下一轮请求被供应商以 400 拒绝。`contentResult` 部件不合法时同理，
-`errorKind = 'invalid_content'`。
+`tool_calls`，下一轮请求被供应商以 400 拒绝。`contentResult` 部件不合法、或（视觉开启时）
+它自己的图就超出 `imageLimits` 时同理：`result` 为 `Error: Tool "<name>" returned invalid content: <InvalidContentError 消息>`，
+`errorKind = 'invalid_content'`，`onError` 收到该 `InvalidContentError`。
 
 `plan_and_execute` 的步骤内工具循环（`plan-and-execute.js:544`）对含图 `contentResult`
 一律按 `unsupported_content` 处理（本版该策略不支持图）。
@@ -175,6 +188,13 @@ execute: async () => contentResult([
      公网 URL 计张数、字节计 0。
    - 超出 `maxImages` 或 `maxBytes` 时，待移除量**向上取整到量子倍数**，从最老处连续替换为
      `[image omitted to fit request image limits; png 1024×768 #a1b2c3d4]`。
+   - **本轮受保护。** 最后一条"最终" `assistant`（无 `tool_calls` 或为空数组）**之后**的图 ——
+     用户刚发的图、本轮工具回灌的图 —— 绝不在携带它的那次请求里被卸载。量子仍按**全部**图计算
+     （与 dsh 一致，前缀稳定性不变），再封顶到边界及之前的旧图张数：
+     `count = min(offloadedPrefixCount(全部), 旧图张数)`；没有这样的 `assistant` 时旧图张数为 0。
+     图按顺序排列，封顶后的前缀碰不到本轮。代价：单条用户消息 / 单个工具结果自己超限已在入口
+     （§2.3 第 4 步 / §2.4）被拒，但本轮的图**合计**超限（用户图加上几次工具回灌）时不卸载，
+     原样发出，由供应商裁决。
    - **量子的意义是缓存稳定。** 每轮只挤掉一张，会让前缀每轮都变、prompt cache 每轮失效；
      按量子成批移除，被移除的前缀在历史再增长一个量子之前保持不变。
      dsh 的注释给过一个例子：129 张 1 MB 图、上限 128 MiB、量子 64 MiB → 一次移除最老的 65 张，
@@ -239,6 +259,8 @@ execute: async () => contentResult([
 | `openai` | tile 公式：`detail:'low'` → 85；否则先缩放进 2048×2048，再把短边缩到 768，按 512 切 tile，token = 85 + 170·tiles |
 
 `openai` 公式对应 gpt-4o 系列；mini / 新型号的公式可能不同，所以估算器可由宿主覆盖。
+宿主估算器抛错或返回非有限 / 负数时按 `unknownImageTokens` 计价 —— 计价只是估算，不能把整轮打断。
+`estimateMessageTokens(msg, pricing)` 的 `pricing` 缺省或为 `null` 时用默认（`mimo`）计价。
 估算偏差的影响面有限：锚点是真实用量（不变量 6），一张图只在**首次被发送的那一轮**
 处于"估算增量"里，之后就进入锚点。
 
@@ -281,7 +303,11 @@ execute: async () => contentResult([
 | 类 | 字段 | `code` |
 |---|---|---|
 | `UnsupportedContentError` | `code`, `role?` | `'vision_disabled'` · `'plan_and_execute'` · `'image_in_role'` |
-| `InvalidContentError` | `code`, `partIndex?`, `mediaType?`, `bytes?`, `maxBytes?` | `'bad_part_type'` · `'bad_url_scheme'` · `'unsupported_media_type'` · `'image_too_large'` · `'bad_base64'` |
+| `InvalidContentError` | `code`, `partIndex?`, `mediaType?`, `bytes?`, `maxBytes?`, `images?`, `maxImages?` | `'bad_part_type'` · `'bad_url_scheme'` · `'unsupported_media_type'` · `'image_too_large'` · `'bad_base64'` · `'exceeds_image_limits'` |
+
+`exceeds_image_limits` 的 `images` / `bytes` 是这条内容的图张数与 data URL 字符数，`maxImages` / `maxBytes`
+取自 `imageLimits`；消息形如 `Images in this content (3 images, 900 bytes as data URLs) exceed the per-request image limits (2 images, 800 bytes); lower maxImageBytes or raise imageLimits.`
+（`images` / `maxImages` 与其余数值字段一样只收非负安全整数。）
 
 ---
 
@@ -292,7 +318,7 @@ execute: async () => contentResult([
 | `src/content/parts.js` | 入口规范化（文本数组折叠）、`imagePart`、`contentResult`、`isContentResult`、`contentText`、`hasImage`、`toolResultText`、`normalizeMaxImageBytes` |
 | `src/content/image-meta.js` | data URL 解析、四种格式的宽高嗅探、短摘要 |
 | `src/content/image-tokens.js` | `mimo` / `openai` 估算器 |
-| `src/content/projection.js` | `projectHistoryImages`、`toWireMessages` |
+| `src/content/projection.js` | `projectHistoryImages`、`toWireMessages`、`imagesExceedLimits`（入口与工具闸的单条内容上限检查） |
 | `src/content/errors.js` | 两个错误类 |
 | `src/content/index.js` | 模块出口 |
 
@@ -326,14 +352,14 @@ execute: async () => contentResult([
 
 ### 8.2 `examples/multimodal.js` —— 综合用例（DoD 第 3 条）
 
-测试图用 Node 内置 `zlib` 现场生成 PNG（颜色、数量确定的色块），不依赖图片文件。
+测试图由 `demo/lib/png.js`（Node 内置 `zlib`）现场生成 PNG（颜色、数量确定的色块），不依赖图片文件。
 断言**发生了什么**，不断言措辞；任何失败非零退出。依次对 **OpenAI** 与 **MiMo** 各跑一遍。
 
 | 幕 | 内容 | 断言 |
 |---|---|---|
 | 1 | 用户发一张含 N 个色块的图，要求调 `report_count({count})` | 工具被调用且 `count === N`（同时覆盖既有工具调用） |
 | 2 | 工具 `render_chart` 返回 `contentResult`（三根不同颜色的柱） | 模型调 `submit_answer({color})` 答出最高柱的颜色 |
-| 3 | `examples/support/` 下的最小 stdio MCP 服务器返回 `image` 部件 | 模型拿到图并完成同样判断 |
+| 3 | `demo/mcp-servers/image-chart.js`（最小 stdio MCP 服务器，与 demo 共用）返回 `image` 部件 | 模型拿到图并完成同样判断 |
 | 4 | 追问"刚才第一张图里有几个色块"；再把 `imageLimits` 调小 | 历史保留生效；调小后请求里出现卸载占位 |
 | 5 | 同场：SummarizingMemory（小阈值触发摘要）、意图识别 + 工具过滤、`tokenBudget` | 摘要里是占位而非 base64；`context.assembled` 可见图片 token |
 | 6 | `vision:false` 的 Agent：发图；再调一个返回图的工具 | 前者抛 `UnsupportedContentError` 且 memory 不变；后者工具级错误、run 正常结束 |
@@ -378,6 +404,9 @@ memory / 事件日志 / 子 Agent 镜像不被 base64 撑大，占位还能给�
   `reasoning_content`，否则 400。我们写 memory 时丢弃了它（improvements.md **D-2**）。
   这不是多模态问题、不并入本设计；若验收撞上，按 AGENTS.md DoD 第 4 条单独修复。
 - **OpenAI 计价公式漂移。** 不同型号公式不同，估算器可覆盖；锚点兜住长期误差。
+- **公网 URL 无法在入口校验。** http(s) 图片 URL 原样收下（SDK 不替供应商抓图）。若供应商抓不到
+  （404、鉴权、内网地址），这条带图消息此后**每一轮**都会让请求失败，直到它被卸载（§3.A）、被摘要压掉，
+  或宿主调用 `reset()`。需要确定性的宿主应先自行下载，再以 data URL 传入。
 - **JPEG 尺寸扫描上限。** EXIF 缩略图很大的 JPEG 可能在 256 KB 内扫不到 SOF，
   此时按 `unknownImageTokens` 计价，不影响发送。
 - **demo 载荷。** data URL 经 `/chat` 的 JSON 与 SSE 往返，大图会让单次请求变重；
@@ -388,10 +417,10 @@ memory / 事件日志 / 子 Agent 镜像不被 base64 撑大，占位还能给�
 ## 相关测试
 
 - `src/content/image-meta.test.js` —— 四种格式宽高、JPEG 扫描上限、魔数优先、错误类不泄露数据
-- `src/content/parts.test.js` —— 规范化、折叠、`imagePart`、`contentResult` 往返
+- `src/content/parts.test.js` —— 规范化、折叠、魔数校验（非图字节拒绝、魔数改写头）、`imagePart`、`contentResult` 往返
 - `src/content/image-tokens.test.js` —— 两个公式的钉住值、9-token 锚点、base64 不按文本计价
-- `src/content/projection.test.js` —— dsh 量子算例、fast-check 属性（前缀单调、剩余在限内、整量子）、tool 图拆分
-- `src/agent-multimodal.test.js` —— 入口拒绝不留痕、两条路径发图、纯文本逐字节不变、积压合并、stream 对等、工具图、spill、plan 模式
+- `src/content/projection.test.js` —— dsh 量子算例、fast-check 属性（前缀单调、剩余在限内、整量子）、本轮受保护、`imagesExceedLimits`、tool 图拆分
+- `src/agent-multimodal.test.js` —— 入口拒绝不留痕（含 `exceeds_image_limits`）、两条路径发图、ContextManager 路径先投影后计价、纯文本逐字节不变、积压合并、stream 对等、工具图（含超限）、spill、plan 模式、`vision` 类型校验
 - `src/multimodal-consumers.test.js` —— 摘要、意图识别、技能过滤、历史检索的文本投影
 - `src/mcp/image-result.test.js` —— normalize 的图片分支 + 真实 stdio 的 image-chart server
 - `demo/lib/png.test.js` —— PNG 编码与 CRC
