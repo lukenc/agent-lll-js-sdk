@@ -123,7 +123,10 @@ await agentB.chat('先调用 render_chart 看图，再调用 submit_answer 提�
 const followUp2 = requests.slice(before2).find(b => (b.messages ?? []).some(m => m.role === 'tool' && m.name === 'render_chart'))
 const t2 = followUp2 ? followUp2.messages.findIndex(m => m.role === 'tool' && m.name === 'render_chart') : -1
 ok(t2 >= 0 && typeof followUp2.messages[t2].content === 'string', 'tool 消息只带文字')
-ok(t2 >= 0 && followUp2.messages[t2 + 1]?.role === 'user' && bodyText(followUp2.messages[t2 + 1]).includes('image_url'), '图片紧随其后作为 user 消息发出')
+// 模型可能并行调用 render_chart 与 submit_answer：submit_answer 的 tool 消息会夹在中间
+// （toWireMessages 把图片挪到那一整串连续 tool 消息之后），所以跳过所有紧邻的 tool 消息再看。
+const next2 = t2 >= 0 ? (() => { let i = t2 + 1; while (i < followUp2.messages.length && followUp2.messages[i].role === 'tool') i++; return i })() : -1
+ok(next2 >= 0 && followUp2.messages[next2]?.role === 'user' && bodyText(followUp2.messages[next2]).includes('image_url'), '图片跟在 tool 结果之后，作为 user 消息发出')
 ok(answer2.last()?.color === tallestOf(heights2), `最高柱是 ${tallestOf(heights2)}（模型提交 ${answer2.last()?.color}）`)
 
 // ---------------------------------------------------------------- 3. MCP 工具回灌图
@@ -177,7 +180,9 @@ const agentE = new Agent({
   memoryOpts: { threshold: 4, keepRecent: 2 },
 })
 agentE.on('context.assembled', p => assembled.push(p))
-const K = randInt(2, 7)
+// K 取 5..7，强制两行图（440×240）：一行图（K<=4，440×140）在 MiMo 估算器下只值 56 token，
+// 会让下面的 100-token 校验对着一个正确的 SDK 失败。
+const K = randInt(5, 7)
 const before5 = requests.length
 await agentE.chat(ask('图里有几个红色方块？调用 report_count 提交。', squaresPng(K)))
 ok(count5.last()?.count === K, `意图识别开启时仍答对 ${K}（模型提交 ${count5.last()?.count}）`)
