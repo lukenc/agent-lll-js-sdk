@@ -28,6 +28,7 @@ function _providerFromUrl(url) {
   if (u.includes('api.x.ai')) return 'x-grok'
   if (u.includes('api.moonshot.cn')) return 'moonshot'
   if (u.includes('open.bigmodel.cn')) return 'zhipu'
+  if (u.includes('api.xiaomimimo.com')) return 'xiaomi'
   return 'unknown'
 }
 

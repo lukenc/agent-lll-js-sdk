@@ -27,6 +27,11 @@ const PROVIDERS = {
   zhipu: {
     url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
   },
+  xiaomi: {
+    // 小米 MiMo 开放平台，OpenAI 兼容。只有部分型号收图（mimo-v2.5 收，mimo-v2.5-pro 不收），
+    // 能否发图由 Agent 的 `vision` 开关声明，不由供应商名推断。
+    url: 'https://api.xiaomimimo.com/v1/chat/completions',
+  },
 }
 
 /**

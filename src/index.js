@@ -96,3 +96,14 @@ export {
   SpillError,
 } from './spill/index.js'
 export { createSpillPolicy, SPILL_READ_TOOL_NAME, SPILL_SEARCH_TOOL_NAME } from './spill/policy.js'
+
+// ---- 多模态（图片输入）----
+// 内部消息沿用 OpenAI content parts；无图时 content 仍是字符串。见 docs/design/multimodal.md。
+export {
+  imagePart,
+  contentResult,
+  isContentResult,
+  contentText,
+  UnsupportedContentError,
+  InvalidContentError,
+} from './content/index.js'

@@ -123,3 +123,16 @@ test('[SMOKE] src/index.js — runtime history and memory policy APIs exported',
     assert.ok(name in pkg, `${name} should be exported`)
   }
 })
+
+const NEW_MULTIMODAL_SYMBOLS = [
+  'imagePart', 'contentResult', 'isContentResult', 'contentText',
+  'UnsupportedContentError', 'InvalidContentError',
+]
+
+test('[SMOKE] src/index.js — multimodal symbols exported', () => {
+  for (const sym of NEW_MULTIMODAL_SYMBOLS) {
+    assert.notEqual(typeof pkg[sym], 'undefined', `missing multimodal export: ${sym}`)
+  }
+  assert.ok(new pkg.UnsupportedContentError({ code: 'vision_disabled' }) instanceof Error)
+  assert.ok(new pkg.InvalidContentError({ code: 'bad_part_type', partIndex: 0 }) instanceof Error)
+})
