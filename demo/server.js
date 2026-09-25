@@ -349,6 +349,15 @@ const renderSalesChart = defineTool({
   },
 })
 
+/**
+ * 本页交给 Agent 的全部本地工具 —— 构造（createAgent）与热更新（refreshAgentTools）
+ * 共用这一份。两处各写一份清单时，热更新漏了 render_sales_chart：面板上挂载/卸载一次
+ * MCP（或用 MCP_SERVER_CMD 启动）之后，图表工具就从 Agent 上消失了。
+ */
+function getDemoLocalTools() {
+  return [...getLocalBaseTools(), readNote, readBuildLog, renderSalesChart]
+}
+
 // 默认开启。SPILL=0 关闭后行为与引入 spill 之前逐字节一致。
 const ENABLE_SPILL = process.env.SPILL !== '0' && process.env.SPILL !== 'false'
 // 单条工具结果的模型可见上限（字节）。demo 里设小一点，方便观察效果。
@@ -437,7 +446,7 @@ function refreshAgentTools() {
     (t) => t.name === 'load_mcp_server' || t.name === 'skill' || t.name === 'skill_resource'
       || dynamicNames.has(t.name) || META_TOOL_NAMES.has(t.name)
   )
-  agent.tools = [...getLocalBaseTools(), readNote, readBuildLog, ...getAllMcpTools(), ...preserved]
+  agent.tools = [...getDemoLocalTools(), ...getAllMcpTools(), ...preserved]
 }
 
 /**
@@ -560,9 +569,9 @@ function createAgent(strategy) {
         : '')
       + (VISION ? '。用户可能发来图片,请结合图片作答;需要看销售图表时调用 render_sales_chart' : '')
       + '。请用中文回答。',
-    // getLocalBaseTools() 已含 get_current_time / calculate / (skills 启用时) read_file；
-    // readNote 是 subagent 演示素材，两边合并后一起给。
-    tools: [...getLocalBaseTools(), readNote, readBuildLog, renderSalesChart, ...getAllMcpTools()],
+    // getDemoLocalTools()：get_current_time / calculate / (skills 启用时) read_file，
+    // 加 subagent 演示素材 read_note、spill 演示用的 read_build_log 与图表工具。
+    tools: [...getDemoLocalTools(), ...getAllMcpTools()],
     strategy: currentStrategy,
     vision: VISION,
     // 启用后,Agent 工具集会多一个 load_mcp_server 元工具,LLM 可自主加载 MCP 服务器;
@@ -818,7 +827,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/context') {
     const context = await buildContextSnapshot(agent)
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-    res.end(JSON.stringify(context))
+    res.end(JSON.stringify(context, elideDataUrls))
     return
   }
 

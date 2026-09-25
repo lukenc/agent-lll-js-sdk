@@ -681,6 +681,14 @@ var timer = defineTool({
   }
 })
 
+// 本页交给 Agent 的全部本地工具 —— 构造（initAgent）与 MCP 热更新（refreshBrowserMcpTools）
+// 共用这一份。两处各写一份清单时，热更新漏了 draw_chart：挂载/卸载一次 MCP 之后，
+// 图表工具就从 Agent 上消失了。hostAskUser 不在这里：它只在勾选时由 initAgent 追加，
+// 热更新时按 ask_user 这个名字从现有 tools 捞回（见 META_TOOL_NAMES）。
+function getDemoLocalTools() {
+  return [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer, readBuildLog, drawChart]
+}
+
 // 11. 宿主自带的 ask_user（勾了「用宿主自带的 ask_user」才装进 tools）
 //
 // 这是真实宿主（Electron / 桌面端）最常见的形态：一个富 schema 的询问工具，
@@ -1003,7 +1011,7 @@ async function refreshBrowserMcpTools() {
   }
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
-    var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer, readBuildLog]
+    var baseTools = getDemoLocalTools()
     // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user / spill_read):
     // 它们不在 baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们
     // 冲掉,导致挂载/卸载 MCP 后技能系统、ask_user 或 spill 取回失效 —— 而系统提示
@@ -1086,7 +1094,7 @@ function initAgent() {
   var enableVision = document.getElementById('enableVision').checked
   if (!apiKey) { alert('请输入 API Key'); return }
 
-  var baseTools = [getCurrentTime, calculate, showPopup, getWeather, convertUnit, generateRandom, processText, modifyPage, notepad, timer, readBuildLog, drawChart]
+  var baseTools = getDemoLocalTools()
   // 勾了「宿主自带的 ask_user」就把它一起交给 Agent。SDK 注入 ask_user 时会认出
   // 这个同名的宿主工具并**包一层**（保留富 schema 与 execute，外面补 AskRegistry
   // 登记），而不是替换掉它。
