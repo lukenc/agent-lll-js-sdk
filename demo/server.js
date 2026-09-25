@@ -70,8 +70,10 @@ import {
   listAgentTypes,
   SUBAGENT_TOOL_NAMES,
   defaultTokenBudget,
+  contentResult, imagePart,
 } from '../src/index.js'
 import { createActivityLedger } from './lib/activity.js'
+import { barChartPng } from './lib/png.js'
 
 const PORT = parseInt(process.env.PORT, 10) || 3000
 // 供应商与 Key 的解析 —— 与 examples/subagents.js 同一套。SDK 支持 6 家,只认两个 key
@@ -83,6 +85,7 @@ const KEY_BY_PROVIDER = {
   moonshot: process.env.MOONSHOT_API_KEY,
   zhipu: process.env.ZHIPU_API_KEY,
   'x-grok': process.env.XAI_API_KEY || process.env.GROK_API_KEY,
+  xiaomi: process.env.MIMO_API_KEY,
 }
 const DEFAULT_MODEL_BY_PROVIDER = {
   openai: 'gpt-4',
@@ -91,6 +94,7 @@ const DEFAULT_MODEL_BY_PROVIDER = {
   moonshot: 'moonshot-v1-8k',
   zhipu: 'glm-4',
   'x-grok': 'grok-2-latest',
+  xiaomi: 'mimo-v2.5',
 }
 const PROVIDER = process.env.PROVIDER
   || Object.keys(KEY_BY_PROVIDER).find(p => KEY_BY_PROVIDER[p])
@@ -100,6 +104,10 @@ const API_KEY = KEY_BY_PROVIDER[PROVIDER] || process.env.LLM_API_KEY
 const MODEL = process.env.MODEL || DEFAULT_MODEL_BY_PROVIDER[PROVIDER] || 'gpt-4'
 // 自定义 API 端点(OpenAI 兼容的代理/聚合服务);不设则用 provider 注册表里的默认地址。
 const LLM_URL = process.env.LLM_URL || undefined
+
+// 多模态：模型能看图时设 VISION=1。关闭时带图的用户消息会被 SDK 在入口拒绝，
+// 工具返回的图以 unsupported_content 工具级失败 —— 这是 SDK 对非视觉模型的约定。
+const VISION = process.env.VISION === '1' || process.env.VISION === 'true'
 
 // MCP 集成 —— 可选。未设置 MCP_SERVER_CMD 时完全跳过,向后兼容。
 const MCP_SERVER_CMD = process.env.MCP_SERVER_CMD
@@ -172,6 +180,15 @@ const MCP_PRESETS = [
     name: 'fetch',
     env: {},
     description: '通用 HTTP 抓取,可配合搜索做检索增强',
+  },
+  {
+    id: 'image-chart',
+    label: '🖼️ 图表 (本仓库自带,返回 PNG 图片,演示 MCP 回灌图片)',
+    command: 'node',
+    args: ['demo/mcp-servers/image-chart.js'],
+    name: 'chart',
+    env: {},
+    description: '工具 render_bar_chart 返回一张红/蓝/绿柱状图。需要 VISION=1 且模型能看图,否则工具以 unsupported_content 失败',
   },
   {
     id: 'mock',
@@ -316,6 +333,20 @@ const readBuildLog = defineTool({
   description: '读取最近一次构建的完整日志（输出可能非常大，约 100KB）',
   parameters: { type: 'object', properties: {} },
   execute: async () => BUILD_LOG,
+})
+
+// 多模态演示：工具返回图片（contentResult）。柱高随机，最高的是哪根只在图里。
+const renderSalesChart = defineTool({
+  name: 'render_sales_chart',
+  description: '渲染本季度红/蓝/绿三个产品线的销售柱状图，返回 PNG 图片',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => {
+    const heights = [120, 200, 160].sort(() => Math.random() - 0.5)
+    return contentResult([
+      { type: 'text', text: '柱状图已渲染：红、蓝、绿三根柱子。' },
+      imagePart(barChartPng(heights)),
+    ])
+  },
 })
 
 // 默认开启。SPILL=0 关闭后行为与引入 spill 之前逐字节一致。
@@ -527,11 +558,13 @@ function createAgent(strategy) {
         ? '。工具输出过大时会被自动转存,你只会看到头尾摘要和一个 spill:// 地址;'
           + '需要细节时先用 spill_search 搜关键词定位,再用 spill_read 按 offset 精读,不要从头顺序读'
         : '')
+      + (VISION ? '。用户可能发来图片,请结合图片作答;需要看销售图表时调用 render_sales_chart' : '')
       + '。请用中文回答。',
     // getLocalBaseTools() 已含 get_current_time / calculate / (skills 启用时) read_file；
     // readNote 是 subagent 演示素材，两边合并后一起给。
-    tools: [...getLocalBaseTools(), readNote, readBuildLog, ...getAllMcpTools()],
+    tools: [...getLocalBaseTools(), readNote, readBuildLog, renderSalesChart, ...getAllMcpTools()],
     strategy: currentStrategy,
+    vision: VISION,
     // 启用后,Agent 工具集会多一个 load_mcp_server 元工具,LLM 可自主加载 MCP 服务器;
     // 连接/关闭超时沿用默认 30s/5s。运行时加载的客户端由 Agent 持有,reset()/
     // closeMCPClients() 时统一关闭。未启用时行为不变(向后兼容)。
@@ -590,6 +623,13 @@ function createAgent(strategy) {
 }
 
 let agent = createAgent('react')
+
+/** 上下文面板只需要"这里有张图"；把 data URL 缩成占位，免得每轮把 base64 往返三遍（all/visible/model）。 */
+function elideDataUrls(key, value) {
+  return key === 'url' && typeof value === 'string' && value.startsWith('data:')
+    ? `data:…(${value.length} chars)`
+    : value
+}
 
 async function buildContextSnapshot(agent) {
   if (!agent) {
@@ -758,7 +798,7 @@ const server = createServer(async (req, res) => {
       const session = agent.getSessionMetrics()
       res.write(`data: ${JSON.stringify({ type: 'metrics', lastRun, session })}\n\n`)
       const context = await buildContextSnapshot(agent)
-      res.write(`data: ${JSON.stringify({ type: 'context', context })}\n\n`)
+      res.write(`data: ${JSON.stringify({ type: 'context', context }, elideDataUrls)}\n\n`)
       // 一轮结束时再补一份 subagent 快照 —— 后台 agent 可能在这一轮里刚 settle,
       // 面板不该停在最后一次轮询看到的中间态。
       const subagents = await buildSubagentSnapshot(agent)
@@ -1081,6 +1121,7 @@ function startServer(port, retries = 10) {
     console.log(`  • 服务端 Agent: http://localhost:${actualPort}/`)
     console.log(`  • 浏览器端 Agent: http://localhost:${actualPort}/browser`)
     if (PROVIDER && API_KEY) console.log(`供应商: ${PROVIDER}, 模型: ${MODEL}`)
+    console.log(`视觉输入: ${VISION ? '开启' : '关闭（模型能看图时用 VISION=1 开启）'}`)
     console.log(`默认策略: ${currentStrategy}`)
     if (mcpConnections.size > 0) {
       const names = [...mcpConnections.keys()].join(', ')

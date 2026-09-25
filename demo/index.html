@@ -53,6 +53,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .input-area button { padding: 10px 24px; background: #1a1a2e; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }
 .input-area button:hover { background: #16213e; }
 .input-area button:disabled { background: #999; cursor: not-allowed; }
+.attach-bar { display: flex; gap: 10px; padding: 8px 24px 0; flex-wrap: wrap; background: #fff; }
+.attach-bar:empty { display: none; }
+.attach-thumb { position: relative; text-align: center; font-size: 11px; color: #666; }
+.attach-thumb img { height: 56px; border-radius: 6px; border: 1px solid #ddd; display: block; }
+.attach-thumb button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; padding: 0; border-radius: 50%; border: none; background: #333; color: #fff; font-size: 12px; line-height: 18px; cursor: pointer; }
+.msg img.inline-image { max-width: 240px; max-height: 180px; display: block; margin-top: 6px; border-radius: 6px; border: 1px solid #ddd; }
 .actions { display: flex; gap: 8px; }
 .actions button.secondary { background: transparent; color: #666; border: 1px solid #ddd; }
 .actions button.secondary:hover { background: #f5f5f5; }
@@ -316,9 +322,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <button class="ghost" onclick="submitAnswer(true)">放弃</button>
   </div>
 </div>
+<div class="attach-bar" id="attachBar"></div>
 <div class="input-area">
-  <input id="input" placeholder="输入消息..." autocomplete="off" />
+  <input id="input" placeholder="输入消息...（可粘贴图片）" autocomplete="off" />
+  <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
   <div class="actions">
+    <button class="secondary" title="附加图片" onclick="document.getElementById('fileInput').click()">📎</button>
     <button id="send" onclick="send()">发送</button>
     <button class="secondary" onclick="resetChat()">新会话</button>
   </div>
@@ -331,25 +340,74 @@ const eventsEl = document.getElementById('events')
 const telemetryPanel = document.getElementById('telemetryPanel')
 let sending = false
 
+// ---- 图片附件（发给服务端 Agent 的 content parts）----
+const MAX_ATTACH_BYTES = 5 * 1024 * 1024
+let attachments = []   // data URL 字符串
+const attachBar = document.getElementById('attachBar')
+document.getElementById('fileInput').addEventListener('change', e => { addFiles(e.target.files); e.target.value = '' })
+input.addEventListener('paste', e => {
+  const files = [...(e.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'))
+  if (files.length) { e.preventDefault(); addFiles(files) }
+})
+function addFiles(files) {
+  for (const f of files) {
+    if (f.size > MAX_ATTACH_BYTES) {
+      addMsg('phase', `⚠️ ${f.name} 有 ${(f.size / 1048576).toFixed(1)} MB，超过 5 MB 已忽略（图片每一轮都会随历史重发）`)
+      continue
+    }
+    const reader = new FileReader()
+    reader.onload = () => { attachments.push(reader.result); renderAttachments() }
+    reader.readAsDataURL(f)
+  }
+}
+function renderAttachments() {
+  attachBar.innerHTML = ''
+  attachments.forEach((url, i) => {
+    const wrap = document.createElement('div'); wrap.className = 'attach-thumb'
+    const img = document.createElement('img'); img.src = url
+    const size = document.createElement('span'); size.textContent = Math.round(url.length * 3 / 4 / 1024) + ' KB'
+    const del = document.createElement('button'); del.textContent = '×'
+    del.onclick = () => { attachments.splice(i, 1); renderAttachments() }
+    wrap.append(img, size, del)
+    attachBar.appendChild(wrap)
+  })
+}
+/** content 可能是字符串，也可能是 parts 数组（带图）。 */
+function renderContent(el, content) {
+  if (!Array.isArray(content)) { el.textContent = String(content ?? ''); return }
+  el.textContent = content.filter(p => p.type === 'text').map(p => p.text).join('\n')
+  for (const p of content) {
+    if (p.type !== 'image_url') continue
+    const img = document.createElement('img'); img.className = 'inline-image'; img.src = p.image_url.url
+    el.appendChild(img)
+  }
+}
+function contentPreview(content) {
+  return Array.isArray(content) ? content.map(p => (p.type === 'text' ? p.text : '[图片]')).join(' ') : String(content || '')
+}
+
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } })
 
 async function send(followup = false) {
   const msg = followup ? '' : input.value.trim()
-  if ((!followup && !msg) || sending) return
-  if (!followup) input.value = ''
+  if ((!followup && !msg && attachments.length === 0) || sending) return
+  const message = !followup && attachments.length > 0
+    ? [{ type: 'text', text: msg || '请看图。' }, ...attachments.map(url => ({ type: 'image_url', image_url: { url } }))]
+    : msg
+  if (!followup) { input.value = ''; attachments = []; renderAttachments() }
   sending = true
   sendBtn.disabled = true
   // 一轮对话里后台 agent 的进展不走 delta 通道 —— 不轮询的话面板要等整轮结束才动。
   startSubagentPolling()
 
-  if (!followup) addMsg('user', msg)
+  if (!followup) renderContent(addMsg('user', ''), message)
   let assistantEl = null
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, followup }),
+      body: JSON.stringify({ message, followup }),
     })
 
     if (!res.ok) throw new Error(await res.text())
@@ -377,9 +435,15 @@ async function send(followup = false) {
             case 'tool_start':
               addMsg('tool', `🔧 调用工具: ${event.name}`)
               break
-            case 'tool_end':
-              addMsg('tool', `✅ ${event.name} → ${event.result}`)
+            case 'tool_end': {
+              const el = addMsg('tool', `✅ ${event.name} → `)
+              if (event.result && event.result.type === 'content_result') {
+                const body = document.createElement('div'); renderContent(body, event.result.parts); el.appendChild(body)
+              } else {
+                el.textContent += event.result
+              }
               break
+            }
             case 'phase':
               addMsg('phase', `📋 ${event.message}`)
               break
@@ -685,7 +749,7 @@ function renderContextSnapshot(context) {
   const counts = context.counts
   const visible = context.tracks?.visible || []
   const artifacts = context.tracks?.artifacts || []
-  const latestVisible = visible.slice(-2).map(m => `${m.role}: ${String(m.content || '').slice(0, 40)}`).join('\n')
+  const latestVisible = visible.slice(-2).map(m => `${m.role}: ${contentPreview(m.content).slice(0, 40)}`).join('\n')
   addMsg(
     'context',
     '🧠 RuntimeHistory 轨道快照\n' +
