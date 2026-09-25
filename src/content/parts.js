@@ -74,11 +74,17 @@ function normalizePart(part, partIndex, maxImageBytes) {
   if (parsed.base64.length === 0 || parsed.base64.length % 4 !== 0 || !BASE64_RE.test(parsed.base64)) {
     throw new InvalidContentError({ code: 'bad_base64', partIndex })
   }
+  // 头只是声明，魔数才是事实：非图字节挂在 image/png 头下能过上面几关，存进 memory 后
+  // 每一轮都被供应商拒绝 —— 正是入口闸要防的永久毒化。类型不符时以魔数为准（§1.1）。
+  const sniffed = sniffMediaType(decodeBase64Prefix(parsed.base64, 64))
+  if (!sniffed || !SUPPORTED_IMAGE_TYPES.includes(sniffed)) {
+    throw new InvalidContentError({ code: 'unsupported_media_type', partIndex, mediaType: sniffed ?? parsed.mediaType })
+  }
   const bytes = base64ByteLength(parsed.base64)
   if (bytes > maxImageBytes) {
     throw new InvalidContentError({ code: 'image_too_large', partIndex, bytes, maxBytes: maxImageBytes })
   }
-  const canonical = `data:${parsed.mediaType};base64,`
+  const canonical = `data:${sniffed};base64,`
   return imageUrlPart(url.startsWith(canonical) ? url : canonical + parsed.base64, detail)
 }
 

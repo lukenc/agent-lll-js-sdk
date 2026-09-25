@@ -54,6 +54,19 @@ describe('normalizeContent', () => {
       assert.throws(() => normalizeContent(content), e => e instanceof InvalidContentError && e.code === code && e.partIndex === 0)
     })
   }
+  it('rejects non-image bytes under an image header (magic bytes are checked, not just the header)', () => {
+    const notImage = Buffer.from('hello world!').toString('base64')
+    assert.throws(
+      () => normalizeContent([{ type: 'text', text: 'x' }, img(`data:image/png;base64,${notImage}`)]),
+      e => e instanceof InvalidContentError && e.code === 'unsupported_media_type' && e.partIndex === 1
+        && e.mediaType === 'image/png' && !e.message.includes(notImage),
+    )
+  })
+  it('magic bytes win over the declared type: JPEG bytes declared as image/png get a jpeg header', () => {
+    const jpegB64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]).toString('base64')
+    const [part] = normalizeContent([img(`data:image/png;base64,${jpegB64}`, { detail: 'low' })])
+    assert.deepEqual(part, img(`data:image/jpeg;base64,${jpegB64}`, { detail: 'low' }))
+  })
   it('enforces maxImageBytes and reports the offending index without echoing data', () => {
     assert.throws(
       () => normalizeContent([{ type: 'text', text: 'x' }, img(PNG_URL)], { maxImageBytes: 10 }),
