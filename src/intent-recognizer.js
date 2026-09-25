@@ -9,6 +9,7 @@
 
 import { syncChat } from './llm-client.js'
 import { childContext } from './telemetry.js'
+import { contentText } from './content/parts.js'
 
 /**
  * @typedef {object} IntentResult
@@ -59,10 +60,9 @@ function sanitizeHistoryForIntent(history) {
   return history.filter(m =>
     m
     && (m.role === 'user' || m.role === 'assistant')
-    && typeof m.content === 'string'
-    && m.content.length > 0
     && !m.tool_calls,
-  ).map(m => ({ role: m.role, content: m.content }))
+  ).map(m => ({ role: m.role, content: contentText(m.content) }))
+    .filter(m => m.content.length > 0)
 }
 
 export class IntentRecognizer {
@@ -102,6 +102,8 @@ export class IntentRecognizer {
       opts = { signal: opts }
     }
     const { history = [], maxHistoryMessages = 12, signal, telemetry = null } = opts
+    // 宿主也可能直接传 content parts；sidecar 只收文本。
+    userMessage = typeof userMessage === 'string' ? userMessage : contentText(userMessage)
 
     try {
       const toolList = availableToolNames.join(', ')

@@ -6,6 +6,8 @@
  * 这是"找回记忆"的实现基础，也是 subagent 不必继承父上下文的前提。
  */
 
+import { contentText } from '../content/parts.js'
+
 export const SNIPPET_RADIUS = 120
 export const MAX_SNIPPET = 400
 export const DEFAULT_LIMIT = 20
@@ -16,7 +18,8 @@ function searchableText(event) {
   if (event.type === 'summary') return String(event.content ?? '')
   const msg = event.message
   if (!msg) return ''
-  const parts = [String(msg.content ?? '')]
+  // 文本投影：对几 MB 的 base64 做全文检索既无意义又慢。
+  const parts = [contentText(msg.content)]
   if (msg.name) parts.push(String(msg.name))
   if (Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {

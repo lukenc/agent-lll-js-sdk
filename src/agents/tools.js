@@ -9,6 +9,7 @@ import {
 import { modelEnum } from './models.js'
 import { searchHistory, getHistoryEvent } from './history-search.js'
 import { cancelHandle } from './runner.js'
+import { contentText } from '../content/parts.js'
 
 export const SUBAGENT_TOOL_NAMES = [
   'agent', 'agent_status', 'agent_cancel',
@@ -532,7 +533,8 @@ export function createSubagentTools(runtime) {
         const got = getHistoryEvent(runtime.sharedHistory, { eventId, before, after })
         if (!got) return `Error: event "${eventId}" not found.`
         const render = (e) => {
-          const body = e.type === 'summary' ? e.content : (e.message?.content ?? '')
+          // 数组原样拼进字符串会得到 [object Object]；JSON 化则会把 base64 带进模型上下文。
+          const body = e.type === 'summary' ? e.content : contentText(e.message?.content)
           const role = e.type === 'summary' ? 'summary' : (e.message?.role ?? '?')
           return `[${e.id}] ${role}: ${body}`
         }

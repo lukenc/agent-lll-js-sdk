@@ -6,6 +6,7 @@
 
 import { syncChat } from '../llm-client.js'
 import { childContext } from '../telemetry.js'
+import { contentText } from '../content/parts.js'
 
 const SYSTEM_PROMPT_TEMPLATE =
   'You are a skill selector. Given a user message and a list of skills, ' +
@@ -36,6 +37,7 @@ export class SkillFilter {
    */
   async filter(userMessage, skills, { topK = 20, signal, telemetry = null } = {}) {
     try {
+      const userText = typeof userMessage === 'string' ? userMessage : contentText(userMessage)
       const listing = skills.map(s => `- ${s.name}: ${s.description}`).join('\n')
       const systemPrompt = SYSTEM_PROMPT_TEMPLATE
         .replace('%TOPK%', String(topK))
@@ -48,7 +50,7 @@ export class SkillFilter {
           model: this.model,
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
+            { role: 'user', content: userText },
           ],
           temperature: 0,
         },

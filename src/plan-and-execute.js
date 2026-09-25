@@ -798,10 +798,9 @@ function sanitizeHistory(history) {
   return history.filter(m =>
     m
     && (m.role === 'user' || m.role === 'assistant')
-    && typeof m.content === 'string'
-    && m.content.length > 0
     && !m.tool_calls,
-  ).map(m => ({ role: m.role, content: m.content }))
+  ).map(m => ({ role: m.role, content: contentText(m.content) }))
+    .filter(m => m.content.length > 0)
 }
 
 function truncate(text, maxLen) {

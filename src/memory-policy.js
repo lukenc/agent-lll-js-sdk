@@ -1,4 +1,5 @@
 import { DEFAULT_IMAGE_PRICING } from './content/image-tokens.js'
+import { contentText } from './content/parts.js'
 
 const CHARS_PER_TOKEN = 4
 
@@ -165,7 +166,8 @@ export class SummaryPolicy {
       ? `[Previous summary]\n${previousSummary}\n\n[New messages]\n`
       : ''
     const text = prevBlock + toSummarize
-      .map(event => `[${event.message.role}]: ${event.message.content ?? ''}`)
+      // 文本投影：摘要走简单模型、本就只收文本；图片压缩后只剩占位，这是接受的信息损失。
+      .map(event => `[${event.message.role}]: ${contentText(event.message.content)}`)
       .join('\n')
     return {
       text,
