@@ -118,7 +118,7 @@ export function normalizeCallToolResult(result, rawToolName) {
   const content = result?.content
   if (Array.isArray(content) && content.some(isWireImage)) {
     return contentResult(content.map(part => isWireImage(part)
-      ? { type: 'image_url', image_url: { url: `data:${part.mimeType.toLowerCase()};base64,${part.data}` } }
+      ? { type: 'image_url', image_url: { url: `data:${String(part.mimeType).toLowerCase()};base64,${part.data}` } }
       : { type: 'text', text: renderContentPart(part) }))
   }
   return body

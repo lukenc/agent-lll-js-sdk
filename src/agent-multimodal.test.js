@@ -222,6 +222,15 @@ describe('Agent multimodal: entry', () => {
     assert.throws(() => makeAgent({ imageTokenEstimator: 'nope' }), TypeError)
   })
 
+  it('vision / simpleVision must be booleans when given (undefined keeps the defaults)', () => {
+    for (const bad of ['true', 1, null, {}]) {
+      assert.throws(() => makeAgent({ vision: bad }), TypeError)
+      assert.throws(() => makeAgent({ simpleVision: bad }), TypeError)
+    }
+    assert.equal(makeAgent({ vision: undefined }).vision, false)
+    assert.equal(makeAgent({ vision: false, simpleVision: true }).simpleVision, true)
+  })
+
   it('simpleVision defaults to vision when no simple model is configured, else false', () => {
     assert.equal(makeAgent({ vision: true }).simpleVision, true)
     assert.equal(makeAgent({ vision: true, simpleModel: 'cheap' }).simpleVision, false)

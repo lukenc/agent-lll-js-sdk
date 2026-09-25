@@ -44,6 +44,10 @@ describe('createImagePricing', () => {
     assert.equal(createImagePricing({ estimator: (w, h) => w + h }).imageTokens(img(pngUrl(3, 4))), 7)
     assert.equal(createImagePricing({ estimator: () => NaN, unknownTokens: 5 }).imageTokens(img(pngUrl(3, 4))), 5)
   })
+  it('a throwing host estimator falls back to unknownTokens instead of aborting the run', () => {
+    const pricing = createImagePricing({ estimator: () => { throw new Error('boom') }, unknownTokens: 6 })
+    assert.equal(pricing.imageTokens(img(pngUrl(3, 4))), 6)
+  })
   it('rejects bad configuration at construction', () => {
     assert.throws(() => createImagePricing({ estimator: 'nope' }), TypeError)
     assert.throws(() => createImagePricing({ unknownTokens: -1 }), TypeError)
@@ -63,6 +67,10 @@ describe('estimateMessageTokens with content parts', () => {
     const msg = { role: 'user', content: [{ type: 'text', text: 'abcd' }, img(pngUrl(10, 10))] }
     // text 1+4, image 100+4, message 4+4
     assert.equal(estimateMessageTokens(msg, { imageTokens: () => 100 }), 117)
+  })
+  it('null pricing falls back to the default pricing', () => {
+    const msg = { role: 'user', content: [img(pngUrl(640, 480))] }
+    assert.equal(estimateMessageTokens(msg, null), estimateMessageTokens(msg))
   })
   it('base64 is never priced as text: a ~1 MB image costs its formula price', () => {
     const msg = { role: 'user', content: [img(pngUrl(640, 480, 1_000_000))] }

@@ -64,7 +64,13 @@ export function createImagePricing({ estimator = 'mimo', unknownTokens = DEFAULT
     imageTokens(part) {
       const meta = imageMeta(part?.image_url?.url)
       if (!meta.width || !meta.height) return unknownTokens
-      const n = fn(meta.width, meta.height, part.image_url.detail)
+      // 宿主估算器抛错不能冒泡进 assemblePrompt 把整轮打断 —— 计价只是估算，兜底值即可。
+      let n
+      try {
+        n = fn(meta.width, meta.height, part.image_url.detail)
+      } catch {
+        return unknownTokens
+      }
       return Number.isFinite(n) && n >= 0 ? Math.ceil(n) : unknownTokens
     },
   }

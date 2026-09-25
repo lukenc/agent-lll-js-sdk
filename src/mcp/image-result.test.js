@@ -21,6 +21,10 @@ describe('normalizeCallToolResult with image parts', () => {
       { type: 'text', text: '[mcp:audio mimeType=audio/wav]' },
     ])
   })
+  it('a non-string mimeType that stringifies to a whitelisted type does not throw', () => {
+    const r = normalizeCallToolResult({ content: [{ type: 'image', mimeType: { toString: () => 'image/PNG' }, data: PNG_B64 }] }, 'raw')
+    assert.deepEqual(r.parts, [{ type: 'image_url', image_url: { url: `data:image/png;base64,${PNG_B64}` } }])
+  })
   it('non-whitelisted images keep the legacy placeholder and the result stays a string', () => {
     assert.equal(
       normalizeCallToolResult({ content: [{ type: 'image', mimeType: 'image/svg+xml', data: 'x' }] }, 'raw'),

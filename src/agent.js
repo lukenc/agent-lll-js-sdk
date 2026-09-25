@@ -397,6 +397,9 @@ export class Agent {
 
     // ---- 多模态（图片输入）----
     // 必须早于 `opts.subagents`：子 Agent 的模型别名在 runtime 构造时就读 vision / simpleVision。
+    for (const key of ['vision', 'simpleVision']) {
+      if (opts[key] !== undefined && typeof opts[key] !== 'boolean') throw new TypeError(`${key} must be a boolean`)
+    }
     this.vision = opts.vision === true
     this.simpleVision = opts.simpleVision ?? (hasSimpleConfig ? false : this.vision)
     this.imageLimits = normalizeImageLimits(opts.imageLimits)
