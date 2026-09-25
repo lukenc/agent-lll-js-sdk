@@ -8,7 +8,7 @@
 
 ## 目录
 
-- [安装](#安装) · [快速开始](#快速开始) · [流式对话](#流式对话) · [架构](#架构)
+- [安装](#安装) · [快速开始](#快速开始) · [多模态（图片输入）](#多模态图片输入) · [流式对话](#流式对话) · [架构](#架构)
 - **核心模块**：[Agent 配置](#agent) · [Hooks](#hooks) · [IntentRecognizer](#intentrecognizer) ·
   [KnowledgeBase](#knowledgebase) · [ContextManager](#contextmanager) ·
   [Memory 策略](#memory-策略) · [RuntimeHistory 与轨道](#runtimehistory-与轨道) ·
@@ -79,6 +79,38 @@ const agent = new Agent({
 
 const reply = await agent.chat('分析项目架构并找出潜在问题')
 ```
+
+## 多模态（图片输入）
+
+模型能看图时，构造 Agent 传 `vision: true`，消息改用 OpenAI content parts：
+
+```js
+import { Agent, imagePart } from 'lll-web-agent'
+import { readFile } from 'node:fs/promises'
+
+const agent = new Agent({ provider: 'xiaomi', apiKey: process.env.MIMO_API_KEY, model: 'mimo-v2.5', vision: true })
+const answer = await agent.chat([
+  { type: 'text', text: '这张图里有什么？' },
+  imagePart(await readFile('photo.png')),        // 也接受 data URL、https URL、裸 base64
+])
+```
+
+工具返回图片用 `contentResult` 包装（直接返回数组仍按旧规则 JSON 化）：
+
+```js
+import { defineTool, contentResult, imagePart } from 'lll-web-agent'
+
+const screenshot = defineTool({
+  name: 'screenshot', description: '截取当前页面', parameters: { type: 'object', properties: {} },
+  execute: async () => contentResult([{ type: 'text', text: '截图完成' }, imagePart(pngBytes)]),
+})
+```
+
+- `vision` 默认 `false`：带图的用户消息在写入 memory 之前抛 `UnsupportedContentError`；工具返回的图以 `unsupported_content` 工具级失败，run 继续。
+- 历史里的图全部保留；单次请求超过 `imageLimits`（默认 20 张 / 20 MiB）时按批卸载最老的图，替换成文字占位。
+- 摘要、意图识别等只收文本，看到的是 `[image png 1024×768 #a1b2c3d4]` 这样的占位。
+- `plan_and_execute` 策略本版不支持图片。
+- 完整示例：`examples/multimodal.js`；机制说明：[docs/design/multimodal.md](docs/design/multimodal.md)。
 
 ## 流式对话
 

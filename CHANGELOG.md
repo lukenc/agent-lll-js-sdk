@@ -6,6 +6,11 @@
 
 ### 新增
 
+- **多模态（图片输入）** —— `new Agent({ vision: true })` 后 `chat()` / `stream()` 接受 OpenAI
+  content parts；工具用 `contentResult([...])` 返回图片；新导出 `imagePart`、`contentResult`、
+  `isContentResult`、`contentText`、`UnsupportedContentError`、`InvalidContentError`；新选项
+  `simpleVision`、`imageLimits`、`maxImageBytes`、`imageTokenEstimator`、`unknownImageTokens`；
+  新供应商 `xiaomi`（小米 MiMo）。见 `docs/design/multimodal.md`。
 - **`Agent#followup(opts?)`** —— 把积压的待投递通知跑成一轮。对应 dsh 的
   `followup(message)`（`packages/agent/continuation.ts:1664-1673`：空闲的父 agent 得到
   一次普通轮次）。**队列为空时返回 `null` 且不发任何请求** —— 空转一次 LLM 调用是纯烧
@@ -44,6 +49,15 @@
   `{ spent, budget, pendingAgents, pendingNodes, inFlight }`。`inFlight` 是全部在飞
   handle 的 `toStatus()` 快照（无函数字段、无 apiKey），它是宿主决定"要不要关、要不要
   告诉用户"的唯一依据；`pendingNodes` 跨**全部**图（含 closed），与超时提示同一口径。
+
+### 行为变更
+
+- **MCP 工具返回 png/jpeg/webp/gif 图片时**，结果从 `[mcp:image mimeType=…]` 占位字符串变为
+  `contentResult`。`vision: false` 的 Agent 上这次工具调用会以 `unsupported_content` 失败
+  （此前模型只看到占位文字）。宿主若依赖旧行为，需开启 `vision` 或不挂载返回图片的 MCP 工具。
+- 流式 `tool_end.result` 与 `hooks.afterToolCall` 的 `result` 在工具返回图片时是 contentResult
+  对象（`{ type: 'content_result', parts }`），不再一定是字符串。
+- `tool.call` 事件的 `bytes` 对带图结果只计文本部分，并新增可选字段 `imageCount`。
 
 ### 变更
 
