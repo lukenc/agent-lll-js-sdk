@@ -1,7 +1,8 @@
 /**
  * 出站投影 —— 只作用于本次请求的副本，永不修改 memory。
  *
- *   A. projectHistoryImages：计价/裁剪**之前**。文本投影兜底 + 超限按量子卸载最老的图。
+ *   A. projectHistoryImages：计价/裁剪**之前**。文本投影兜底 + 超限按量子卸载最老的图
+ *      （本轮 —— 最后一条最终 assistant 之后 —— 的图受保护）。
  *      必须先于计价：计价看到的必须就是实际发出的东西。
  *   B. toWireMessages：组装完成、写进 body 之前。tool 消息里的图拆成随后的一条 user 消息
  *      （OpenAI chat completions 的 tool 消息只收文本）。
@@ -67,6 +68,21 @@ function inlineLength(part) {
   return typeof url === 'string' && url.startsWith('data:') ? url.length : 0
 }
 
+/**
+ * 一条内容**自己**的图是否就超出单请求上限（口径同卸载：data URL 字符数，公网 URL 计 0 字节）。
+ * 入口据此拒绝"永远发不出去"的内容 —— 否则它会被收下，再在携带它的那次请求里被卸载。
+ *
+ * @param {string|object[]} content 一条消息 / 一个工具结果的内容
+ * @param {{ maxImages: number, maxBytes: number }} imageLimits
+ * @returns {null | { images: number, bytes: number }}
+ */
+export function imagesExceedLimits(content, imageLimits = DEFAULT_IMAGE_LIMITS) {
+  const images = imageParts(content)
+  if (images.length === 0) return null
+  const bytes = images.reduce((sum, p) => sum + inlineLength(p), 0)
+  return images.length > imageLimits.maxImages || bytes > imageLimits.maxBytes ? { images: images.length, bytes } : null
+}
+
 function replaceOldestImages(messages, count, placeholder) {
   let remaining = count
   return messages.map((m) => {
@@ -97,9 +113,26 @@ export function projectHistoryImages(messages, { vision, imageLimits = DEFAULT_I
   }
   const lengths = []
   for (const m of messages) for (const p of imageParts(m?.content)) lengths.push(inlineLength(p))
-  const count = offloadedPrefixCount(lengths, imageLimits)
+  // 量子计算仍覆盖**全部**图（对齐 dsh，前缀稳定性不变），再封顶到"旧图"数：最后一条
+  // 最终 assistant（无 tool_calls）之后是本轮 —— 用户刚发的图、本轮工具回灌的图 ——
+  // 绝不能在携带它的那次请求里被换成占位。图按顺序排列，封顶后的前缀碰不到本轮。
+  const count = Math.min(offloadedPrefixCount(lengths, imageLimits), oldImageCount(messages))
   if (count === 0) return messages
   return replaceOldestImages(messages, count, meta => `[image omitted to fit request image limits; ${describeImage(meta)}]`)
+}
+
+function oldImageCount(messages) {
+  let boundary = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role === 'assistant' && !(Array.isArray(m.tool_calls) && m.tool_calls.length > 0)) {
+      boundary = i
+      break
+    }
+  }
+  let n = 0
+  for (let i = 0; i <= boundary; i++) n += imageParts(messages[i]?.content).length
+  return n
 }
 
 /**

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fc from 'fast-check'
 import {
   DEFAULT_IMAGE_LIMITS, normalizeImageLimits, offloadedPrefixCount,
-  projectHistoryImages, toWireMessages, TOOL_IMAGE_LABEL,
+  projectHistoryImages, toWireMessages, TOOL_IMAGE_LABEL, imagesExceedLimits,
 } from './projection.js'
 import { UnsupportedContentError } from './errors.js'
 
@@ -102,14 +102,62 @@ describe('projectHistoryImages', () => {
       userImg('one', a),
       { role: 'assistant', content: null, tool_calls: [{ id: 't', type: 'function', function: { name: 'f', arguments: '{}' } }] },
       { role: 'tool', tool_call_id: 't', content: [{ type: 'text', text: 'r' }, img(b)] },
+      { role: 'assistant', content: 'done' },
       userImg('three', c),
     ]
     const snapshot = JSON.stringify(msgs)
     const out = projectHistoryImages(msgs, { vision: true, imageLimits: normalizeImageLimits({ maxImages: 2, countQuantum: 1 }) })
     assert.match(out[0].content, /^one\n\[image omitted to fit request image limits; png 10×10 #/)
     assert.equal(out[2], msgs[2])
-    assert.equal(out[3], msgs[3])
+    assert.equal(out[4], msgs[4])
     assert.equal(JSON.stringify(msgs), snapshot, 'input is never mutated')
+  })
+  it('the current turn (after the last final assistant) is never offloaded from its own request', () => {
+    const limits = normalizeImageLimits({ maxImages: 1, countQuantum: 1 })
+    const done = [userImg('one', a), { role: 'assistant', content: 'seen' }, userImg('two', b)]
+    const out = projectHistoryImages(done, { vision: true, imageLimits: limits })
+    assert.match(out[0].content, /^one\n\[image omitted to fit request image limits; png 10×10 #/)
+    assert.equal(out[2], done[2])
+
+    // 还没有任何"最终" assistant：整段都是本轮，一张都不卸
+    const inTurn = [
+      userImg('one', a),
+      { role: 'assistant', content: null, tool_calls: [{ id: 't', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 't', content: [{ type: 'text', text: 'r' }, img(b)] },
+    ]
+    assert.equal(projectHistoryImages(inTurn, { vision: true, imageLimits: limits }), inTurn)
+
+    // tool_calls 为空数组的 assistant 也算最终回复
+    const emptyCalls = [userImg('one', a), { role: 'assistant', content: 'x', tool_calls: [] }, userImg('two', b)]
+    assert.match(projectHistoryImages(emptyCalls, { vision: true, imageLimits: limits })[0].content, /image omitted to fit/)
+  })
+  it('the quantum count is capped at the old images, never reaching the protected tail', () => {
+    // countQuantum 2 会要求卸掉 2 张，但边界之前只有 1 张旧图
+    const limits = normalizeImageLimits({ maxImages: 2, countQuantum: 2 })
+    const msgs = [userImg('one', a), { role: 'assistant', content: 'seen' }, userImg('two', b, c)]
+    const out = projectHistoryImages(msgs, { vision: true, imageLimits: limits })
+    assert.match(out[0].content, /image omitted to fit/)
+    assert.equal(out[2], msgs[2])
+  })
+})
+
+describe('imagesExceedLimits', () => {
+  const a = pngUrl(10, 10)
+  it('null when one content array fits both limits (or has no images)', () => {
+    const limits = normalizeImageLimits({ maxImages: 2, maxBytes: 1000 })
+    assert.equal(imagesExceedLimits('text', limits), null)
+    assert.equal(imagesExceedLimits([{ type: 'text', text: 'x' }, img(a), img(a)], limits), null)
+  })
+  it('reports image count and data-URL bytes when either limit is exceeded; URLs count 0 bytes', () => {
+    assert.deepEqual(
+      imagesExceedLimits([img(a), img('https://x/y.png')], normalizeImageLimits({ maxImages: 1 })),
+      { images: 2, bytes: a.length },
+    )
+    assert.deepEqual(
+      imagesExceedLimits([img(a)], normalizeImageLimits({ maxBytes: a.length - 1 })),
+      { images: 1, bytes: a.length },
+    )
+    assert.equal(imagesExceedLimits([img(a)], normalizeImageLimits({ maxBytes: a.length })), null)
   })
 })
 

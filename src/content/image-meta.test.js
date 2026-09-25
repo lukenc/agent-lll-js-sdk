@@ -162,4 +162,13 @@ describe('content errors: whitelisted scalar fields only', () => {
     assert.ok(!evil.message.includes('SECRET'))
     assert.equal(new InvalidContentError({ code: 'unsupported_media_type', partIndex: 0, mediaType: 'image/svg+xml' }).mediaType, 'image/svg+xml')
   })
+  it('InvalidContentError exceeds_image_limits carries whitelisted counts only', () => {
+    const e = new InvalidContentError({ code: 'exceeds_image_limits', images: 3, maxImages: 2, bytes: 900, maxBytes: 800, url: 'data:image/png;base64,SECRET' })
+    assert.deepEqual([e.code, e.images, e.maxImages, e.bytes, e.maxBytes], ['exceeds_image_limits', 3, 2, 900, 800])
+    assert.equal(e.message,
+      'Images in this content (3 images, 900 bytes as data URLs) exceed the per-request image limits (2 images, 800 bytes); lower maxImageBytes or raise imageLimits.')
+    assert.equal(e.url, undefined)
+    assert.ok(!e.message.includes('SECRET'))
+    assert.equal(new InvalidContentError({ code: 'exceeds_image_limits', images: -1, maxImages: 1.5 }).images, undefined)
+  })
 })

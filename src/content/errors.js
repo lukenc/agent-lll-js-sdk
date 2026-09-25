@@ -1,6 +1,6 @@
 /**
  * 多模态内容的错误类。构造函数只接收白名单标量字段(code / role / partIndex /
- * mediaType / bytes / maxBytes),绝不接收原始 part 或 URL —— data URL 动辄几 MB,
+ * mediaType / bytes / maxBytes / images / maxImages),绝不接收原始 part 或 URL —— data URL 动辄几 MB,
  * 又是用户数据,不能进 err.message。与 src/mcp/errors.js、src/skills/errors.js 同款设计。
  */
 
@@ -44,15 +44,20 @@ const INVALID_MESSAGES = {
   image_too_large: ({ partIndex, bytes, maxBytes }) =>
     `Image part ${at(partIndex)} is ${bytes ?? '?'} bytes, above the ${maxBytes ?? '?'}-byte limit.`,
   bad_base64: ({ partIndex }) => `Image part ${at(partIndex)} is not valid base64.`,
+  exceeds_image_limits: ({ images, bytes, maxImages, maxBytes }) =>
+    `Images in this content (${images ?? '?'} images, ${bytes ?? '?'} bytes as data URLs) exceed the per-request image limits `
+    + `(${maxImages ?? '?'} images, ${maxBytes ?? '?'} bytes); lower maxImageBytes or raise imageLimits.`,
 }
 
 export class InvalidContentError extends Error {
-  constructor({ code, partIndex, mediaType, bytes, maxBytes } = {}) {
+  constructor({ code, partIndex, mediaType, bytes, maxBytes, images, maxImages } = {}) {
     const fields = {
       partIndex: safeInt(partIndex),
       mediaType: safeMediaType(mediaType),
       bytes: safeInt(bytes),
       maxBytes: safeInt(maxBytes),
+      images: safeInt(images),
+      maxImages: safeInt(maxImages),
     }
     const render = INVALID_MESSAGES[code]
     super(render ? render(fields) : 'Invalid content.')

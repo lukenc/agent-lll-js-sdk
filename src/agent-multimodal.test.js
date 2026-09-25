@@ -99,6 +99,38 @@ describe('Agent multimodal: entry', () => {
     await assert.rejects(agent.chat(withImage('big')), e => e.code === 'image_too_large')
   })
 
+  it('a message whose own images can never fit imageLimits is rejected at the entry, before memory.add', async () => {
+    const url = PNG.image_url.url
+    const agent = makeAgent({ vision: true, imageLimits: { maxBytes: url.length - 1 } })
+    await assert.rejects(agent.chat(withImage('too big for any request')), e => e instanceof InvalidContentError
+      && e.code === 'exceeds_image_limits' && e.images === 1 && e.bytes === url.length && e.maxBytes === url.length - 1
+      && e.maxImages === 20 && !e.message.includes(url.split(',')[1]))
+    assert.equal(requests.length, 0)
+    assert.equal((await nonSystem(agent)).length, 0)
+
+    const twoImages = makeAgent({ vision: true, imageLimits: { maxImages: 1 } })
+    await assert.rejects(twoImages.chat([{ type: 'text', text: 'two' }, PNG, PNG2]),
+      e => e.code === 'exceeds_image_limits' && e.images === 2 && e.maxImages === 1)
+    assert.equal((await nonSystem(twoImages)).length, 0)
+  })
+
+  it('[ContextManager path] an offloaded old image is priced as placeholder text, not as an image', async () => {
+    const agent = makeAgent({
+      vision: true, tokenBudget: defaultTokenBudget(), imageLimits: { maxImages: 1 }, imageTokenEstimator: () => 5000,
+    })
+    const assembled = []
+    agent.on('context.assembled', p => assembled.push(p))
+    reply('first')
+    await agent.chat(withImage('one'))
+    reply('second')
+    await agent.chat(withImage('two', PNG2))
+    assert.equal(assembled.length, 2)
+    // 第二轮：第一张图已卸载 → 只剩 PNG2 按 5000 计价；若先计价后卸载，会 ≥ 10000
+    const second = assembled[1].historyTokens
+    assert.ok(second >= 5000 && second < 10000, `historyTokens=${second}`)
+    assert.ok(JSON.stringify(requests[1]).includes('image omitted to fit request image limits'))
+  })
+
   it('vision:true (simple path) sends the image and stores the array in memory', async () => {
     const agent = makeAgent({ vision: true })
     reply('a dog')
@@ -261,6 +293,25 @@ describe('Agent multimodal: tool results', () => {
     toolRound('render'); reply('ok')
     await agent.chat('draw')
     assert.equal(calls[0].errorKind, 'invalid_content')
+  })
+
+  it('a tool result whose images exceed imageLimits → invalid_content, onError fires, run completes', async () => {
+    const calls = []
+    const errors = []
+    const agent = makeAgent({
+      vision: true, imageLimits: { maxImages: 1 },
+      tools: [chartTool(contentResult([{ type: 'text', text: 'two charts' }, PNG, PNG2]))],
+      hooks: { onError: e => errors.push(e) },
+    })
+    agent.on('tool.call', p => calls.push(p))
+    toolRound('render'); reply('ok')
+    assert.equal(await agent.chat('draw'), 'ok')
+    assert.equal(calls[0].ok, false)
+    assert.equal(calls[0].errorKind, 'invalid_content')
+    assert.ok(errors.some(e => e instanceof InvalidContentError && e.code === 'exceeds_image_limits'))
+    const tool = requests[1].messages.find(m => m.role === 'tool')
+    assert.match(tool.content, /^Error: Tool "render" returned invalid content: Images in this content \(2 images/)
+    assert.ok(!JSON.stringify(requests[1]).includes('image_url'))
   })
 
   it('[Review Focus 4] a plain JSON array result is still JSON-stringified', async () => {

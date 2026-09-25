@@ -45,9 +45,9 @@ import { applySkillArgs } from './skills/model.js'
 import { createSubagentRuntime } from './agents/runtime.js'
 import { SUBAGENT_TOOL_NAMES } from './agents/tools.js'
 import {
-  normalizeContent, hasImage, contentText, UnsupportedContentError, projectHistoryImages,
+  normalizeContent, hasImage, contentText, UnsupportedContentError, InvalidContentError, projectHistoryImages,
   toWireMessages, normalizeImageLimits, normalizeMaxImageBytes, createImagePricing, estimatorForUrl,
-  contentResult, isContentResult, partsText, imageParts, toolResultText,
+  contentResult, isContentResult, partsText, imageParts, toolResultText, imagesExceedLimits,
 } from './content/index.js'
 // 一次轮边界排空时，超过这个条数的待注入消息会被合并为一条 —— 连续多条 user
 // 消息会被部分供应商拒绝。常量的家在 `agents/mailbox.js`：它是注入契约的一部分，
@@ -1845,8 +1845,23 @@ export class Agent {
     if (hasImage(content)) {
       if (!this.vision) throw new UnsupportedContentError({ code: 'vision_disabled' })
       if (this.strategy === 'plan_and_execute') throw new UnsupportedContentError({ code: 'plan_and_execute' })
+      this._assertFitsImageLimits(content)
     }
     return content
+  }
+
+  /**
+   * 一条内容自己的图就超出单请求上限 → 抛 InvalidContentError(exceeds_image_limits)。
+   * 收下它毫无意义：出站投影只会在携带它的那次请求里就把它换成卸载占位。
+   */
+  _assertFitsImageLimits(content) {
+    const over = imagesExceedLimits(content, this.imageLimits)
+    if (over) {
+      throw new InvalidContentError({
+        code: 'exceeds_image_limits', images: over.images, bytes: over.bytes,
+        maxImages: this.imageLimits.maxImages, maxBytes: this.imageLimits.maxBytes,
+      })
+    }
   }
 
   /** 出站投影 A：计价/裁剪之前。只作用于本次请求的副本。 */
@@ -1866,18 +1881,28 @@ export class Agent {
    */
   _admitToolResult(result, errorKind, ctx) {
     if (errorKind !== undefined || !isContentResult(result)) return { result, errorKind }
+    const invalid = (err) => {
+      this._safeHook('onError', err, ctx)
+      return { result: `Error: Tool "${ctx.toolName}" returned invalid content: ${err.message}`, errorKind: 'invalid_content' }
+    }
     let content
     try {
       content = normalizeContent(Array.isArray(result.parts) ? result.parts : [], { maxImageBytes: this.maxImageBytes })
     } catch (err) {
-      this._safeHook('onError', err, ctx)
-      return { result: `Error: Tool "${ctx.toolName}" returned invalid content: ${err.message}`, errorKind: 'invalid_content' }
+      return invalid(err)
     }
     if (hasImage(content) && !this.vision) {
       this._safeHook('onError', new UnsupportedContentError({ code: 'vision_disabled' }), ctx)
       return {
         result: `Error: Tool "${ctx.toolName}" returned image content, but the model does not accept image input (vision is disabled).`,
         errorKind: 'unsupported_content',
+      }
+    }
+    if (hasImage(content)) {
+      try {
+        this._assertFitsImageLimits(content)
+      } catch (err) {
+        return invalid(err)
       }
     }
     return { result: hasImage(content) ? contentResult(content) : content, errorKind }

@@ -14,5 +14,5 @@ export {
 } from './image-tokens.js'
 export {
   DEFAULT_IMAGE_LIMITS, normalizeImageLimits, offloadedPrefixCount,
-  projectHistoryImages, toWireMessages, TOOL_IMAGE_LABEL,
+  projectHistoryImages, toWireMessages, TOOL_IMAGE_LABEL, imagesExceedLimits,
 } from './projection.js'
