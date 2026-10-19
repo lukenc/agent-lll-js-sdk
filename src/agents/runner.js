@@ -84,20 +84,19 @@ export const FLOOR_TOOLS = new Set([
 /**
  * 单次 attempt 截止时间的默认值（毫秒）—— 10 分钟。
  *
- * 这个数不是新拍的：`docs/superpowers/plans/2026-07-30-subagent-system.md` 当初写的
- * 就是 `retry = { maxAttempts = 3, attemptTimeoutMs = 600000 }`，设计里有、实现里漏了，
+ * 这个数不是新拍的：子 agent 系统的设计当初写的就是
+ * `retry = { maxAttempts = 3, attemptTimeoutMs = 600000 }`，设计里有、实现里漏了，
  * 而 0.9.0 的 CHANGELOG 把这次漏掉追认成了"刻意留白"。它还与 `keepAliveTimeoutMs`
  * 默认同值 —— 编排者愿意为一次等待花的上限，正好是它愿意为一个子任务花的上限。
  */
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 600000
 
-/** `AttemptTimeoutError.code`，也是 dsh `deadline(upstream, ms, code)` 里那个 code 的对应物。 */
+/** `AttemptTimeoutError.code`，也是 `attemptDeadline` 到点时 abort reason 上带的那个 code。 */
 export const ATTEMPT_TIMEOUT_CODE = 'SUBAGENT_ATTEMPT_TIMEOUT'
 
 /**
  * `setTimeout` 的上限（2^31-1，约 24.8 天）。超过它 Node 会**立即**触发表 —— 一个
- * 想表达"几乎不设界"的大数于是变成"当场超时"。dsh 用 `clampTimeout` 把上限钳到同一个
- * 数（`packages/util/timeout/src/index.ts`），这里照做。
+ * 想表达"几乎不设界"的大数于是变成"当场超时"，所以上限要钳到这个数。
  */
 export const MAX_TIMER_DELAY_MS = 2147483647
 
@@ -108,7 +107,7 @@ export const MAX_TIMER_DELAY_MS = 2147483647
  * 优先采信它，比读消息正则可靠；消息里仍然写着 "timed out"，所以两条路指向同一个结论，
  * 改文案不会让分类静默退化成不可重试的 `tool_error`。
  *
- * 对应 dsh 的 `TimeoutReason`（`name` / `code` / `timeoutMs` 三个可观测字段同款）。
+ * 可观测字段是 `name` / `code` / `timeoutMs` 三个。
  */
 export class AttemptTimeoutError extends Error {
   constructor(timeoutMs, code = ATTEMPT_TIMEOUT_CODE) {
@@ -123,14 +122,13 @@ export class AttemptTimeoutError extends Error {
 /**
  * 给一次 attempt 装一张截止表，与调用方的 signal 融合。
  *
- * 移植 dsh `packages/util/timeout` 的 `deadline()` 语义，但**不用 `AbortSignal.any` 也不用
- * `using`/`Symbol.dispose`** —— 本包的支持下限是 Node 18（`package.json` 的
+ * **不用 `AbortSignal.any` 也不用 `using`/`Symbol.dispose`** —— 本包的支持下限是 Node 18（`package.json` 的
  * `engines.node: ">=18.0.0"`，且不做任何转译），而 `AbortSignal.any` 是 Node 20.3.0+。
  * 仓内已有同一个取舍的先例：`src/mcp/transports/sse.js` 的 `combineSignals`，它的注释写着
  * "Node 18+ 有 `AbortSignal.any(...)`，但为兼容更老的语义与测试环境我们手动实现"。
  * `[Symbol.dispose]` 同理换成显式 `clear()` + `try/finally`。
  *
- * 语义逐条对齐 dsh 的 `timeout.spec.ts`：
+ * 语义（逐条由 `runner-attempt-timeout.test.js` 钉住）：
  *   - **先到者胜**：上游（调用方取消 / `agent_cancel` / `closeSubagents()`）先 abort 就把
  *     它的 reason 原样转发，`timedOut()` 是 `undefined` —— 一次刻意的取消不该被读成
  *     "这个子 agent 出故障了"；我们的表先到则 `timedOut()` 返回那个错误，之后上游再
@@ -140,11 +138,11 @@ export class AttemptTimeoutError extends Error {
  *   - `timeoutMs` 为 `null` / `<= 0` / 非数 → **不装表**，`signal` 就是上游本身（没有上游
  *     则是 `undefined`），`clear()` 是空操作。
  *
- * `timedOut()` 用**闭包身份**判定而不是 dsh 的 `timeoutOf(signal, code)` 按 code 扫 reason：
- * 这里更强一层。一个**父** attempt 的截止表 abort 了子 agent 的融合 signal 时，子这一侧的
+ * `timedOut()` 用**闭包身份**判定而不是按 code 扫 signal 的 reason：
+ * 这样更强一层。一个**父** attempt 的截止表 abort 了子 agent 的融合 signal 时，子这一侧的
  * `fired` 仍是 `null`，于是它被分类成 `aborted` 而不是 `timeout` —— 父超时会连带停掉子，
- * 但那是父的账，不该让子背上"我自己超时了"并去重试。dsh 需要 code 作用域是因为它的
- * `timeoutOf` 在远处读一个裸 signal，没有闭包可用。
+ * 但那是父的账，不该让子背上"我自己超时了"并去重试。按 code 扫 reason 只在远处读
+ * 一个裸 signal、没有闭包可用时才需要。
  *
  * `clear()` 两件事都做，少一件都是一个真实缺陷：
  *   - `clearTimeout` —— 漏掉的话每次 attempt 都给宿主进程留下一个最长 10 分钟的活表，
@@ -561,9 +559,8 @@ export class SubagentRunner {
       text = await child.chat(options._contract, { signal: deadline.signal })
     } catch (err) {
       // 只在**错误路径**上看表。一次跑完的 attempt 手里是完整报告，与截止时刻擦肩也照收
-      // —— 丢掉它去重跑是纯烧 token，还会把已经干完的活再干一遍。这与 dsh 的
-      // `timeout-policy` 有意分歧：它即使工具成功返回也照样换成超时结果，但它的结果可能
-      // 是被掐断的半截输出，而这里不会。
+      // —— 丢掉它去重跑是纯烧 token，还会把已经干完的活再干一遍。成功返回的结果是完整
+      // 报告而不是被掐断的半截输出，没有理由把它换成超时结果。
       throw deadline.timedOut() ?? err
     } finally {
       // 表与上游监听器都必须摘干净：漏 `clearTimeout` 会让宿主进程在每个跑完的子 agent

@@ -217,7 +217,7 @@ test('预算耗尽后不再等待，但迟到的通知仍会被投递', async ()
   // 抑制的是**等待**，不是**投递** —— 所以待注入判断仍在最前面。
   //
   // 这个界原先是硬编码的"每 run 一次"（粘性布尔 `lastKeepAliveTimedOut`），
-  // 现在是一个可配置的计数 `maxConsecutiveWakes`（默认 3，对齐 dsh）。取 1 时
+  // 现在是一个可配置的计数 `maxConsecutiveWakes`（默认 3）。取 1 时
   // 行为与旧版逐条相同 —— 本用例正是用 1 保住旧版那条反自激保证。计数语义、
   // refill 规则与"放弃时不取消在飞工作"见 `agent-keepalive-budget.test.js`。
   const agent = new Agent({

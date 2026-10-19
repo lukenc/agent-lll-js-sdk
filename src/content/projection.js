@@ -6,9 +6,6 @@
  *      必须先于计价：计价看到的必须就是实际发出的东西。
  *   B. toWireMessages：组装完成、写进 body 之前。tool 消息里的图拆成随后的一条 user 消息
  *      （OpenAI chat completions 的 tool 消息只收文本）。
- *
- * 移植自 deepseek-harness `dsh-llm/content.ts`（offloadRequestImagesWithPolicy）与
- * `dsh-llm-deepseek/serialize.ts`（serializeMessagesWithImages），MIT。
  */
 
 import { UnsupportedContentError } from './errors.js'
@@ -17,7 +14,7 @@ import { hasImage, imageParts, partsText } from './parts.js'
 
 const MiB = 1024 * 1024
 
-/** 20 MiB 取自 dsh 的内联 base64 默认值（DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES）。 */
+/** 20 MiB 是单次请求内联 base64 图片总字节的默认上限。 */
 export const DEFAULT_IMAGE_LIMITS = Object.freeze({ maxImages: 20, maxBytes: 20 * MiB, countQuantum: 5, byteQuantum: 10 * MiB })
 
 export const TOOL_IMAGE_LABEL = 'Attached image(s) from tool result:'
@@ -42,7 +39,7 @@ export function normalizeImageLimits(limits) {
 /**
  * 需要卸载的最老图片数。待移除量向上取整到量子倍数 —— 每轮只挤掉一张会让前缀
  * 每轮都变、prompt cache 每轮失效；按量子成批移除，被移除的前缀在历史再增长一个
- * 量子之前保持不变。逐行对齐 dsh `offloadedImagePrefixCount`（含 `>` 的边界约定）。
+ * 量子之前保持不变。边界约定：字节量子大于 1 时，已移除字节须严格大于（`>`）目标才停。
  */
 export function offloadedPrefixCount(lengths, { maxImages, maxBytes, countQuantum = 1, byteQuantum = 1 } = {}) {
   const total = lengths.reduce((sum, bytes) => sum + bytes, 0)
@@ -107,13 +104,13 @@ function replaceOldestImages(messages, count, placeholder) {
 export function projectHistoryImages(messages, { vision, imageLimits = DEFAULT_IMAGE_LIMITS } = {}) {
   if (!Array.isArray(messages) || !messages.some(m => hasImage(m?.content))) return messages
   // 兜底：正常流程被入口与工具两道闸挡住走不到这里。选投影而非抛错 —— 否则一张旧图
-  // 就能让会话永久不可用（与 dsh LlmRuntime 的 projectImagesForTextModel 同位）。
+  // 就能让会话永久不可用。
   if (vision !== true) {
     return replaceOldestImages(messages, Infinity, meta => `[image omitted: model accepts text only; ${describeImage(meta)}]`)
   }
   const lengths = []
   for (const m of messages) for (const p of imageParts(m?.content)) lengths.push(inlineLength(p))
-  // 量子计算仍覆盖**全部**图（对齐 dsh，前缀稳定性不变），再封顶到"旧图"数：最后一条
+  // 量子计算仍覆盖**全部**图（前缀稳定性不变），再封顶到"旧图"数：最后一条
   // 最终 assistant（无 tool_calls）之后是本轮 —— 用户刚发的图、本轮工具回灌的图 ——
   // 绝不能在携带它的那次请求里被换成占位。图按顺序排列，封顶后的前缀碰不到本轮。
   const count = Math.min(offloadedPrefixCount(lengths, imageLimits), oldImageCount(messages))

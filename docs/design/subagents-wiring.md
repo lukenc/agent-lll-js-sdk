@@ -55,8 +55,7 @@ Agent **持久**的情况下也能复现，也就是说它独立于 sticky gate 
 
 ### 2.3 `followup(opts?)`
 
-宿主的重新调用入口，对应 dsh `followup(message)` 的那一半
-（`continuation.ts:1664-1673`：父级空闲 → `followup`，父级忙 → `steer`）。
+宿主的重新调用入口，负责"父级空闲时"的那一半（父级忙时由轮边界排空接走）。
 它排空队列并跑一轮；**队列为空或当前轮次忙碌时返回 `null` 且不发请求**，忙碌时保留队列
 （一次空转的 LLM 调用烧 token，而"没有待处理"是正常情况）。
 SDK **从不自己开那一轮** —— 一次新轮是该打扰用户还是该走宿主的流式渲染器，是宿主的决定。
@@ -121,36 +120,29 @@ wrapper 用 `Symbol.for('lll.askUser.wrapped')` 打标签，因为一个子 Agen
    就是关于"被抛弃的工作"的谎话。
 3. **唤醒预算。**
 
-### 等待预算与 Harness 自动唤醒预算的区别
+### 等待预算约束的是什么
 
 旧代码每个 run 只设一次 `lastKeepAliveTimedOut`，此后就不再等待（客户报告 §3）。
-父 run 在子 Agent 仍运行时以 `completed` 结束，本身符合后台任务语义；Harness 对照测试也如此。
-已确认的缺口是迟到通知的投递和续跑。把等待次数从一次改成三次，并不能单独解决这个缺口。
+父 run 在子 Agent 仍运行时以 `completed` 结束，本身符合后台任务语义。
+已确认的缺口是迟到通知的投递和续跑。把等待次数从一次改成三次，并不能单独解决这个缺口 ——
+迟到通知靠的是接触点 2 的重新调用路径（父级空闲时 `followup`，忙碌时轮边界排空），
+不依赖轮内 keep-alive。
 
-dsh 的 SubAgent continuation 在父级空闲时 `followup`、忙碌时 `steer`，不依赖轮内 keep-alive。
-另一个独立的 jobs 插件提供**唤醒预算**：
-`maxConsecutiveWakes`（默认 3），在
-`packages/jobs/tool-jobs/src/index.ts:38-51, 208-228, 292-298`，
-在**构造时**用 `Number.isSafeInteger` 校验，投递决定是
-`spent < wakeBudget ? owner.followup(message) : owner.inject(message)` ——
-dsh jobs 的预算约束"再唤醒一次"，而本 SDK 的同名参数约束轮内等待超时。
-两者计数对象不同；本参数不是 Harness SubAgent 的等价实现，也不限制跨轮续跑次数。
-
-所以 ours 现在是 `subagents.maxConsecutiveWakes`（默认 3，同名/同值/同回填规则；
-对 `0` / 负数 / 非整数 / `Infinity` 在**构造时** `TypeError` ——
+所以 `subagents.maxConsecutiveWakes` 约束的是**轮内等待超时**，不是"再唤醒一次"，
+也不限制跨轮续跑次数（那由宿主控制）。它默认 3
+（对 `0` / 负数 / 非整数 / `Infinity` 在**构造时** `TypeError` ——
 调用时抛会把一次成功的等待变成一次失败的 run），计的是**超时**（白等）而不是等待次数：
 一次事件唤醒买到了东西，所以把它算进"该放弃了"会惩罚一个正常推进的 run，
 因此事件唤醒**既不消耗也不回填**（让它们回填会让一串结算把计数器压在零，
 而交错着的挂死孩子会把 run 拖到 `maxRounds`）。
 
 回填**只**发生在**用户自撰**的输入上 —— 经由 `_refillKeepAliveBudget(opts)` 的
-`chat()` / `stream()`，以 `opts._frameworkAuthored` 门控 —— 对应 dsh 的
-`message.source.kind === 'user'`，其注释写着
-*"a notice this plugin itself queued must not refill the budget it just spent"*。
+`chat()` / `stream()`，以 `opts._frameworkAuthored` 门控 ——
+框架自己排进队列的通知绝不能回填它刚花掉的预算。
 
 计数器住在 **Agent** 上而不是 runtime 上：只有 Agent 知道用户是否说话了，
 而 runtime 看见的是 `enqueueMessage`，那同样可能是一次 agent 间的 `send_message`，
-dsh 不把它算作用户输入。配置则住在 runtime 上。
+它不算用户输入。配置则住在 runtime 上。
 
 `_spentKeepAliveWakes` **刻意不在 `_runWithSession` / `_runWithSessionStream` 里重置**
 （它跨 run 累积；在共享入口处清零会让一条框架通知回填它自己刚花掉的预算），
@@ -161,14 +153,14 @@ dsh 不把它算作用户输入。配置则住在 runtime 上。
 发 **`run.keep_alive.gave_up`**，携带 `{ spent, budget, pendingAgents, pendingNodes, inFlight }` ——
 在飞快照是宿主决定"关闭、取消，还是告诉用户"的唯一依据（报告 §5）。
 
-放弃**不取消**任何东西：dsh 只在处置时取消（`continuation.ts:1528-1544`），
+放弃**不取消**任何东西：取消只发生在显式处置时（`closeSubagents()` / `agent_cancel` / `reset()`），
 而报告 §10 #7 那条"run 结束时自动 `closeSubagents()`"的建议正是因此被拒绝 ——
 它会杀掉它自己 §7 想要的"派一个慢任务，下一轮收结果"这个用例。
 
 所以 `'idle'` 有两个含义（干净结束 vs. 预算耗尽），
 **由事件区分，不由返回值区分** —— 返回值集合未变。
 `lastStopReason` 同样保持 `'completed'`：那个 enum（`null | 'completed' | 'max_rounds'`）
-是一份跨包的既有契约，dsh 无条件返回 `completed`（`agent-loop/src/agent.ts:471`），
+是一份跨包的既有契约，keep-alive 放弃时它仍是 `completed`，
 而让它诚实的是**重新调用路径**（接触点 2），不是一个新的 enum 值。
 结束等待之所以诚实，**只因为那条路径先落地了** ——
 通知仍留在队列里，由 round-0 合并、`run.wakeup` 或 `followup()` 投递。

@@ -1,6 +1,6 @@
 /**
- * output-retention 测试 —— 契约来自 dsh 的 output-retention.spec.ts。
- * 见 docs/dsh-diff/CONTRACT-NOTES.md 的 A 节。
+ * output-retention 测试 —— 有界保留原语的行为契约（A2–A9）。
+ * 设计说明见 docs/design/spill.md。
  */
 
 import { test, describe } from 'node:test'

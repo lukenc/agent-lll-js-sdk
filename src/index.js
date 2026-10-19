@@ -25,7 +25,7 @@ export {
 export { KnowledgeBase, createKnowledgeEntry } from './knowledge-base.js'
 export {
   ContextManager, defaultTokenBudget, estimateTokens,
-  // token 计量：结构开销计价 + 信封指纹（第 03 份差距，移植自 dsh token-meter）。
+  // token 计量：结构开销计价 + 信封指纹。
   // estimateMessageTokens 由 memory-policy 侧统一导出，此处不重复。
   estimateToolsTokens, headerFingerprint, ROLE_OVERHEAD, BLOCK_OVERHEAD,
 } from './context-manager.js'
@@ -79,7 +79,6 @@ export {
 } from './agents/index.js'
 
 // ---- Spill：工具输出限长 + 转存取回 ----
-// 移植自 deepseek-harness 的 output-retention / spill 系列（MIT）。
 export {
   TextRetainer,
   ItemRetainer,

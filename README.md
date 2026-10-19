@@ -1001,8 +1001,8 @@ Browser Agent 继续 ReAct 循环
 ## Skill 系统
 
 一个 skill 是一个目录：`SKILL.md`（YAML frontmatter + Markdown 正文）加上可选的
-`scripts/` / `references/` 等捆绑文件，目录结构与 [Claude Code 的 skill 格式](https://docs.claude.com/en/docs/claude-code/skills)
-兼容，可直接复用已有的 Claude Code skill 包。
+`scripts/` / `references/` 等捆绑文件，即 SKILL.md + YAML frontmatter 格式的 skill 包，
+可直接复用已有的同格式 skill 包。
 
 ```js
 import { Agent } from 'lll-web-agent'
@@ -1028,7 +1028,7 @@ await agent.chat('帮我审查这个 PR')
 
 ### 三级渐进披露（Progressive Disclosure）
 
-与 Claude Code 一致，skill 内容按需分三级注入上下文，避免一次性把所有 skill 正文塞进
+skill 内容按需分三级注入上下文，避免一次性把所有 skill 正文塞进
 system prompt：
 
 | 级别 | 内容 | 注入方式 |
@@ -1040,7 +1040,7 @@ system prompt：
 `disable-model-invocation: true` 的 skill 不出现在 Level 1 清单里，但仍可通过
 `agent.skills.get(name)` 访问。
 
-#### `skill` 工具的参数（对齐 Claude Code）
+#### `skill` 工具的参数
 
 ```js
 { name: 'skill', parameters: { skill: string, args?: string } }  // 仅 skill 必填
@@ -1276,7 +1276,7 @@ agent.lastStopReason             // 取值集合未变：null | 'completed' | 'm
 `keepAliveTimeoutMs` 却没有任何 subagent 事件的次数；被事件唤醒（真有结果回来）不花预算，
 那一次等待买到了东西。用户亲手输入的新一轮（`chat()` / `stream()`）把预算补回，框架自己
 开的续跑轮（`followup()`）不补 —— 否则通知自己就能把它刚花掉的预算充满，闸门等于不存在。
-该名称和默认值参考 dsh 的 jobs 插件；两者计数对象不同：本 SDK 计等待超时，dsh jobs 计自动唤醒。dsh SubAgent 的完成通知直接使用父 Agent 的 followup/steer。非法取值（`0`、负数、非整数、
+非法取值（`0`、负数、非整数、
 `Infinity`）在**构造期**抛 `TypeError`，不留到调用期把一次成功的等待变成整个 run 报错。
 
 ```js
@@ -1284,7 +1284,7 @@ new Agent({ subagents: { maxConsecutiveWakes: 5 } })   // 1 = 复现旧版"最�
 ```
 
 **放弃等待 ≠ 放弃工作。** 预算耗尽时本轮收尾、发 `run.keep_alive.gave_up`，在飞的子 agent
-**不被取消**（dsh 同样只在 disposal 时取消）。它的结果仍会送达，靠三条路径之一：下一次
+**不被取消**（取消只发生在显式关闭时）。它的结果仍会送达，靠三条路径之一：下一次
 `chat()` / `stream()` 的 round 0 合并（用户又说话了，自动生效）、宿主订阅 `run.wakeup` 后调
 `agent.followup()`（用户没说话，需要宿主主动开一轮）、或宿主自己再调一次 `chat()`。
 
@@ -1296,8 +1296,8 @@ agent.on('run.wakeup', ({ pendingInjections, inFlightAgents }) => {
 })
 ```
 
-**推荐配置：`keepAlive: false` + 订阅 `run.wakeup` + 调 `followup()`。** 这正是 dsh 的方向
-（不在轮内干等，而是结束本轮、稍后叫醒），流式宿主因此不会在等待期间看不到任何 chunk。
+**推荐配置：`keepAlive: false` + 订阅 `run.wakeup` + 调 `followup()`。** 不在轮内干等，
+而是结束本轮、稍后叫醒，流式宿主因此不会在等待期间看不到任何 chunk。
 
 每次轮次仍受 `maxRounds` 约束；跨轮自动续跑的总预算由宿主控制，`maxConsecutiveWakes` 只限制轮内等待，不能充当跨轮续跑次数上限。`keepAlive: false` 时本轮直接结束，通知暂存
 到下一次 run 的 round 0 —— 那里会把积压的通知**并进**用户这条新消息（通知在前），而不是追加
@@ -1796,7 +1796,7 @@ floor）与 `interviewer`（只有 floor，含 `ask_user`）。面板会实时�
     一个永不 settle 的 Promise）仍然无上界，超时只打断 `child.chat()` 的等待，工具自己
     的异步尾巴还在跑。框架**有意不**改成 race `chat()` 的 Promise：赢了 race 会把
     handle 标成 failed、释放并发槽，而子 Agent 还活着继续发遥测、写产物轨 —— 一个框架
-    账本上已死、物理上还活着的 agent 比没有超时更坏（与 dsh 同一契约）。宿主侧的对应
+    账本上已死、物理上还活着的 agent 比没有超时更坏。宿主侧的对应
     动作是给自己的工具接上 `ctx.signal`。另外 `send_message` 的续跑路径
     （`runtime._resume`）复活已终态 agent 后的那一轮 `chat()` 还没装这张表，只受调用方
     signal 约束 —— `_resume` 不走 attempt 循环，硬套会把"续跑超时"错误地计入

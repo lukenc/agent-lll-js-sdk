@@ -1,8 +1,8 @@
 /**
- * spill 存储层测试 —— 契约见 docs/dsh-diff/CONTRACT-NOTES.md 的 B/C 节。
+ * spill 存储层测试 —— 设计说明见 docs/design/spill.md。
  *
- * Node 后端的安全措施（私有目录、独占创建、路径段编码）对齐 dsh 的
- * spill-local.spec.ts；内存后端是浏览器 IndexedDB 后端的可测替身，
+ * Node 后端的安全措施（私有目录、独占创建、路径段编码）在这里逐条钉住；
+ * 内存后端是浏览器 IndexedDB 后端的可测替身，
  * 两者共用同一套 SpillStore 契约测试。
  */
 
@@ -18,9 +18,9 @@ import {
   SpillError,
 } from './index.js'
 
-// ---- C 节：路径段编码 ----
+// ---- 路径段编码 ----
 
-describe('encodeSegment（C 节）', () => {
+describe('encodeSegment（路径段编码）', () => {
   test('安全字符原样保留', () => {
     assert.equal(encodeSegment('abcXYZ019._-'), 'abcXYZ019._-')
   })
@@ -150,9 +150,9 @@ after(async () => { if (nodeRoot) await rm(nodeRoot, { recursive: true, force: t
 
 contractTests('NodeSpillStore', async () => createNodeSpillStore({ root: nodeRoot }))
 
-// ---- C 节：Node 后端专有的安全措施 ----
+// ---- Node 后端专有的安全措施 ----
 
-describe('NodeSpillStore 安全措施（C 节）', () => {
+describe('NodeSpillStore 安全措施', () => {
   test('会话目录按 sessionId 哈希命名，且稳定', async () => {
     const store = createNodeSpillStore({ root: nodeRoot })
     const a = await store.saveText({ sessionId: 'sess-x', toolName: 't', callId: 'c', content: '1' })

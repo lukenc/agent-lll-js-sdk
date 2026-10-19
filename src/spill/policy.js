@@ -4,12 +4,9 @@
  * 存储机制在 ./index.js，截断机制在 ../output-retention.js。
  * 这一层只做判断和措辞，不碰这两者的内部。
  *
- * 移植自 deepseek-harness 的 `dsh-spill-policy`（MIT）。
- * 契约见 docs/dsh-diff/CONTRACT-NOTES.md 的 D 节。
+ * 契约由 spill/policy.test.js 钉住；设计说明见 docs/design/spill.md。
  *
- * 与 dsh 的结构差异：它挂在 `tools/post-execute` 事件瀑布上，
- * 我们没有 Cordis，所以做成一个对象由 agent.js 在工具执行处直接调用。
- * 判断逻辑和措辞逐条对齐。
+ * 我们没有事件瀑布可挂，所以做成一个对象由 agent.js 在工具执行处直接调用。
  */
 
 import { TextRetainer, describeOmitted } from '../output-retention.js'
@@ -21,12 +18,10 @@ export const SPILL_READ_TOOL_NAME = 'spill_read'
 /**
  * spill 搜索工具的名字。
  *
- * 为什么需要它：dsh 的 retrievalHint 原文是
- * 「Use read with offset/limit, **or grep this path to search within it**」——
- * 它假设宿主已有能搜真实路径的 grep（dsh 自带打包 ripgrep 的 fs-search 工具）。
- * 我们是库，宿主不一定有 grep，浏览器里更没有文件路径可 grep。
+ * 为什么需要它：只提示「去 grep 这个路径」的前提是宿主已有能搜真实路径的
+ * grep 工具。我们是库，宿主不一定有 grep，浏览器里更没有文件路径可 grep。
  * 只给顺序分段读的话，模型在大文件里找一行错误只能线性扫，实测会撞 maxRounds。
- * 所以这里把「搜」这一环补上，等价于 dsh 依赖的外部 grep。
+ * 所以这里自带「搜」这一环，不依赖宿主的外部 grep。
  */
 export const SPILL_SEARCH_TOOL_NAME = 'spill_search'
 
@@ -226,7 +221,7 @@ export function createSpillPolicy(opts = {}) {
     /**
      * 构造 spill_search 工具 —— 在转存内容里按关键词/正则定位。
      *
-     * 这是 dsh 里由外部 grep 承担的那一环（见 SPILL_SEARCH_TOOL_NAME 注释）。
+     * 它承担的是通常交给外部 grep 的那一环（见 SPILL_SEARCH_TOOL_NAME 注释）。
      * 没有它，模型面对大文件只能从头顺序读，实测 150KB 日志找一行错误
      * 要 19 轮以上，直接撞 maxRounds。
      *

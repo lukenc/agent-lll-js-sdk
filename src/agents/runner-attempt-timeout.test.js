@@ -8,31 +8,25 @@
  * （keep-alive 管不着它，它压根没走到"最终回答"那个分支）；后台派发时挂死的子 agent
  * 永久占着它那一个 depth 层的并发槽，四个就把 `maxConcurrent: 4` 的池坐死。
  *
- * **dsh 的对照**：`packages/subagent/subagent/src/continuation.ts` 里
- * `timeout|Timeout|deadline` **零命中** —— dsh 没有"单次 attempt 截止"这个东西。它的
- * 同类机制是两处更细的界：`packages/guard/timeout-policy` 给**每次工具调用**装一个
- * `deadline`，`packages/llm/llm-deepseek/src/adapter.ts:477` 给**每次流读取**装一个
- * 300s 的 `idleWatchdog`。我们拿不到第二处 —— 子 agent 走的是非流式 `syncChat`，一次
- * `await` 就是一整段黑盒，没有"空闲"可观测。所以这里移植的是 dsh 的**机制**（
- * `packages/util/timeout`：signal 融合、先到者胜、能力自有的分类、构造期校验），落在
- * 一个 dsh 没有的边界上，而不是抄一个 dsh 的功能。
+ * **为什么界在 attempt 上**：更细的界（每次工具调用一个 deadline、每次流读取一个空闲
+ * 看门狗）在这里拿不到第二处 —— 子 agent 走的是非流式 `syncChat`，一次 `await` 就是
+ * 一整段黑盒，没有"空闲"可观测。所以截止落在整个 attempt 上，机制是：signal 融合、
+ * 先到者胜、能力自有的分类、构造期校验。
  *
- * 本文件按 dsh `packages/util/timeout/tests/timeout.spec.ts` 逐条对照钉住：
+ * 本文件逐条钉住：
  *   - 到点 abort，reason 是自有的分类载体（不是裸字符串）。
- *   - `clear()` 之后表不再触发 —— 对应它的 `[Symbol.dispose]`。**这条不是整洁问题**：
+ *   - `clear()` 之后表不再触发 —— 相当于 `[Symbol.dispose]`。**这条不是整洁问题**：
  *     漏掉的话每次 attempt 都留下一个最长 10 分钟的 `setTimeout`，Node 的事件循环因此
  *     不退出，"后台 agent settle 之后进程自然结束"这条既有承诺被推翻。
- *   - 取消先到 → 分类是**取消**，不是超时（它的 "cancel wins when it fires before the
- *     timeout"）。上游预先已 aborted → 立即转发，不等满。
- *   - 超时先到 → 之后上游再 abort 是 no-op（它的 "timeout wins when it fires before
- *     upstream cancellation"）。
- *   - `<= 0` / `null` → 不装表，只转发上游（它的 `timeoutMs <= 0` 分支）。
+ *   - 取消先到 → 分类是**取消**，不是超时。上游预先已 aborted → 立即转发，不等满。
+ *   - 超时先到 → 之后上游再 abort 是 no-op。
+ *   - `<= 0` / `null` → 不装表，只转发上游。
  *
- * 与 dsh 的两处**有意**分歧，都写在下面的用例里：`Infinity` 不是"不设界"的写法而是构造期
+ * 两处**有意**的取舍，都写在下面的用例里：`Infinity` 不是"不设界"的写法而是构造期
  * 报错（与 `maxConsecutiveWakes` 同款，"不设界"正是这个字段存在的理由所要防的），显式
  * 关闭用 `null`（与 `ask.timeoutMs` 默认 `null` = 永不超时同一拼法）；以及成功的 attempt
- * 即使与截止时刻擦肩也**照收**（dsh 的 timeout-policy 会丢弃工具结果，但它的结果可能是
- * 半截的，而一次跑完的 attempt 拿到的是完整报告 —— 丢掉它去重跑是纯烧 token）。
+ * 即使与截止时刻擦肩也**照收**（一次跑完的 attempt 拿到的是完整报告而不是半截输出
+ * —— 丢掉它去重跑是纯烧 token）。
  */
 import test from 'node:test'
 import assert from 'node:assert'
@@ -162,7 +156,7 @@ test('到点 abort，reason 是自有的分类载体而不是裸字符串', asyn
   d.clear()
 })
 
-test('clear() 之后表不再触发（dsh 的 [Symbol.dispose] 语义）', async () => {
+test('clear() 之后表不再触发（[Symbol.dispose] 语义）', async () => {
   // 漏掉 clear 的后果不是"多一个定时器"这么轻：Node 的事件循环会一直等到它触发，
   // 于是每个跑完的子 agent 都给宿主进程留下最长 attemptTimeoutMs（默认 10 分钟）
   // 的悬挂时间 —— README「后台 agent 跨 chat() 存活」那条承诺会变成"而且跑完了也不退出"。
@@ -187,7 +181,7 @@ test('clear() 摘掉上游 signal 上的监听器（重试路径不堆积）', a
 })
 
 test('取消先到 → 分类是取消，不是超时', async () => {
-  // dsh：cancel wins when it fires before the timeout。这条是"主动取消不被误报成
+  // 取消先于超时触发则取消胜出。这条是"主动取消不被误报成
   // 子 agent 出故障"的前提 —— `cancelHandle` 走的就是上游 abort。
   const ac = new AbortController()
   const d = attemptDeadline(ac.signal, 5000)
@@ -211,7 +205,7 @@ test('上游预先已 aborted → 立即转发，不等满 attemptTimeoutMs', as
 })
 
 test('超时先到 → 之后上游再 abort 是 no-op', async () => {
-  // dsh：timeout wins when it fires before upstream cancellation。融合信号只认第一个。
+  // 超时先于上游取消触发则超时胜出。融合信号只认第一个。
   const ac = new AbortController()
   const d = attemptDeadline(ac.signal, 10)
   await new Promise(r => setTimeout(r, 40))

@@ -52,7 +52,7 @@ describe('锚点采集', () => {
     await agent.chat('hi')
     const a = agent.getTokenAnchor()
     assert.ok(a, '应产生锚点')
-    // 我方 prompt_tokens 已含缓存，锚点 = prompt + completion（见 CONTRACT-NOTES H1）
+    // 我方 prompt_tokens 已含缓存，锚点 = prompt + completion（再加 cached 会重复计数）
     assert.equal(a.totalTokens, 1234 + 56)
     assert.ok(typeof a.fingerprint === 'string' && a.fingerprint.length > 0)
     assert.ok(Number.isFinite(a.estimatedAtAnchor))
@@ -74,7 +74,7 @@ describe('锚点采集', () => {
     assert.ok(a === null || Number.isFinite(a.totalTokens), '要么没锚点，要么是有限数')
   })
 
-  test('多轮对话时锚点更新为最新一次（对齐 dsh G3）', async () => {
+  test('多轮对话时锚点更新为最新一次', async () => {
     stubTurns([
       { usage: { prompt_tokens: 100, completion_tokens: 10 } },
       { usage: { prompt_tokens: 900, completion_tokens: 90 } },
@@ -105,7 +105,7 @@ describe('锚点复用', () => {
     assert.equal(assembled.tokenConfidence, 'estimated')
   })
 
-  test('系统提示变化后锚点失效（G4）', async () => {
+  test('系统提示变化后锚点失效', async () => {
     stubTurns([{ usage: { prompt_tokens: 5000, completion_tokens: 100 } }])
     const agent = buildAgent({ systemPrompt: 'sys-A' })
     await agent.chat('first')
@@ -116,7 +116,7 @@ describe('锚点复用', () => {
       '换了系统提示就不该复用旧锚点')
   })
 
-  test('工具集变化后锚点失效（G4）', async () => {
+  test('工具集变化后锚点失效', async () => {
     stubTurns([{ usage: { prompt_tokens: 5000, completion_tokens: 100 } }])
     const agent = buildAgent({ systemPrompt: 'sys' })
     await agent.chat('first')
@@ -130,7 +130,7 @@ describe('锚点复用', () => {
       '加载新工具后信封变了，锚点必须失效')
   })
 
-  test('守恒校验：真实用量低于同期估算时退回估算（G2）', async () => {
+  test('守恒校验：真实用量低于同期估算时退回估算', async () => {
     // 造一个很长的历史让估算值很高，而真实用量报得很低
     const agent = buildAgent({ systemPrompt: 'x'.repeat(20000) })
     stubTurns([{ usage: { prompt_tokens: 5, completion_tokens: 1 } }])

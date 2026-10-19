@@ -164,7 +164,7 @@ export function parseSkillMd(text, { dirName, source, files, baseDir }) {
 const ARG_PLACEHOLDER_RE = /\$ARGUMENTS(?![A-Za-z0-9_])|\$([1-9])/g
 
 /**
- * 把 skill 调用参数代入正文占位符(对齐 Claude Code 斜杠命令的展开规则)。
+ * 把 skill 调用参数代入正文占位符。
  * `$ARGUMENTS` 取整串;`$1`..`$9` 取按空白切分的第 N 个 token,缺失代入空串。
  * 注意:替换一律用函数式 replacer,故参数里的 `$&` / `$1` 等不会被二次解释。
  *

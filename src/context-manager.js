@@ -162,7 +162,7 @@ export class ContextManager {
     //
     //    锚点 = 上一次成功调用的**真实用量**。信封（system + 工具集）没变时，
     //    只需要对锚点之后新增的历史做估算，误差从「整体估算」缩小到「只有增量
-    //    是估算的」。信封变了就必须重估 —— 对齐 dsh 的 G4。
+    //    是估算的」。信封变了就必须重估 —— 请求体的固定部分变了，旧用量不再可比。
     const estimatedTotal = sysTokens + knowledgeTokens + historyTokens + toolsTokens
     const fingerprint = headerFingerprint(systemPrompt, filteredTools)
     const anchor = request.anchor
@@ -170,7 +170,7 @@ export class ContextManager {
     let tokenConfidence = 'estimated'
 
     if (isUsableAnchor(anchor) && anchor.fingerprint === fingerprint) {
-      // 守恒校验（dsh G2）：只有锚点**不小于**同期估算时才采信真实用量。
+      // 守恒校验：只有锚点**不小于**同期估算时才采信真实用量。
       // 锚点若比估算还小（例如缓存计费导致真实用量偏低），从它出发做有符号
       // 增量会系统性偏低，越滚越不准 —— 这种情况宁可退回估算。
       if (anchor.totalTokens >= anchor.estimatedAtAnchor) {
@@ -193,7 +193,7 @@ export class ContextManager {
        * 这个 totalTokens 可不可信：
        *   'usage'     —— 基于上一次真实用量的锚点 + 本轮增量
        *   'estimated' —— 纯启发式估算
-       * 新增字段，不影响既有调用方（dsh 的 G5：置信度必须暴露）。
+       * 新增字段，不影响既有调用方（置信度必须暴露，否则调用方无从区分测得与猜得）。
        */
       tokenConfidence,
       /** 纯估算值，便于调用方与锚定值对比、或作为下一次锚点的 estimatedAtAnchor */
@@ -252,10 +252,9 @@ export function estimateToolsTokens(tools) {
  * 请求信封的指纹 —— 用来判断「这次请求的固定部分和上次是不是同一套」。
  *
  * 信封 = 系统提示 + 工具集。它没变时，上一次的真实用量才能当锚点复用；
- * 变了就必须全量重估（dsh 的 G4：model / system / tools / config 任一变化
- * 都让锚点失效）。
+ * 变了就必须全量重估（model / system / tools / config 任一变化都让锚点失效）。
  *
- * 规范化对齐 dsh 的 `canonicalHeader`：**空 system 与无 system 等价，
+ * 规范化：**空 system 与无 system 等价，
  * 空工具数组与无工具等价** —— 否则 `tools: []` 和 `undefined` 会算成两个
  * 信封，每轮都白白丢掉锚点。
  *

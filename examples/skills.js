@@ -13,7 +13,7 @@
  * 运行:OPENAI_API_KEY=sk-xxx node examples/skills.js
  *
  * 想从远端加载技能?把 providers 换成 HTTP provider 即可(wire 协议见
- * docs/superpowers/specs/2026-07-28-skill-system-design.md):
+ * docs/design/skills.md):
  *   providers: [{ type: 'http', baseUrl: 'https://example.com/skill-source' }]
  */
 import { readFile } from 'fs/promises'

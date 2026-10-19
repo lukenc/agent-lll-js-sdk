@@ -5,9 +5,8 @@
 > **状态：已实现**（2026-09-25）。真实供应商验收（OpenAI / 小米 MiMo）待完成，完成后在 §8 末尾补"验收记录"。
 
 让 Agent 能**看图**：用户消息里带图，以及工具（含 MCP）返回的图回灌给模型。
-历史保留策略移植自 deepseek-harness 的 `dsh-llm/content.ts` 与 `dsh-llm-deepseek/serialize.ts`
-（MIT），但**存储形态不同**：dsh 把字节放进独立的 attachment store、消息里只存引用；
-我们把图**内联**在消息里（见 §9 的取舍）。
+图在历史里按量子卸载（§3.A），存储形态是**内联**：字节直接放在消息里，
+而不是放进独立的 attachment store、消息里只存引用（见 §9 的取舍）。
 
 ---
 
@@ -44,8 +43,7 @@
 ```
 
 - 入口规范化时，**只含文本部件的数组折叠成字符串**。于是"`content` 是数组 ⇔ 至少一张图"，
-  纯文本会话对 memory、`getHistory()`、宿主 UI、自定义 memory 零变化
-  （dsh 的 DeepSeek 序列化器同样"text-only requests retain string user content"）。
+  纯文本会话对 memory、`getHistory()`、宿主 UI、自定义 memory 零变化。
 - 允许的部件类型：`text`、`image_url`。`image_url.url` 只允许 `data:` 与 `http(s):`；
   `detail`（`'low' | 'high' | 'auto'`）原样透传。
 - data URL 媒体类型白名单：`image/png`、`image/jpeg`、`image/webp`、`image/gif` ——
@@ -91,7 +89,7 @@ SDK 不提供异步 Blob 读取。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `vision` | `false` | 主模型是否接受图片。对齐 dsh `inputModalities ?? ['text']` —— 默认拒绝。给了就必须是布尔值，否则**构造时抛** `TypeError`（`'true'` 不会被当成真） |
+| `vision` | `false` | 主模型是否接受图片。未声明即视为只收文本 —— 默认拒绝。给了就必须是布尔值，否则**构造时抛** `TypeError`（`'true'` 不会被当成真） |
 | `simpleVision` | 未配置简单模型时同 `vision`，否则 `false` | 只影响子 Agent 的 `fast` 别名（没配简单模型时 `fast` 就是主模型，所以继承 `vision`）；sidecar 一律走文本投影（§4.2）。类型校验同 `vision` |
 | `imageLimits` | `{ maxImages: 20, maxBytes: 20 MiB, countQuantum: 5, byteQuantum: 10 MiB }` | 出站卸载的上限与量子（§3.A）。非法值**构造时抛** |
 | `maxImageBytes` | `20 MiB` | 入口单张上限 |
@@ -182,24 +180,24 @@ execute: async () => contentResult([
 1. **兜底文本投影。** `vision` 为假而历史里仍有图（自定义 memory 注入、宿主中途关掉 vision）→
    全部替换为 `[image omitted: model accepts text only; png 1024×768 #a1b2c3d4]`。
    正常流程被 §2.3 与 §2.4 两道闸挡住，走不到这里；兜底选**投影而非抛错**，
-   否则一张旧图就能让会话永久不可用（这与 dsh `LlmRuntime` 的 `projectImagesForTextModel` 同位）。
-2. **超限按量子卸载最老的图**（移植 dsh `offloadRequestImagesWithPolicy`）。
+   否则一张旧图就能让会话永久不可用。
+2. **超限按量子卸载最老的图**。
    - 按请求顺序收集所有图（含 `tool` 消息内的）。长度 = data URL 字符数（即 base64 表示）；
      公网 URL 计张数、字节计 0。
    - 超出 `maxImages` 或 `maxBytes` 时，待移除量**向上取整到量子倍数**，从最老处连续替换为
      `[image omitted to fit request image limits; png 1024×768 #a1b2c3d4]`。
    - **本轮受保护。** 最后一条"最终" `assistant`（无 `tool_calls` 或为空数组）**之后**的图 ——
      用户刚发的图、本轮工具回灌的图 —— 绝不在携带它的那次请求里被卸载。量子仍按**全部**图计算
-     （与 dsh 一致，前缀稳定性不变），再封顶到边界及之前的旧图张数：
+     （前缀稳定性因此不变），再封顶到边界及之前的旧图张数：
      `count = min(offloadedPrefixCount(全部), 旧图张数)`；没有这样的 `assistant` 时旧图张数为 0。
      图按顺序排列，封顶后的前缀碰不到本轮。代价：单条用户消息 / 单个工具结果自己超限已在入口
      （§2.3 第 4 步 / §2.4）被拒，但本轮的图**合计**超限（用户图加上几次工具回灌）时不卸载，
      原样发出，由供应商裁决。
    - **量子的意义是缓存稳定。** 每轮只挤掉一张，会让前缀每轮都变、prompt cache 每轮失效；
      按量子成批移除，被移除的前缀在历史再增长一个量子之前保持不变。
-     dsh 的注释给过一个例子：129 张 1 MB 图、上限 128 MiB、量子 64 MiB → 一次移除最老的 65 张，
+     例：129 张 1 MB 图、上限 128 MiB、量子 64 MiB → 一次移除最老的 65 张，
      剩 64 MiB；此后直到总量超过 192 MiB 前，这个前缀不动。
-   - 默认 20 MiB 取自 dsh 的内联 base64 默认值（`DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES`），
+   - 默认 20 MiB 是内联 base64 的保守上限，
      低于 OpenAI 单请求总载荷上限（50 MB，以官方文档为准）。
 
 **A 必须先于计价。** 计价看到的必须就是实际发出的东西：若 100 张图中 80 张已被卸载却仍按图计价，
@@ -216,10 +214,10 @@ execute: async () => contentResult([
    ```
 
    连续多个 tool 结果**共享**这一条，所以 `assistant(tool_calls)` 之后仍紧跟**全部** `tool` 消息，
-   满足 OpenAI / Qwen / MiMo 的配对要求。OpenAI chat completions 的 `tool` 消息只收文本，
-   dsh 的 `serializeMessagesWithImages` 用的是同一个布局。
+   满足 OpenAI / Qwen / MiMo 的配对要求。之所以要拆，是因为 OpenAI chat completions 的
+   `tool` 消息只收文本。
 2. **`assistant` / `system` 带图 → 抛** `UnsupportedContentError { code: 'image_in_role', role }`。
-   代码不会产生这种消息，出现即 bug，fail loud（dsh `assertSupportedImageRoles` 同理）。
+   代码不会产生这种消息，出现即 bug，fail loud。
 3. **无图请求原样返回同一个数组引用**，不复制 —— 纯文本会话零开销、零行为变化。
 
 `_withUnavailableToolsNote`、skill 清单注入、子 Agent 类型清单注入不动：它们只改写
@@ -381,7 +379,7 @@ execute: async () => contentResult([
 
 ## 9. 取舍记录
 
-**内联而非 attachment store。** dsh 把字节放进内容寻址的 store、消息只存引用，好处是
+**内联而非 attachment store。** 另一种做法是把字节放进内容寻址的 store、消息只存引用，好处是
 memory / 事件日志 / 子 Agent 镜像不被 base64 撑大，占位还能给出模型可读的路径。
 我们选择内联：实现面小、`getHistory()` 直接是 OpenAI 形状、不引入第二个存储生命周期。
 代价是 base64 常驻内存、`cloneMessage` 会深拷贝大字符串、卸载占位无法指向可恢复的路径。
@@ -419,7 +417,7 @@ memory / 事件日志 / 子 Agent 镜像不被 base64 撑大，占位还能给�
 - `src/content/image-meta.test.js` —— 四种格式宽高、JPEG 扫描上限、魔数优先、错误类不泄露数据
 - `src/content/parts.test.js` —— 规范化、折叠、魔数校验（非图字节拒绝、魔数改写头）、`imagePart`、`contentResult` 往返
 - `src/content/image-tokens.test.js` —— 两个公式的钉住值、9-token 锚点、base64 不按文本计价
-- `src/content/projection.test.js` —— dsh 量子算例、fast-check 属性（前缀单调、剩余在限内、整量子）、本轮受保护、`imagesExceedLimits`、tool 图拆分
+- `src/content/projection.test.js` —— 量子算例（129 张 1 MB 图）、fast-check 属性（前缀单调、剩余在限内、整量子）、本轮受保护、`imagesExceedLimits`、tool 图拆分
 - `src/agent-multimodal.test.js` —— 入口拒绝不留痕（含 `exceeds_image_limits`）、两条路径发图、ContextManager 路径先投影后计价、纯文本逐字节不变、积压合并、stream 对等、工具图（含超限）、spill、plan 模式、`vision` 类型校验
 - `src/multimodal-consumers.test.js` —— 摘要、意图识别、技能过滤、历史检索的文本投影
 - `src/mcp/image-result.test.js` —— normalize 的图片分支 + 真实 stdio 的 image-chart server
@@ -427,9 +425,5 @@ memory / 事件日志 / 子 Agent 镜像不被 base64 撑大，占位还能给�
 
 ## 来源
 
-- deepseek-harness：`packages/llm/llm/src/content.ts`（`offloadRequestImagesWithPolicy`、
-  `projectImagesForTextModel`、`contentHasImage`）、`packages/llm/llm-deepseek/src/serialize.ts`
-  （tool 图拆分、`assertSupportedImageRoles`）、`packages/llm/llm-deepseek/src/adapter.ts`
-  （量子默认值、`UNSUPPORTED_CONTENT`）、`docs/subsystems/attachment.zh.md`。行号为写作时定位。
 - [MiMo 图片理解](https://mimo.mi.com/docs/zh-CN/quick-start/usage-guide/multimodal-understanding/image-understanding)
   · [MiMo OpenAI 兼容 API](https://mimo.mi.com/docs/zh-CN/api/chat/openai-api)

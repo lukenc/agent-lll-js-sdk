@@ -59,24 +59,23 @@ export function createSubagentRuntime({
   keepAliveTimeoutMs = 600000,
   /**
    * keep-alive 的**等待预算**：连续多少次"白等"（等满 `keepAliveTimeoutMs` 却
-   * 没有任何 subagent 事件）之后，不再替模型把本轮撑住。默认 3，与 dsh 同值
-   * （`packages/jobs/tool-jobs/src/index.ts:51`）。
+   * 没有任何 subagent 事件）之后，不再替模型把本轮撑住。默认 3。
    *
    * 它取代的是原先那道 `lastKeepAliveTimedOut` 粘性闸门 —— 超时一次就永久放弃，
    * 后果是 run 在仍有子 agent 在飞时结束、对外报 `stopReason:'completed'`，而
-   * 模型的下一句"我继续等通知"落到了空气里。dsh 里没有那道闸门；它的同类机制
-   * 是 `maxConsecutiveWakes`，约束的是"再叫醒一次"，不是"要不要等"。
+   * 模型的下一句"我继续等通知"落到了空气里。`maxConsecutiveWakes` 约束的是
+   * "再叫醒一次"，不是"要不要等"。
    *
    * **花预算的是超时，不是等待本身**：被事件唤醒（真有结果回来）不计入。
    * 补回预算的只有用户亲手输入的新一轮（见 `Agent.chat` / `Agent.stream`）；
-   * 框架自己开的续跑轮（`Agent.followup`）不补 —— dsh 的原话是 "a notice this
-   * plugin itself queued must not refill the budget it just spent"。少了这条，
+   * 框架自己开的续跑轮（`Agent.followup`）不补 —— 框架自己排进队列的通知不得
+   * 补回它刚花掉的预算。少了这条，
    * 自激链（被叫醒的一轮又派一个后台任务、它的完成又叫醒同一轮）重新无界。
    */
   maxConsecutiveWakes = 3,
   createAgent,
 } = {}) {
-  // 与 dsh 同款校验，且在**构造期**抛（`tool-jobs/src/index.ts:219-221`）：留到
+  // 校验在**构造期**抛：留到
   // 调用期抛的话，一次本来成功的 keep-alive 等待会变成整个 run 报错。配置错误
   // 应该让初始化失败，而不是让运行中的业务失败 —— 与 `spill/policy.js` 对
   // `maxInlineBytes` 的处理同一先例。

@@ -4,15 +4,15 @@ import { contentText } from './content/parts.js'
 const CHARS_PER_TOKEN = 4
 
 /**
- * 结构开销常量 —— 对齐 dsh token-meter 的 `estimate.ts`。
+ * 结构开销常量。
  *
- * 密度启发式（chars/4）两边一致，dsh 也没上真分词器；差别在这两个常量。
+ * 密度启发式仍是 chars/4，不上真分词器；精度的改进来自这两个常量。
  * 实际发出去的不是拼接文本而是 JSON：每条消息有 role 字段和对象花括号，
  * 每个工具调用有 id/type/function 三层嵌套。不算这些会**系统性低估**，
  * 而低估的方向是危险那侧 —— 以为没超，实际超了，请求发出去才由服务端报错。
  *
  * 校准锚点：`estimateMessageTokens({role:'user', content:'abcd'})` === 9
- * （4 字符/4=1 + BLOCK 4 + ROLE 4），与 dsh 的同名断言一致。
+ * （4 字符/4=1 + BLOCK 4 + ROLE 4），由 token-accounting.test.js 钉住。
  *
  * 放在本模块（而非 context-manager）是因为依赖方向：context-manager 已经
  * 依赖 memory-policy，反过来会成环。计价是底层能力，两处必须共用同一份 ——

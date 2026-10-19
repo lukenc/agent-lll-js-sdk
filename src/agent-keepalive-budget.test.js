@@ -7,17 +7,14 @@
  * 模型说一句"任务重，我继续等通知"（这是它的合理推断，工具描述刚刚承诺过
  * "you will be notified when one completes"），整个 run 就地终止。
  *
- * dsh 里没有这道闸门 —— 搜遍全仓没有 `lastKeepAlive` / `alreadyWaited` /
- * `keep_alive_waiting` 之类。它的对应机制是**唤醒预算**：
- * `tool-jobs/src/index.ts:208-228, 292-298`
+ * 正确的形状是**唤醒预算**：
  *   - `maxConsecutiveWakes` 默认 3；
- *   - `if (!Number.isSafeInteger(wakeBudget)) throw`（**构造期**，不是调用期）；
- *   - `spent < wakeBudget` 才 `owner.followup(message)`，否则**降级为 `inject`**；
- *   - 只在 `agent/inbox/claimed` 且 `message.source.kind === 'user'` 时
- *     `spentWakes.delete(agent)` —— 注释写得很直白："a notice this plugin itself
- *     queued must not refill the budget it just spent"。
+ *   - 非法值在**构造期**抛，不是调用期；
+ *   - 预算没花完才替模型撑住本轮，否则收尾（结果仍会经后续投递路径送达）；
+ *   - 只有用户亲手输入才补回预算 —— 框架自己排进队列的通知不得补回它刚花掉的
+ *     预算。
  *
- * 两边的差别正是缺陷所在：**dsh 的预算约束"再叫醒一次"，我们的闸门抑制"等待"
+ * 缺陷就在约束的方向上：**预算该约束的是"再叫醒一次"，旧闸门抑制的却是"等待"
  * 本身**，而抑制等待的后果是通知无处投递、run 谎报完成。
  *
  * 本文件钉住五条不变量：
@@ -25,7 +22,7 @@
  *   - 耗尽后不再替模型撑住本轮，但**发事件、留清单**，不是静默走人。
  *   - 用户亲手输入的新一轮补回预算；框架自己开的续跑轮（`followup`）不补。
  *   - 被事件唤醒（真有结果回来）不花预算 —— 花预算的是白等。
- *   - 预算耗尽**不取消**在飞的子 agent（dsh 同样只在 disposal 时取消）。它的结果
+ *   - 预算耗尽**不取消**在飞的子 agent（只在 disposal 时取消）。它的结果
  *     仍会在下一次 user 轮的 round 0 或宿主调 `followup()` 时送达 —— 这是
  *     `agent-wakeup.test.js` 那条投递路径给的保证，也是本任务得以成立的前提：
  *     先有"结束本轮不再是弃置"，才谈得上把闸门换成预算。
@@ -63,7 +60,7 @@ function drainKeepAliveNotice(agent) {
 
 // ---- 配置 ----
 
-test('maxConsecutiveWakes 默认 3（与 dsh 同值）', () => {
+test('maxConsecutiveWakes 默认 3', () => {
   const agent = new Agent({ ...baseOpts, subagents: {} })
   assert.strictEqual(agent.subagents.maxConsecutiveWakes, 3)
 })
@@ -74,7 +71,7 @@ test('maxConsecutiveWakes 可配置', () => {
 })
 
 test('非法的 maxConsecutiveWakes 在构造期抛（不留到调用期）', () => {
-  // dsh 同款校验（`tool-jobs/src/index.ts:219-221`）。留到调用期抛的话，一次
+  // 留到调用期抛的话，一次
   // 本来成功的 keep-alive 会变成 run 报错 —— 配置错误应当让初始化失败。
   for (const bad of [0, -1, 2.5, Number.POSITIVE_INFINITY, Number.NaN, '3', null]) {
     assert.throws(
@@ -146,7 +143,7 @@ test('预算耗尽时发 run.keep_alive.gave_up，并带上被留下的在飞清
 })
 
 test('预算耗尽不取消在飞的子 agent（signal 不被 abort）', async () => {
-  // dsh 只在 disposal 时取消（`continuation.ts:1528-1544`），run 结束不取消。
+  // 只在 disposal 时取消，run 结束不取消。
   // 报告 §10 #7 建议"run 结束时自动 closeSubagents()"，那恰好会杀掉它自己
   // §7 最想要的"派慢任务、下轮收结果"。
   const agent = new Agent({
@@ -187,7 +184,7 @@ test('用户亲手输入的新一轮补回预算', async () => {
     assert.strictEqual(timeouts.length, 2, '第一轮把预算花光')
     assert.strictEqual(agent._spentKeepAliveWakes, 2)
 
-    // 用户又说话了 —— dsh 的 refill 条件是 `message.source.kind === 'user'`。
+    // 用户又说话了 —— refill 的条件是这一轮由用户亲手发起。
     // 补回之后这一轮又能等满整个预算；不补的话它会一次都不等、直接 gave_up。
     await agent.chat('继续')
     assert.strictEqual(timeouts.length, 4, 'chat 入口必须补回，第二轮同样等满预算')
@@ -197,8 +194,7 @@ test('用户亲手输入的新一轮补回预算', async () => {
 })
 
 test('followup() 不补回预算（框架自己开的轮次不能 refill 它刚花掉的预算）', async () => {
-  // dsh 原话：a notice this plugin itself queued must not refill the budget it
-  // just spent。少了这条，`followup` → `chat` 会把预算立刻充满，闸门等于不存在，
+  // 框架自己排进队列的通知不得补回它刚花掉的预算。少了这条，`followup` → `chat` 会把预算立刻充满，闸门等于不存在，
   // 自激链（被叫醒的一轮又派一个后台任务、它的完成又叫醒同一轮）重新无界。
   const originalFetch = globalThis.fetch
   try {
@@ -292,7 +288,7 @@ test('被事件唤醒不花预算（花预算的是白等，不是有结果的�
   assert.ok(h2)
 })
 
-test('事件唤醒也不 refill 预算（与 dsh 一致：只有用户输入 refill）', async () => {
+test('事件唤醒也不 refill 预算（只有用户输入 refill）', async () => {
   // 若事件也 refill，一个不断 settle 的流就能让"白等"计数永远归零，
   // 交错出现的挂死子 agent 于是把 run 拖到 maxRounds 耗尽。
   const agent = new Agent({

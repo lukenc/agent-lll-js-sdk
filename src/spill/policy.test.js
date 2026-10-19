@@ -1,8 +1,8 @@
 /**
- * spill 策略层测试 —— 契约见 docs/dsh-diff/CONTRACT-NOTES.md 的 D 节。
+ * spill 策略层测试 —— 设计说明见 docs/design/spill.md。
  *
  * 策略层回答的是「什么时候截、截完跟模型说什么」，
- * 每一条都对齐 dsh spill-policy.spec.ts 里的对应断言。
+ * D1–D9 每一条都在这里有对应断言。
  */
 
 import { test, describe } from 'node:test'
@@ -304,10 +304,8 @@ describe('spill_read 工具', () => {
 
 // ---- 搜索能力 ----
 //
-// 为什么必须有：dsh 的 retrievalHint 原文是
-// "Use read with offset/limit, or grep this path to search within it."
-// —— 它假设宿主已有能搜真实路径的 grep 工具（dsh 自带打包 ripgrep 的 fs-search）。
-// 我们是库，宿主不一定有 grep，浏览器里更没有文件路径。
+// 为什么必须有：只提示「去 grep 这个路径」的前提是宿主已有能搜真实路径的
+// grep 工具。我们是库，宿主不一定有 grep，浏览器里更没有文件路径。
 // 只给顺序分段读的话，模型在 150KB 日志里找一行错误要线性扫 19 轮，
 // 真实跑下来会直接撞 maxRounds（examples/spill.js 第 3 幕实测复现）。
 describe('spill_search：在转存内容里定位，而不是线性扫', () => {

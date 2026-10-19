@@ -6,10 +6,9 @@
  *   2. `MemorySpillStore` —— 内存后端，也是浏览器后端的可测替身
  *   3. `createNodeSpillStore` / `createIndexedDBSpillStore` —— 两个环境的实现
  *
- * 移植自 deepseek-harness 的 `dsh-spill` / `dsh-spill-local`（MIT）。
- * 契约见 docs/dsh-diff/CONTRACT-NOTES.md 的 B/C 节。
+ * 契约由 spill/index.test.js 钉住；设计说明见 docs/design/spill.md。
  *
- * 与 dsh 的差异：它只有 Node 文件后端且由宿主自理取回；我们要覆盖浏览器，
+ * 只有 Node 文件后端、取回交给宿主自理是不够的：我们要覆盖浏览器，
  * 所以抽出 SpillStore 接口 + 注册表，并内置 `spill_read` 工具（见 spill/policy.js）。
  */
 
@@ -42,8 +41,6 @@ export class SpillError extends Error {
  *
  * 整段的 `.` / `..` 单独转义 —— 它们本身就是穿越语义。
  * 空串编码成 `~`，避免产生空路径段。
- *
- * 对齐 dsh 的 `encodeSegment`（spill-local/src/store.ts）。
  */
 export function encodeSegment(raw) {
   if (raw.length === 0) return '~'
@@ -134,15 +131,13 @@ function shortHash(input) {
  *
  * 措辞把「先搜后读」摆在前面是有实测依据的：只说「用 spill_read 分段读」时，
  * 模型会从 offset 0 开始线性扫，150KB 的日志要 19 轮才能扫完，直接撞 maxRounds。
- * 对齐 dsh 的 hint 语义（"Use read with offset/limit, or grep this path to
- * search within it."），只是把它依赖的外部 grep 换成我们自带的 spill_search。
+ * 「搜」这一环不依赖宿主有没有能搜真实路径的 grep，由自带的 spill_search 承担。
  *
  * 措辞要**尽量短**：它整条都算进 maxInlineBytes 的预留里（策略层 D5），
  * hint 越长留给预览的字节越少；长到一定程度会让小上限完全没有合规替换方案，
  * 触发 D6 保留原文 —— 那时 spill 等于没生效。
  *
- * 由后端提供而非策略层硬编码，是因为不同后端的取回方式本就可能不同 ——
- * 这一点与 dsh 的 `SpillRef.retrievalHint` 归属一致。
+ * 由后端提供而非策略层硬编码，是因为不同后端的取回方式本就可能不同。
  */
 const DEFAULT_HINT = '用 spill_search 搜关键词定位，再用 spill_read 按 offset 精读。'
 
@@ -196,7 +191,7 @@ export class MemorySpillStore {
 /**
  * Node 文件后端。
  *
- * 安全措施逐条对齐 dsh 的 spill-local（这些防的是真实的本地攻击面）：
+ * 安全措施（这些防的是真实的本地攻击面）：
  *   - 私有根目录：mkdtemp 产生不可预测的名字，0700
  *   - 会话目录：`session-<hash>`，0700
  *   - 文件名：`<随机12位hex>-<encodeSegment(工具名)>.txt` —— 不可预测且可读

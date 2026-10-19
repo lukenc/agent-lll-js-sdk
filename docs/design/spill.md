@@ -3,9 +3,7 @@
 > 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
 
 让一个超尺寸的工具结果**离开模型的上下文但不丢失**。
-移植自 deepseek-harness `dsh-output-retention` / `dsh-spill-policy` / `dsh-spill-local`（MIT）；
-经核实的逐行为契约住在 [`../dsh-diff/CONTRACT-NOTES.md`](../dsh-diff/CONTRACT-NOTES.md)，
-那份笔记写自 dsh 的**测试文件**而不是它的散文。
+逐条行为契约由**测试**钉住（见文末"相关测试"），而不是由散文描述。
 
 ---
 
@@ -37,7 +35,7 @@
 | 实现 | 说明 |
 |---|---|
 | `createNodeSpillStore` | 私有 `mkdtemp` 根目录，`session-<hash>` 目录权限 `0o700`，`<random>-<encodeSegment(tool)>.txt` 文件以 `'wx', 0o600` 打开，所以一个预先植入的符号链接**无法劫持这次写入** |
-| `createIndexedDBSpillStore` | 浏览器那一半 —— **dsh 没有对应物** |
+| `createIndexedDBSpillStore` | 浏览器那一半 —— 浏览器里没有文件系统可写 |
 | `MemorySpillStore` | FIFO 上限；既是测试替身也是最后手段的回退 |
 | `createDefaultSpillStore` | 按环境选择 |
 
@@ -68,10 +66,9 @@
 5. preview 是 `headTail`，预算**对半分** ——
    因为结论（退出码、总计、最终错误）通常在**尾部**。
 
-### `spill_search` 没有 dsh 对应物，这是刻意的
+### `spill_search` 是刻意自带的
 
-dsh 的 `retrievalHint` 写着 *"Use read with offset/limit, **or grep this path to search within it**"* ——
-它假设宿主已经带了一个能搜真实路径的 `grep`（dsh 在 `tool-fs-search` 里捆了 ripgrep）。
+只提示模型"用 offset/limit 读，**或者 grep 这个路径**"，就等于假设宿主已经带了一个能搜真实路径的 `grep`。
 **我们是一个库**：宿主可能没有 grep，而浏览器没有路径可供 grep。
 
 只有顺序读取时，一次针对 DeepSeek 的真实运行花了 **7 次 `spill_read`** 扫一个 150 KB 的日志，
@@ -118,8 +115,7 @@ dsh 的 `retrievalHint` 写着 *"Use read with offset/limit, **or grep this path
    所以 `strategy: 'plan_and_execute'` 什么都不限界；
    与已记录的 skill 清单、子 Agent 注入限制同一形状。
 2. **整条结果粒度** —— 一条结果要么整体溢出要么整体保留；
-   没有按 block 或按字段的限界，因为我们的工具结果是纯字符串
-   （见 `docs/dsh-diff/` 里的 ContentBlock 缺口）。
+   没有按 block 或按字段的限界，因为我们的工具结果是纯字符串。
 3. **浏览器配额不做预检** —— 一个 IndexedDB `QuotaExceededError`
    经由正常的失败路径浮现（保留原文 + warn），而不是被预料到。
 
@@ -129,13 +125,12 @@ dsh 的 `retrievalHint` 写着 *"Use read with offset/limit, **or grep this path
 
 - `output-retention.test.js` — UTF-8 边界裁剪（2/3/4 字节的部分字符、裸续字节串、非法前导字节）、
   相邻切片的整 buffer 解码、诚实的裁剪后 omission 计数、有界内存、零预算。
-  逐个用例对照 dsh 的 `output-retention.spec.ts`。
 - `spill/index.test.js` — 一套共享的契约测试同时跑在 `MemorySpillStore` 与 `NodeSpillStore` 上，
   外加仅 Node 的安全断言（`0700`/`0600` 权限、不可预测的文件名、
   遍历形状的工具名被消毒成单个段），以及一条回归：对已清除 locator 的 `readText`
   **抛异常**而不是返回 `undefined` —— IndexedDB 后端曾经做后者，
   而**只有一次真实浏览器运行**才让它现形。
-- `spill/policy.test.js` — D 系列规则：未配置时 no-op、坏 cap 构造时抛、
+- `spill/policy.test.js` — 上面五条规则：未配置时 no-op、坏 cap 构造时抛、
   在许多 cap 尺寸下 cap 作为硬不变量被守住、每条失败路径都保留原文、跳过列表，
   以及那个 400 字节 cap 守卫（检索提示长到挤掉 preview 就失败）。
 - `agent-spill.test.js` — Agent 接线：默认关闭时逐字节等价、两个 ReAct 循环都被限界、
@@ -146,4 +141,3 @@ dsh 的 `retrievalHint` 写着 *"Use read with offset/limit, **or grep this path
 
 - `CLAUDE.md` Supporting modules 的 `output-retention.js` + `spill/` 条目
   （2026-09-07 精简前的版本）
-- `docs/dsh-diff/CONTRACT-NOTES.md` D 系列

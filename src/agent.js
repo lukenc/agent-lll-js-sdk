@@ -287,7 +287,7 @@ export class Agent {
    *   depth 层并发槽也就永久不释放；`run_in_background: false` 时父 agent 的那次工具
    *   调用跟着无上界地 await 下去（keep-alive 管不着它 —— 它压根没走到"最终回答"那个
    *   分支）。**这个界是协作式的**：框架只经 abort signal 通知，宿主工具认不认它由宿主
-   *   决定（与 dsh 同一契约），见 README「已知限制」。
+   *   决定，见 README「已知限制」。
    * @param {object} [opts.subagents.artifacts] - 产物轨配置（policy: 'warn' | 'deny'）
    * @param {number} [opts.subagents.retainCompleted=20] - 保留多少个已完成 agent 的上下文
    * @param {number} [opts.subagents.retainClosedGraphs=5] - 保留多少张已关闭的图（FIFO 淘汰，在飞节点的图不淘汰）
@@ -307,8 +307,7 @@ export class Agent {
    *   **白等**（等满 `keepAliveTimeoutMs` 却没有任何 subagent 事件）之后，不再替模型
    *   把本轮撑住，转而发 `run.keep_alive.gave_up` 并收尾。被事件唤醒（真有结果回来）
    *   不花预算；用户亲手输入的新一轮把预算补回，而框架自己开的续跑轮（`followup()`）
-   *   不补。与 dsh 的 `maxConsecutiveWakes` 同名同值同 refill 规则
-   *   （`packages/jobs/tool-jobs/src/index.ts:38-51, 224-228`）。
+   *   不补 —— 否则框架自己开的轮会把刚花掉的预算立刻充满，预算等于不存在。
    *
    *   它取代的是原先那道"每轮对话最多超时一次"的粘性闸门。闸门的问题是它抑制的是
    *   **等待**而不是**再叫醒**：超时一次之后 run 就地结束，在飞的子 agent 既不被取消
@@ -351,8 +350,7 @@ export class Agent {
      *
      * 计数器在 Agent 上而不是 runtime 上：补回预算的条件是"用户又说话了"，只有
      * Agent 知道这件事 —— runtime 看到的只是 `enqueueMessage`，而那条同样可能是
-     * agent 之间 `send_message` 发来的，dsh 不会把它算作用户输入
-     * （`message.source.kind === 'user'` 才 refill）。
+     * agent 之间 `send_message` 发来的，那不算用户输入，不该 refill。
      */
     this._spentKeepAliveWakes = 0
 
@@ -632,7 +630,7 @@ export class Agent {
       })
 
       // `skill` 元工具(与 ask_user / load_mcp_server 同一注入手法)。
-      // description 保持静态最小;清单在 system prompt 里(Claude Code 形态)。
+      // description 保持静态最小;清单在 system prompt 里(每轮重算,不占工具 schema)。
       this.tools = [
         ...this.tools,
         {
@@ -646,7 +644,7 @@ export class Agent {
             },
             required: ['skill'],
           },
-          // 参数形状对齐 Claude Code 的 Skill 工具:{ skill, args }。
+          // 参数形状:{ skill, args },只有 skill 必填。
           // `name` 是历史别名 —— 弱模型常照着"skill 名"的直觉发 name,
           // 兜一下比让它吃一次 unknown skill 软失败再重试便宜。
           execute: async ({ skill, name, args }) => this._invokeSkill(skill ?? name, args),
@@ -1177,11 +1175,11 @@ export class Agent {
   /**
    * 从一次 `llm.call` 事件里接住真实用量，存为下一轮的锚点。
    *
-   * **口径**：`input_tokens + output_tokens`。不能照抄 dsh 的
-   * `input + cacheRead + cacheWrite + output` —— 它的三项是互斥的
-   * （适配器把缓存命中从 prompt_tokens 里减掉了），而我们的 `extractUsage`
-   * 是原样透传 OpenAI 语义，`prompt_tokens` **已含**缓存命中。
-   * 加上 cached 会重复计数，让锚点系统性偏高。见 CONTRACT-NOTES 的 H1。
+   * **口径**：`input_tokens + output_tokens`。不能写成
+   * `input + cacheRead + cacheWrite + output` —— 那只在三项互斥（缓存命中已从
+   * prompt_tokens 里减掉）时成立，而我们的 `extractUsage` 是原样透传 OpenAI
+   * 语义，`prompt_tokens` **已含**缓存命中。加上 cached 会重复计数，让锚点
+   * 系统性偏高。
    *
    * 只在拿得到真实用量、且本轮确实走过 ContextManager 时才记锚点 ——
    * 没有 `_lastAssembly` 就没有守恒校验的基准，宁可不锚。
@@ -1197,7 +1195,7 @@ export class Agent {
     this._tokenAnchor = {
       fingerprint: snap.fingerprint,
       totalTokens: input + output,
-      // 同期的纯估算值，供下一轮做守恒校验（dsh 的 G2）
+      // 同期的纯估算值，供下一轮做守恒校验
       estimatedAtAnchor: snap.estimatedTokens,
       historyTokens: snap.historyTokens,
     }
@@ -1496,7 +1494,7 @@ export class Agent {
         totalTokens: assembled.totalTokens,
         estimatedTokens: assembled.estimatedTokens,
         // 'usage' = 基于真实用量的锚点；'estimated' = 纯启发式。
-        // 暴露它是为了让宿主知道这个数可不可信（dsh 的 G5）。
+        // 暴露它是为了让宿主知道这个数可不可信。
         tokenConfidence: assembled.tokenConfidence,
         systemPromptTokens: assembled.systemPromptTokens,
         knowledgeTokens: assembled.knowledgeTokens,
@@ -1748,17 +1746,16 @@ export class Agent {
   /**
    * 把积压的待投递通知跑成一轮 —— 后台 agent 在空闲期 settle 之后的续跑入口。
    *
-   * 对应 dsh 的 `followup(message)`（`continuation.ts:1670`：空闲的父 agent 得到
-   * 一次普通轮次）。宿主的用法是订阅 `run.wakeup`，收到后调它；SDK 不自行开轮，
+   * 空闲的父 agent 由此得到一次普通轮次。宿主的用法是订阅 `run.wakeup`，收到后
+   * 调它；SDK 不自行开轮，
    * 因为一次新轮要不要惊动用户、要不要走宿主的流式渲染，是宿主的决定。
    *
    * **队列为空时返回 `null` 且不发任何请求。** 空转一次 LLM 调用是纯烧 token，
    * 而"没有待投递内容"是常态而非异常。
    *
    * **这一轮不补回 keep-alive 等待预算。** 它是框架自己开的轮次，消息也是框架
-   * 自己排进队列的通知 —— dsh 的 refill 条件因此写死为 `source.kind === 'user'`，
-   * 并注明"a notice this plugin itself queued must not refill the budget it just
-   * spent"。少了这条，`followup → chat` 会把刚花掉的预算立刻充满，闸门等于不存在。
+   * 自己排进队列的通知，不得补回它刚花掉的预算。
+   * 少了这条，`followup → chat` 会把刚花掉的预算立刻充满，闸门等于不存在。
    *
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
@@ -1807,10 +1804,8 @@ export class Agent {
    * 再收结果"之所以不成立的原因，与 sticky 闸门和 runtime 是否 per-instance 都
    * 无关（`keepAlive: false` 且复用同一个 Agent 实例照样复现）。
    *
-   * dsh 的对应做法是把方向反过来：不在轮内干等，而是结束本轮、稍后叫醒
-   * （`continuation.ts:1664-1673`：空闲父 agent `followup(message)`，正忙父 agent
-   * `steer(message)`）。本方法是 `followup` 那一支的最小实现 —— 宿主自己开下一轮
-   * 时，通知同样能落地。
+   * 另一个方向是不在轮内干等，而是结束本轮、稍后叫醒（空闲父 agent 走
+   * `followup()`）。本方法补的是另一条路 —— 宿主自己开下一轮时，通知同样能落地。
    *
    * **合并成一条**而不是追加一条：通知与用户新消息同为 `role: 'user'`，两条相邻
    * 的 user 会被部分供应商拒绝（与 `INJECTION_MERGE_THRESHOLD` 同一理由）。
@@ -1914,16 +1909,14 @@ export class Agent {
   /**
    * run 入口补回 keep-alive 等待预算 —— **仅当这一轮是用户亲手发起的**。
    *
-   * dsh 的对应条件是 `agent/inbox/claimed` 上的 `message.source.kind === 'user'`
-   * （`tool-jobs/src/index.ts:224-228`），注释写得很直白："a notice this plugin
-   * itself queued must not refill the budget it just spent"。我们这里的同一条线是
+   * 规则是：框架自己排进队列的通知，不得补回它刚花掉的预算。这条线落在
    * `followup()`：它把 `enqueueMessage` 排进来的通知跑成一轮，那条消息是框架自己
    * 写的，不是用户说的。若它也补预算，`followup → chat → 预算清零` 会让闸门等于
    * 不存在，而它要防的自激链（被叫醒的一轮又派一个后台任务、那个任务的完成又叫醒
    * 同一轮）重新无界。
    *
    * 反过来，**不能**只在 `enqueueMessage` 里判来源：那个方法也是 agent 之间
-   * `send_message` 的投递口，而 dsh 同样不把 agent 间消息算作用户输入。
+   * `send_message` 的投递口，而 agent 间消息不是用户输入。
    *
    * @param {object} opts `chat` / `stream` 的入参
    * @returns {void}
@@ -1975,13 +1968,12 @@ export class Agent {
     // 工具描述承诺过 "you will be notified when one completes"）。客户端报告 §3
     // 抓的就是这个。
     //
-    // dsh 里没有这道闸门，它的同类机制约束的是**再叫醒一次**而不是**要不要等**
-    // （`tool-jobs/src/index.ts:292-298`：`spent < wakeBudget` 才 followup，
-    // 否则降级为 inject）。这个方向的差别正是缺陷所在。
+    // 缺陷在于约束的方向：该被约束的是**再叫醒一次**（白等的次数），而不是
+    // **要不要等**。
     //
     // 换成计数之后，反自激的保护还在（`maxRounds` 之外多了一道有界的花费），
     // 而"静默弃置"没有了：耗尽时发事件、附在飞清单，子 agent **不被取消**
-    // （dsh 同样只在 disposal 时取消），它的结果仍会经 round 0 排空、`run.wakeup`
+    // （只在 disposal 时取消），它的结果仍会经 round 0 排空、`run.wakeup`
     // 或宿主调 `followup()` 送达。
     const budget = this.subagents.maxConsecutiveWakes
     if (this._spentKeepAliveWakes >= budget) {
@@ -2845,7 +2837,7 @@ export class Agent {
 
   /**
    * 把 Level 1 skill 清单块合并进本轮 system 消息(不持久化,与
-   * _withUnavailableToolsNote 同款每轮重算)。格式对齐 Claude Code:
+   * _withUnavailableToolsNote 同款每轮重算)。格式:
    *   The following skills are available for use with the Skill tool:
    *   - name
    *   - name: description

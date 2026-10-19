@@ -17,8 +17,8 @@
 
 相关但独立的文档：
 
-- [`../dsh-diff/CONTRACT-NOTES.md`](../dsh-diff/CONTRACT-NOTES.md) — 从 deepseek-harness
-  **测试文件**反推出的行为契约（F/G/H 节是 token 计价的依据，D 系列是 spill policy 的依据）。
+- `src/token-accounting.test.js` / `src/spill/policy.test.js` / `src/output-retention.test.js` —
+  token 计价与 spill policy 的行为契约以这些测试为准（各设计文件末尾的"相关测试"列出了完整清单）。
 - [`../../improvements.md`](../../improvements.md) — 项目唯一有效的待改进列表
   （由原 `framework-review.md` + `todo.md` + `todo-audit.md` 合并而来）。
 
@@ -29,6 +29,5 @@
 **不是回归阈值**。代码改动后它们不会自动更新；读到时请理解为"当时测到的量级"，
 需要当前值就自己跑 `examples/` 里的对应用例（`token-accounting.js` / `spill.js` / `subagents.js`）。
 
-同理，文中引用的 commit 号、`lll-web-agent-sdk-issue-report.md` 的章节号（§3/§4/§5/§10）、
-以及 dsh 源码行号（`continuation.ts:1664-1673` 等）都是**写作时的定位信息**，
-外部仓库重构后即失效，不作为契约。
+同理，文中引用的 commit 号、`lll-web-agent-sdk-issue-report.md` 的章节号（§3/§4/§5/§10）
+都是**写作时的定位信息**，不作为契约；契约由各文件末尾"相关测试"里列出的测试钉住。

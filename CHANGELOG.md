@@ -11,16 +11,14 @@
   `isContentResult`、`contentText`、`UnsupportedContentError`、`InvalidContentError`；新选项
   `simpleVision`、`imageLimits`、`maxImageBytes`、`imageTokenEstimator`、`unknownImageTokens`；
   新供应商 `xiaomi`（小米 MiMo）。见 `docs/design/multimodal.md`。
-- **`Agent#followup(opts?)`** —— 把积压的待投递通知跑成一轮。对应 dsh 的
-  `followup(message)`（`packages/agent/continuation.ts:1664-1673`：空闲的父 agent 得到
+- **`Agent#followup(opts?)`** —— 把积压的待投递通知跑成一轮（空闲的父 agent 得到
   一次普通轮次）。**队列为空时返回 `null` 且不发任何请求** —— 空转一次 LLM 调用是纯烧
   token，而"没有待投递内容"是常态而非异常。这一轮**不补回** keep-alive 等待预算（内部以
   `_frameworkAuthored: true` 走 `chat()`）：它是框架自己开的轮次，消息也是框架自己排进
-  队列的通知，dsh 的 refill 条件因此写死为 `message.source.kind === 'user'`，并注明
-  "a notice this plugin itself queued must not refill the budget it just spent"。
-- **`opts.subagents.maxConsecutiveWakes`（默认 `3`）** —— keep-alive 的等待预算，与 dsh
-  同名同值同 refill 规则（`packages/jobs/tool-jobs/src/index.ts:38-51, 208-228,
-  292-298`）。非法取值（`0`、负数、非整数、`Infinity`、非 number）在**构造期**抛
+  队列的通知 —— 框架自己排进队列的通知不能回填它刚刚花掉的预算，所以回填只认用户
+  自撰的输入。
+- **`opts.subagents.maxConsecutiveWakes`（默认 `3`）** —— keep-alive 的等待预算，
+  回填只发生在用户自撰输入上。非法取值（`0`、负数、非整数、`Infinity`、非 number）在**构造期**抛
   `TypeError`，不留到调用期 —— 留到调用期抛的话，一次本来成功的等待会变成整个 run 报错；
   配置错误应该让初始化失败，而不是让运行中的业务失败（与 `spill.maxToolResultBytes`
   同一先例）。计数器 `_spentKeepAliveWakes` 在 `Agent` 上，配置在 runtime 上。
@@ -32,14 +30,13 @@
   且**默认值只在 runner 的回退链里解析一次** —— `runtime.js` 不 eager 回填 `retry`，
   否则类型级配置不可达（`maxAttempts` 已经踩过一次这个坑）。非法取值（`0`、负数、非整数、
   `Infinity`、非 number）在**构造期**抛 `TypeError`；`null` = 显式不设截止（与
-  `ask.timeoutMs` 默认 `null` 同一拼法）。机制移植自 dsh `packages/util/timeout`
-  （`deadline()` 的 signal 融合、先到者胜、构造期校验），逐条对照其 `timeout.spec.ts`；
-  但**不用 `AbortSignal.any` 也不用 `using`/`Symbol.dispose`** —— 支持下限是 Node 18
+  `ask.timeoutMs` 默认 `null` 同一拼法）。机制是 signal 融合、先到者胜、构造期校验；
+  **不用 `AbortSignal.any` 也不用 `using`/`Symbol.dispose`** —— 支持下限是 Node 18
   且不做转译，`AbortSignal.any` 是 20.3.0+，仓内先例是 `mcp/transports/sse.js` 的
-  `combineSignals`。两处与 dsh 的**有意**分歧：`Infinity` 是构造期报错而不是"不设界"的
+  `combineSignals`。两处**有意**的取舍：`Infinity` 是构造期报错而不是"不设界"的
   写法（不设界正是这个字段存在的理由所要防的失败形态），以及一次跑完的 attempt 即使与
-  截止时刻擦肩也**照收**（dsh 的 `timeout-policy` 会丢弃工具结果，但它的结果可能是被掐断
-  的半截输出，而这里手里是完整报告 —— 丢掉它去重跑是纯烧 token）。
+  截止时刻擦肩也**照收**（丢弃超时结果只在结果可能是被掐断的半截输出时才合理，而这里
+  手里是完整报告 —— 丢掉它去重跑是纯烧 token）。
 - **新事件 `run.wakeup`** —— `enqueueMessage` 在**没有 run 在跑**（`_currentRun == null`）
   时发出，payload `{ pendingInjections, inFlightAgents }`。宿主据此决定要不要再跑一轮
   （典型接法：`agent.on('run.wakeup', () => agent.followup())`）。SDK 不自行开轮：一次新
@@ -95,13 +92,11 @@
 - **keep-alive 超时一次即永久放弃等待，run 在仍有子 agent 在飞时对外报
   `stopReason:'completed'`。** 模型说一句"任务重，我继续等通知"（这是它的合理推断：工具
   描述刚承诺过 "you will be notified when one completes"），整个 run 就地终止，在飞的
-  子 agent 既不被取消也不被等待。dsh 里**没有**这道闸门（搜遍全仓 `lastKeepAlive` /
-  `alreadyWaited` / `giveUp` / `keep_alive_waiting` 零命中），它的同类机制约束的是
-  **再叫醒一次**而不是**要不要等** —— 这个方向的差别正是缺陷本体。现在换成有界的等待
-  预算，耗尽时发事件、附在飞清单，**且不取消在飞工作**（dsh 同样只在 disposal 时取消，
-  `continuation.ts:1528-1544`）。
+  子 agent 既不被取消也不被等待。等待预算该约束的是**再叫醒一次**，而不是**要不要等**
+  —— 一次超时就永久关掉等待，正是缺陷本体。现在换成有界的等待
+  预算，耗尽时发事件、附在飞清单，**且不取消在飞工作**（取消只发生在显式关闭时）。
 - **`Agent#lastStopReason` 的取值集合仍未扩张**（`null` | `'completed'` |
-  `'max_rounds'`，跨包契约；dsh 也无条件返回 completed，`agent-loop/src/agent.ts:471`）。
+  `'max_rounds'`，跨包契约）。
   让 `'completed'` 诚实的不是换一个枚举值，而是上面那条投递路径：结束本轮不再是弃置工作。
 - **一个卡死的子 agent 此前没有任何时间上界，0.9.0 把这件事追认成了"刻意留白"。**
   那段话（见 0.9.0「消费方注意」）写的是"只受 `maxRounds` 与调用方 `signal` 约束"——
@@ -113,12 +108,8 @@
   `classifyFailure` 的 `'timeout'` 分支与 `RETRYABLE_KINDS.has('timeout')` 从 0.9.0 起
   就是**死代码**——设计好的"超时→重试"这条路一次也没被触发过。现在由
   `retry.attemptTimeoutMs` 补上（见「新增」）。
-  **dsh 对照**：`packages/subagent/subagent/src/continuation.ts` 里 `timeout|Timeout|deadline`
-  **零命中** —— dsh 没有"单次 attempt 截止"这个东西，它的同类界更细：
-  `packages/guard/timeout-policy` 管每次工具调用，`packages/llm/llm-deepseek/src/adapter.ts:477`
-  给每次流读取装 300s 的 `idleWatchdog`。我们拿不到第二处 —— 子 agent 走非流式
-  `syncChat`，一次 `await` 就是一整段黑盒，没有"空闲"可观测。所以这里移植的是 dsh 的
-  **机制**（`packages/util/timeout`）落在一个 dsh 没有的**边界**上，而不是抄它的功能。
+  界之所以设在单次 attempt 上而不是更细的流读取空闲上：子 agent 走非流式
+  `syncChat`，一次 `await` 就是一整段黑盒，没有"空闲"可观测。
 
 - **注入 `ask_user` 时不再顶替宿主已提供的同名工具**（0.9.0 引入的回归）。此前只要配置了
   `opts.subagents`，构造函数就会无条件把 `tools` 里名为 `ask_user` 的宿主工具过滤掉，换成
@@ -150,8 +141,8 @@
 下一次 `chat()` / `stream()` 的 round 0 合并（用户又说话了，自动生效）、或宿主订阅
 `run.wakeup` 后调 `agent.followup()`（用户没说话，需要宿主主动开一轮）。只订阅事件不调
 `followup()`，通知会一直等到用户下次开口。**推荐配置**：`keepAlive: false` + 订阅
-`run.wakeup` + 调 `followup()` —— 这正是 dsh 的方向（不在轮内干等，而是结束本轮、稍后
-叫醒），也避免流式宿主在 keep-alive 等待期间看不到任何 chunk。
+`run.wakeup` + 调 `followup()` —— 不在轮内干等，而是结束本轮、稍后
+叫醒，也避免流式宿主在 keep-alive 等待期间看不到任何 chunk。
 
 **放弃等待 ≠ 放弃工作。** `run.keep_alive.gave_up` 之后在飞的子 agent 仍在跑，SDK 不会
 替你取消（报告 §10 建议 #7 的"run 结束时自动 `closeSubagents()`"因此**未采纳** —— 那恰好
@@ -176,9 +167,8 @@
    `fetch`（挂死的 LLM 请求因此真的有界）和 `tool.execute(args, ctx)` 的
    `ctx.signal`，但**宿主工具认不认它由宿主决定** —— 一个忽略 signal 的工具（典型：
    不接 signal 的 `child_process.exec`、裸 `await` 一个永不 settle 的 Promise）仍然
-   无上界，超时只是把 `child.chat()` 的等待打断，而工具自己的异步尾巴还在跑。这与
-   dsh 同一契约（它的注释原话：library 只经 abort signal 通知，每个 capability 仍然
-   自己拥有停下手头工作的机制）。我们**有意不**改成 race `chat()` 的 Promise：赢了
+   无上界，超时只是把 `child.chat()` 的等待打断，而工具自己的异步尾巴还在跑。契约是：
+   框架只经 abort signal 通知，每个工具仍然自己拥有停下手头工作的机制。我们**有意不**改成 race `chat()` 的 Promise：赢了
    race 会把 handle 标成 failed、释放并发槽，而子 Agent 还活着继续发遥测、写产物轨
    —— 一个框架账本上已死、物理上还活着的 agent 比没有超时更坏。宿主侧的对应动作是
    给自己的工具接上 `ctx.signal`。
@@ -322,7 +312,7 @@
     `'max_rounds'`，跨包契约）——keep-alive 超时经上面那面独立的旗子与事件浮出，
     不新增枚举值，现有消费方无需改动。
 
-- **Skill 系统**（`src/skills/`）：兼容 Claude Code 格式的 skill 包（`SKILL.md` +
+- **Skill 系统**（`src/skills/`）：`SKILL.md` + YAML frontmatter 格式的 skill 包（含
   `scripts/` / `references/` 等捆绑文件），可从本地目录或 HTTP manifest 加载。
   Level 1 清单自动注入 system prompt，内置 `skill` 元工具按需注入正文（Level 2），
   浏览器运行时新增 `skill_resource` 工具读取捆绑资源（Level 3），并提供基于 LLM
@@ -475,4 +465,4 @@ worktree。
 - 修复用户轮次初始化与后台 followup 的并发窗口，以及 `stream()` 最终 done 前后到达通知的漏唤醒（含消费者在 done 后 break）。
 - 子 Agent 运行期间更新 rounds、工具调用数和 lastToolCallAt，agent_status 列表展示实际进度。
 - Node/浏览器 demo 接入同一会话 Agent 的自动续跑；新增本地 HTTP 和实模型综合 example。
-- 保留 stopReason 的父轮次语义、会话级 runtime 和显式关闭行为。逐项证据与不采纳建议见 docs/reviews/2026-09-07-client-issue-verification.md。
+- 保留 stopReason 的父轮次语义、会话级 runtime 和显式关闭行为。

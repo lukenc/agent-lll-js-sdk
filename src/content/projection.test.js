@@ -18,8 +18,8 @@ const img = url => ({ type: 'image_url', image_url: { url } })
 const userImg = (text, ...urls) => ({ role: 'user', content: [{ type: 'text', text }, ...urls.map(img)] })
 const MiB = 1024 * 1024
 
-describe('offloadedPrefixCount (dsh parity)', () => {
-  it('dsh doc example: 129×1 MiB under 128 MiB with a 64 MiB quantum removes 65', () => {
+describe('offloadedPrefixCount', () => {
+  it('worked example: 129×1 MiB under 128 MiB with a 64 MiB quantum removes 65', () => {
     const limits = { maxBytes: 128 * MiB, byteQuantum: 64 * MiB }
     assert.equal(offloadedPrefixCount(Array(129).fill(MiB), limits), 65)
     assert.equal(offloadedPrefixCount(Array(192).fill(MiB), limits), 65)

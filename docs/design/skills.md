@@ -85,7 +85,7 @@ local provider **动态** import `node:fs/promises`，所以 `skills/` 仍能安
   （不是每 ReAct 轮 —— 用户消息在轮与轮之间不变），结果被缓存并在该轮的每一轮复用。
 - `_withSkillListingNote` 每轮把 **Level 1** skill 清单注入 system 消息
   （`- name: description`，当 skill 声明了 `argument-hint` 时再加 ` (args: <hint>)`）。
-- `skill` 元工具采用 Claude Code 的参数形状 `{ skill, args? }`（`name` 作为宽松别名被接受），
+- `skill` 元工具的参数形状是 `{ skill, args? }`（`name` 作为宽松别名被接受），
   调用时注入某个 skill 的完整正文（**Level 2**），把 `args` 展开进正文的占位符 ——
   正文没有占位符时则追加 `Arguments: <args>`，**所以 args 绝不会被静默丢弃**。
 - 一个**仅浏览器**的 `skill_resource` 工具暴露 **Level 3** 的束内资源读取

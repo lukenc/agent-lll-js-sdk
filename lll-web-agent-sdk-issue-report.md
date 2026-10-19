@@ -240,17 +240,15 @@ src/agents/runner.js:378    const child = await this.createAgent({ …options, m
 
 **一个能解决本节问题的公开扩展点，文档里完全不存在** —— 这本身就是需要修的一条（见 §10 #6）。我们把它写在这里，是为了让维护者知道：调用方不是没有办法，是办法藏起来了。
 
-**事实 B：`retry.attemptTimeoutMs` 只存在于设计文档和注释里，实现从没读过它。**
+**事实 B：`retry.attemptTimeoutMs` 只存在于当初的设计规划和注释里，实现从没读过它。**
 
 ```
-$ grep -rn "attemptTimeoutMs" src/ docs/
+$ grep -rn "attemptTimeoutMs" src/
 src/agents/runtime.js:116:      // `{ ...retry }`，不是挑着重建 `{ maxAttempts, attemptTimeoutMs }` 两个键：   ← 注释
 src/agents/runtime.test.js:94:  // 曾经的 runtime.js 只挑 maxAttempts / attemptTimeoutMs 两个键重建 retry 对象，  ← 注释
-docs/superpowers/plans/2026-07-30-subagent-system.md:2830:      retry = {},  // { maxAttempts = 3, attemptTimeoutMs = 600000 }
-docs/superpowers/plans/2026-07-30-subagent-system.md:3058:    opts: { retry: { maxAttempts: ..., attemptTimeoutMs: retry.attemptTimeoutMs ?? 600000 }, ... },
 ```
 
-设计文档明确规划了 `attemptTimeoutMs`，默认 600000。**实现里没有任何一处读取它**，`runner.run()` 的重试循环也没有单次尝试的时间上限。
+当初的设计规划明确写了 `attemptTimeoutMs`，默认 600000（`retry = {}  // { maxAttempts = 3, attemptTimeoutMs = 600000 }`）。**实现里没有任何一处读取它**，`runner.run()` 的重试循环也没有单次尝试的时间上限。
 
 **事实 C：重试链条把 `'timeout'` 列为可重试，但没有任何代码会产生 timeout。**
 
@@ -750,5 +748,5 @@ process.exit(0)
 | `CHANGELOG.md:151-153` | `lastKeepAliveTimedOut` 的公开文档：「每轮对话最多超时一次…此后的最终回答直接收尾」 |
 | `CHANGELOG.md:159-161` | 明确记载**有意不扩张** `lastStopReason` 枚举 |
 | `CHANGELOG.md:276-277` | `stopReason: 'completed' \| 'max_rounds'` 契约 |
-| `docs/superpowers/plans/2026-07-30-subagent-system.md:2830 / :3058` | 设计文档规划了 `attemptTimeoutMs`，默认 600000 |
+| 当初的设计规划 | 规划了 `attemptTimeoutMs`，默认 600000 |
 | `package.json` | 无 `types` / `typings` 字段，`files` 里无 `.d.ts` |

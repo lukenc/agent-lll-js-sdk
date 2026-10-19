@@ -8,8 +8,7 @@
  *   - ItemRetainer —— 按「条目」计数（路径、匹配行、搜索结果）
  *   - TextRetainer —— 按「字节」计数（命令输出、HTTP body），支持 head/tail/headTail
  *
- * 移植自 deepseek-harness 的 `@deepseek-ai/dsh-output-retention`（MIT）。
- * 行为契约见 docs/dsh-diff/CONTRACT-NOTES.md A 节，逐条对齐其测试用例。
+ * 行为契约由 output-retention.test.js 逐条钉住；设计说明见 docs/design/spill.md。
  *
  * 零依赖：只用 TextEncoder/TextDecoder，Node 18+ 与浏览器均为全局对象。
  */

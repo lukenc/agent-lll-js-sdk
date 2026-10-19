@@ -1,6 +1,6 @@
 /**
- * 轮次耗尽的结构化呈现(对齐 Vercel finishReason / Claude SDK error_max_turns
- * 的"当数据"派):done 事件带 stopReason,消费方不再字符串匹配哨兵。
+ * 轮次耗尽的结构化呈现(把终止原因当数据):done 事件带 stopReason,
+ * 消费方不再字符串匹配哨兵。
  * 哨兵字符串 '[max rounds exceeded]' 本身保留(向后兼容老消费方)。
  */
 import { describe, it, afterEach } from 'node:test'

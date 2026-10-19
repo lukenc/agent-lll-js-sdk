@@ -1,5 +1,5 @@
 /**
- * token 计量测试 —— 契约见 docs/dsh-diff/CONTRACT-NOTES.md 的 F/G/H 节。
+ * token 计量测试 —— 设计说明见 docs/design/context-manager.md。
  *
  * 分两部分：
  *   F. 结构开销 —— 消息的 role 框架、tool_calls、工具 schema 的真实成本
@@ -22,7 +22,6 @@ import {
 
 describe('F 结构开销：消息计价', () => {
   test('基准锚定值：单条 4 字符文本消息 = 9 tokens', () => {
-    // 对齐 dsh 的 estimateMessage(textMessage('abcd')) === 9
     // 4 字符 / 4 = 1，+ BLOCK_OVERHEAD 4，+ ROLE_OVERHEAD 4
     assert.equal(estimateMessageTokens({ role: 'user', content: 'abcd' }), 9)
   })
@@ -138,7 +137,7 @@ describe('G 信封指纹', () => {
     assert.notEqual(headerFingerprint('s', t1), headerFingerprint('s', t2))
   })
 
-  test('空工具数组与无工具视为同一信封（对齐 canonicalHeader）', () => {
+  test('空工具数组与无工具视为同一信封', () => {
     assert.equal(headerFingerprint('s', []), headerFingerprint('s', null))
     assert.equal(headerFingerprint('s', []), headerFingerprint('s', undefined))
   })
@@ -150,7 +149,7 @@ describe('G 信封指纹', () => {
   // 真实场景暴露的问题：开启意图识别后 ToolFilter 每轮可能返回不同的工具
   // 子集（浏览器 demo 实测 18 → 28 → 28），指纹随之抖动，锚点几乎每轮失效。
   //
-  // 语义上「工具集变了 → 请求体变了 → 锚点失效」是对的（dsh G4），不能为了
+  // 语义上「工具集变了 → 请求体变了 → 锚点失效」是对的，不能为了
   // 让锚点常驻就假装信封没变。但**工具的先后顺序**不影响计费内容，只影响
   // 序列化顺序 —— 那种抖动是纯噪声，必须消除。
   test('工具顺序不同不算信封变化（消除纯噪声抖动）', () => {
@@ -240,7 +239,7 @@ describe('G usage 锚定', () => {
     assert.ok(r.totalTokens >= 0, `不能为负，实得 ${r.totalTokens}`)
   })
 
-  test('G4 信封变化 → 锚点失效，退回 estimated', () => {
+  test('信封变化 → 锚点失效，退回 estimated', () => {
     const m = cm()
     const anchor = {
       fingerprint: headerFingerprint('old-sys', []),
@@ -253,7 +252,7 @@ describe('G usage 锚定', () => {
     assert.ok(r.totalTokens < 9999)
   })
 
-  test('G4 加载新工具 → 锚点失效', () => {
+  test('加载新工具 → 锚点失效', () => {
     const m = cm()
     const anchor = {
       fingerprint: headerFingerprint('sys', []),
@@ -268,7 +267,7 @@ describe('G usage 锚定', () => {
     assert.equal(r.tokenConfidence, 'estimated')
   })
 
-  test('G2 守恒校验：真实用量低于同期估算时不采信', () => {
+  test('守恒校验：真实用量低于同期估算时不采信', () => {
     const m = cm()
     const base = m.assemblePrompt({ systemPrompt: 'sys', history, filteredTools: [] })
     const anchor = {
@@ -328,7 +327,7 @@ describe('向后兼容', () => {
 
   // 加上结构开销后，单条消息的最低成本是 BLOCK+ROLE=8 起。预算被设得极小时，
   // 朴素的「装不下就不装」会把历史清空 —— 模型连用户刚说的话都看不到，
-  // 这比略微超预算糟糕得多。dsh 在 trimHistory 里也是同样取舍：保住协议
+  // 这比略微超预算糟糕得多。trimHistory 里也是同样取舍：保住协议
   // 有效性优先于严格预算。
   test('预算极小时至少保住最后一条消息', () => {
     const r = new ContextManager().assemblePrompt({

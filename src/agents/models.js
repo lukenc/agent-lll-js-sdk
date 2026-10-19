@@ -1,9 +1,9 @@
 /**
  * 模型别名解析。
  *
- * `agent` 工具的 `model` 入参形状恒为 `{ type: 'string', enum: [...] }`（对齐
- * 参考实现），但 enum 内容由主机配置的别名表生成 —— 本 SDK 是多供应商的，
- * 写死 Claude 型号对 DeepSeek / Qwen 用户毫无意义。
+ * `agent` 工具的 `model` 入参形状恒为 `{ type: 'string', enum: [...] }`，
+ * 但 enum 内容由主机配置的别名表生成 —— 本 SDK 是多供应商的，
+ * 写死某一家的型号对 DeepSeek / Qwen 用户毫无意义。
  *
  * 默认两个别名：
  *   fast → Agent 的 simpleModel / simpleApiKey / simpleUrl（既有 sidecar 三件套）

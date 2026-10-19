@@ -189,7 +189,7 @@ demo 支持把外部 MCP server 的工具挂到 Agent 上。有三种挂法。
 | ⭐ 内置搜索 | 搜狗搜索 + 网页抓取，零依赖、秒启、国内直连 | 无 |
 | 🌐 SearXNG | 本地 Docker 多引擎聚合搜索，质量最好 | 需先起 SearXNG（见 `searxng/README.md`） |
 | 🔍 open-websearch | 社区多引擎搜索 | 需 `npx` 下载，可能需 Playwright |
-| 🧠 sequential-thinking | Anthropic 官方思维链工具 | 需 `npx` |
+| 🧠 sequential-thinking | 官方思维链 MCP 工具 | 需 `npx` |
 | 🌐 fetch-mcp | 通用网页抓取 | 需 `npx` |
 | 🧪 mock | 仓库自带的 echo / add 测试 server | 无 |
 

@@ -46,7 +46,7 @@ test('no skill tools when skills not configured', () => {
   assert.strictEqual(agent.tools.find(t => t.name === 'skill'), undefined)
 })
 
-test('_withSkillListingNote merges Claude Code style block into system message', async () => {
+test('_withSkillListingNote merges skill listing block into system message', async () => {
   const agent = makeAgent({ providers: [memProvider({ alpha: 'Does A' })], runtime: 'browser' })
   await agent.loadSkills()
   // parseSkillMd (Task 2, locked contract) rejects an empty `description` in
@@ -171,7 +171,7 @@ test('skill and skill_resource tools are registered as base tools (immune to Too
   assert.strictEqual(isBaseTool('skill'), true)
 })
 
-test('skill tool schema matches Claude Code: { skill, args }, only skill required', () => {
+test('skill tool schema is { skill, args }, only skill required', () => {
   const agent = makeAgent({ providers: [memProvider({ alpha: 'A' })], runtime: 'browser' })
   const tool = agent.tools.find(t => t.name === 'skill')
   assert.deepStrictEqual(Object.keys(tool.parameters.properties), ['skill', 'args'])

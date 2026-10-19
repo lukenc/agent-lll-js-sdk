@@ -91,7 +91,7 @@ try {
   {
     const plain = { role: 'user', content: 'abcd' }
     ok(estimateMessageTokens(plain) === 9,
-      `校准锚点：4 字符消息 = 9 tokens（与 dsh 基准一致），实得 ${estimateMessageTokens(plain)}`)
+      `校准锚点：4 字符消息 = 9 tokens（校准基准），实得 ${estimateMessageTokens(plain)}`)
 
     const withCall = {
       role: 'assistant', content: '',
@@ -162,7 +162,7 @@ try {
   }
 
   // ===================================================================
-  act(4, '锚点跟随最新一次调用（G3）')
+  act(4, '锚点跟随最新一次调用')
   // ===================================================================
   {
     const a1 = agent.getTokenAnchor()
@@ -175,7 +175,7 @@ try {
   }
 
   // ===================================================================
-  act(5, '信封变化让锚点失效（G4）')
+  act(5, '信封变化让锚点失效')
   // ===================================================================
   {
     const fpBefore = headerFingerprint(agent.systemPrompt, agent.tools)
@@ -229,12 +229,12 @@ try {
     ok(evs.every(e => e.toolsTokens >= 0), '工具计价非负')
 
     // 这里不断言一定出现 usage —— 意图识别每轮可能给出不同的工具子集，
-    // 工具集不同就是请求体不同，锚点按 G4 失效是**正确**行为。
+    // 工具集不同就是请求体不同，锚点随之失效是**正确**行为。
     // 把实际分布打出来，让使用方看到这个权衡。
     const dist = evs.reduce((m, e) => (m[e.tokenConfidence] = (m[e.tokenConfidence] || 0) + 1, m), {})
     console.log(`   置信度分布：${JSON.stringify(dist)}`)
     console.log(`   （意图切换时工具集变化 → 锚点失效，这是语义正确的；`)
-    console.log(`     关闭意图识别可获得稳定锚定，见 CONTRACT-NOTES 的 H2）`)
+    console.log(`     关闭意图识别可获得稳定锚定）`)
   }
 
   // ===================================================================
