@@ -2,9 +2,10 @@
 
 按模块拆分的实现说明与"为什么这样设计"的论证。
 
-这些内容原先全部堆在 `CLAUDE.md` 的 Architecture 一节（约 60 KB / 15K+ tokens），
-每次会话都要全量吞下。现在 `CLAUDE.md` 只保留**模块一览**与**不可回退的不变量**，
-机制细节与设计论证移到这里，按需阅读。
+这些内容原先全部堆在项目规范的 Architecture 一节（约 60 KB / 15K+ tokens），
+每次会话都要全量吞下。现在规范文件（真源是根目录的 `AGENTS.md`；`CLAUDE.md` 是一行
+`@AGENTS.md` 导入的指针）只保留**模块一览**与
+**不可回退的不变量**，机制细节与设计论证移到这里，按需阅读。
 
 | 文件 | 覆盖 |
 |---|---|
@@ -14,6 +15,7 @@
 | [subagents.md](subagents.md) | 子 Agent 系统内部：type 注册表、handle 状态机、并发/深度、DAG 多图容器、邮箱、artifact track、A2A |
 | [subagents-wiring.md](subagents-wiring.md) | `agent.js` 侧接线：注入队列与 idle 投递、keep-alive 唤醒预算、`ask_user` 包装、生命周期；含 demo 侧两个易踩点 |
 | [spill.md](spill.md) | 工具输出限界：`TextRetainer`/`ItemRetainer`、三种 `SpillStore`、spill policy、`spill_read`/`spill_search` |
+| [multimodal.md](multimodal.md) | 图片输入：content parts 形状、入口校验、出站投影（量子卸载 + tool 图拆分）、图片计价、文本投影 |
 
 相关但独立的文档：
 

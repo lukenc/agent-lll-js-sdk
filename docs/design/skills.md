@@ -1,6 +1,6 @@
 # `skills/` — Skill 系统
 
-> 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
+> 父文档：[设计说明索引](README.md) · 回到 [AGENTS.md](../../AGENTS.md)
 
 入口是 `skills/index.js`，再导出下面各部件以及
 `SkillLoadError` / `SkillParseError` / `SkillMaterializeError` / `SkillProviderError`。

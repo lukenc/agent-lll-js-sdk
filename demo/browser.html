@@ -304,6 +304,7 @@ var attachMcpToolMetadata = LllWebAgent.attachMcpToolMetadata
 var defaultTokenBudget = LllWebAgent.defaultTokenBudget
 var contentResult = LllWebAgent.contentResult
 var imagePart = LllWebAgent.imagePart
+var SUBAGENT_TOOL_NAMES = LllWebAgent.SUBAGENT_TOOL_NAMES
 
 /**
  * 活动账本 —— 与 demo/lib/activity.js **逻辑等价的内联副本**。
@@ -1012,11 +1013,15 @@ async function refreshBrowserMcpTools() {
   // 热更新 Agent 的 tools(如果已连接)—— 不重建 Agent,保留对话历史
   if (agent) {
     var baseTools = getDemoLocalTools()
-    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user / spill_read):
-    // 它们不在 baseTools 也不在 mcpTools 里,若直接 baseTools.concat(mcpTools) 会把它们
-    // 冲掉,导致挂载/卸载 MCP 后技能系统、ask_user 或 spill 取回失效 —— 而系统提示
-    // 仍在告诉模型「用 spill_read 取回」,那句话就成了空头支票。按名字从现有 tools 捞回来。
+    // 保留构造 Agent 时注入的元工具(skill / skill_resource / ask_user / spill_read /
+    // spill_search,以及 subagent 的 12 个元工具):它们不在 baseTools 也不在 mcpTools 里,
+    // 若直接 baseTools.concat(mcpTools) 会把它们冲掉,导致挂载/卸载 MCP 后技能系统、
+    // ask_user、spill 取回或 subagent 失效 —— 而系统提示仍在告诉模型「用 spill_read 取回」、
+    // 仍在列 agent type 清单,那些话就成了空头支票。按名字从现有 tools 捞回来。
+    // 与 demo/server.js 的 META_TOOL_NAMES 保持同步;subagent 那组直接取 SDK 导出的
+    // SUBAGENT_TOOL_NAMES,不手抄 —— 手抄的那份就是漏掉它们的原因。
     var META_TOOL_NAMES = { skill: 1, skill_resource: 1, ask_user: 1, spill_read: 1, spill_search: 1 }
+    SUBAGENT_TOOL_NAMES.forEach(function(n) { META_TOOL_NAMES[n] = 1 })
     var preserved = (agent.tools || []).filter(function(t) { return META_TOOL_NAMES[t.name] })
     agent.tools = baseTools.concat(mcpTools).concat(preserved)
   }

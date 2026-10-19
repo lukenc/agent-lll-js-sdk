@@ -1,6 +1,6 @@
 # `context-manager.js` — Token 计价与 usage 锚定
 
-> 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
+> 父文档：[设计说明索引](README.md) · 回到 [AGENTS.md](../../AGENTS.md)
 
 `context-manager.js` 组装 prompt（system + knowledge + history + tools）并执行 token 预算。
 裁剪优先级：**TOOLS → HISTORY → KNOWLEDGE**。

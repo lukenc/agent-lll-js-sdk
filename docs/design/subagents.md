@@ -1,6 +1,6 @@
 # `agents/` — 子 Agent 系统（内部机制）
 
-> 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
+> 父文档：[设计说明索引](README.md) · 回到 [AGENTS.md](../../AGENTS.md)
 > `agent.js` 侧的接线（注入队列、keep-alive 预算、`ask_user` 包装、生命周期）见
 > [subagents-wiring.md](subagents-wiring.md)。
 

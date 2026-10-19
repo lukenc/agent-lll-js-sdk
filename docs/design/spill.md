@@ -1,6 +1,6 @@
 # `output-retention.js` + `spill/` — 工具输出限界
 
-> 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
+> 父文档：[设计说明索引](README.md) · 回到 [AGENTS.md](../../AGENTS.md)
 
 让一个超尺寸的工具结果**离开模型的上下文但不丢失**。
 逐条行为契约由**测试**钉住（见文末"相关测试"），而不是由散文描述。

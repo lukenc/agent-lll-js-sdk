@@ -1,6 +1,6 @@
 # `mcp/` — MCP 客户端集成
 
-> 父文档：[设计说明索引](README.md) · 回到 [CLAUDE.md](../../CLAUDE.md)
+> 父文档：[设计说明索引](README.md) · 回到 [AGENTS.md](../../AGENTS.md)
 
 入口是 `mcp/index.js`，导出 `createMCPClient(options): Promise<MCP_Client>`。
 
@@ -15,7 +15,7 @@
 | `mcp/client.js` | `MCP_Client` 类 |
 | `mcp/codec.js` | JSON-RPC 2.0 encode / decodeLine |
 | `mcp/namespace.js` | 工具名命名空间化 |
-| `mcp/normalize.js` | MCP `content` 数组归一化为单个字符串 |
+| `mcp/normalize.js` | MCP `content` 数组归一化为单个字符串，或（非 `isError` 且带白名单格式 image 时）`contentResult` |
 | `mcp/errors.js` | 四个错误类 |
 | `mcp/transports/index.js` | 传输层注册表 |
 | `mcp/transports/stdio.js` | 子进程 stdio |
@@ -47,10 +47,15 @@ JSON-RPC 2.0 encode / decodeLine，带形状校验；畸形输入抛
 
 ### `mcp/normalize.js`
 
-`normalizeCallToolResult(result, rawName)` 把 MCP 的 `content` 数组摊平成单个字符串：
+`normalizeCallToolResult(result, rawName)` 把 MCP 的 `content` 数组摊平成单个字符串，
+但非 `isError` 的结果带白名单格式图片时例外，变为 `contentResult`（见下面的 `image` 一条）：
 
 - `text` 用 `\n` 拼接；
-- `image` / `audio` / `resource_link` / `resource` 替换为 `[mcp:<type> ...]` 占位符；
+- `audio` / `resource_link` / `resource` 替换为 `[mcp:<type> ...]` 占位符；
+- `image`：白名单格式（png/jpeg/webp/gif）且非 `isError` 时，整个结果变为 `contentResult`
+  （text 原文、image → `image_url` data URL、其余仍是占位），由 Agent 按 `vision` 决定发给模型
+  或以 `unsupported_content` 工具级失败；其余格式仍是 `[mcp:image mimeType=…]` 占位。
+  见 [multimodal.md](multimodal.md)；
 - 处理 `isError: true` 前缀，并有 `structuredContent` 回退。
 
 ### `mcp/errors.js`
